@@ -45,7 +45,7 @@
   </div>
 </div>
 <script>
-const API='http://127.0.0.1:5050';
+const API='https://flow-mac.onrender.com';
 function params(){return `market=${market.value}&min_premium=${minPremium.value}&min_vol_oi=${minVolOi.value}&max_spread=${maxSpread.value}`}
 function money(n){return '$'+Number(n||0).toLocaleString('en-US',{maximumFractionDigits:0})}
 function cls(x){return x==='VERDE'?'verde':x==='AMARILLO'?'amarillo':'rojo'}
