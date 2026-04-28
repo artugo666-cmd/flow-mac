@@ -138,10 +138,22 @@ def home():
 @app.route('/api/health')
 def health():
     return jsonify({'ok': True, 'service': 'FlowScan v3', 'time': datetime.now().isoformat(timespec='seconds')})
+import requests
+import os
 
+API_KEY = os.getenv("POLYGON_API_KEY")
 
 @app.route('/api/flow')
 def api_flow():
+    try:
+        url = f"https://api.polygon.io/v3/snapshot/options/SPY?apiKey={API_KEY}"
+        r = requests.get(url)
+        data = r.json()
+
+        return data
+
+    except Exception as e:
+        return {"error": str(e)}
     market_mode = request.args.get('market', 'neutral')
     max_spread = float(request.args.get('max_spread', 15))
     min_vol_oi = float(request.args.get('min_vol_oi', 5))
