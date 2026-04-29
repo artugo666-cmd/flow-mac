@@ -29,7 +29,8 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-app = Flask(__name__, static_folder='.')
+import os as _os
+app = Flask(__name__, static_folder=_os.path.dirname(_os.path.abspath(__file__)))
 CORS(app)
 
 # ============================================================
@@ -325,7 +326,8 @@ def fetch_polygon_flow(ticker: str) -> List[FlowAlert]:
 # ── RUTAS ────────────────────────────────────────────────────
 @app.route('/')
 def home():
-    return send_from_directory('.', 'index.html')
+    dir_path = _os.path.dirname(_os.path.abspath(__file__))
+    return send_from_directory(dir_path, 'index.html')
 
 
 @app.route('/api/health')
