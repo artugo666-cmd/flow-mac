@@ -349,13 +349,10 @@ function runManual(){
     var msg='Analiza '+item.ticker+' para opciones. BUSCA EN INTERNET: precio actual, volumen vs promedio 20d, %vs MA5/MA20/MA50, noticias 7d, short interest, sector.\n'+ctx+cmt+'\nMercado: '+mktTxt+'. Capital: $'+cmin+'-$'+cmax+' IBKR.\n\n'
       +'SCORING OBLIGATORIO (max 10.0):\nV1 Catalizador(max3.0): earnings/M&A=3.0|upgrade=2.5|noticia=1.5|nada=0.0\nV2 Flujo(max2.5): >5M=2.5|2-5M=2.0|1-2M=1.5|<1M=0.5\nV3 Momentum(max2.0): sobreMA20+MA50+vol>150%=2.0|sobreMA50=1.2|lateral=0.6|bajo=0.0\nV4 Sector(max1.5): alcista=1.5|neutral=0.8|cae=0.0\nV5 Short(max1.0): >20%=1.0|10-20%=0.6|<10%=0.2\nVERDE>=7|AMARILLO>=4|ROJO<4\n\n'
       +'Responde SOLO JSON:\n{"ticker":"X","type":"CALL","score":7.5,"semaforo":"VERDE","pts_catalyst":2.5,"pts_flow":2.0,"pts_momentum":1.5,"pts_sector":1.0,"pts_short":0.5,"score_breakdown":"Cat 2.5+Flujo 2.0+Mom 1.5+Sec 1.0+Short 0.5=7.5","strike":100,"expiry":"jun 2025","flow_usd":"$1.8M","price":"$95","vol_vs_avg":"185%","ma5_pct":"+6%","ma20_pct":"+11%","ma50_pct":"+18%","momentum":"ALCISTA","rsi":"Normal 55","short_interest":"12%","sector_context":"sector alcista","news":"noticia o ninguna","sentiment":"POSITIVO","control":"COMPRADORES 71%","control_detail":"OBV al alza","why":"razon en 2 oraciones","risk":"riesgo en 1 oracion","catalyst":"evento o ninguno","ez":"$90-92","pm":"$120-200","c5":3,"c15":9,"sl":"$85"}';
-    fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1400,tools:[{type:'web_search_20250305',name:'web_search'}],messages:[{role:'user',content:msg}]})})
+    fetch(BASE+'/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticker:item.ticker,alert_raw:item.raw,comment:item.comment||'',market:mkt,cap_min:cmin,cap_max:cmax})})
     .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-    .then(function(data){
-      var txt=(data.content||[]).filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
-      var a=txt.indexOf('{'),b=txt.lastIndexOf('}');
-      if(a===-1||b===-1)throw new Error('Sin JSON');
-      var d=JSON.parse(txt.substring(a,b+1));
+    .then(function(d){
+      if(d.error)throw new Error(d.error);
       d._comment=item.comment||'';
       results.push(d);
       var card=buildCard(d,i);
