@@ -1,80 +1,42 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>FlowScan v3 Mac</title>
+  <meta charset="UTF-8">
+  <title>FlowScan Backend</title>
   <style>
-    :root{--bg:#07080a;--panel:#10141d;--panel2:#151a25;--b:#263044;--txt:#e7ecf7;--mut:#7d879c;--g:#00ff8c;--r:#ff3d5a;--y:#ffcc00;--blu:#6bb7ff}
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font-family:Arial,system-ui,sans-serif} .w{max-width:1100px;margin:0 auto;padding:22px 14px 70px}
-    .hdr{display:flex;justify-content:space-between;gap:12px;align-items:end;border-bottom:1px solid var(--b);padding-bottom:14px;margin-bottom:18px}.logo{font-size:30px;font-weight:900;letter-spacing:.05em}.logo span{color:var(--g)}.sub{color:var(--mut);font-size:12px;margin-top:4px}.pill{border:1px solid var(--b);padding:8px 10px;border-radius:10px;background:var(--panel);font-size:12px;color:var(--mut)}
-    .controls{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:12px}.box{background:var(--panel);border:1px solid var(--b);border-radius:12px;padding:12px}.box label{display:block;color:var(--mut);font-size:11px;text-transform:uppercase;margin-bottom:6px}input,select,textarea{width:100%;background:#080b10;color:var(--txt);border:1px solid var(--b);border-radius:8px;padding:9px}button{cursor:pointer;border:0;border-radius:10px;padding:13px 14px;font-weight:900;letter-spacing:.04em}.btn{background:linear-gradient(135deg,#0a6,#084);color:white}.btn2{background:#252d3d;color:var(--txt);border:1px solid var(--b)}
-    .status{margin:14px 0;padding:12px;border-radius:10px;border:1px solid var(--b);background:var(--panel);color:var(--mut)}.status strong{color:var(--txt)}
-    .summary{font-size:20px;font-weight:900;padding:16px;border-radius:14px;margin:16px 0;border:1px solid var(--b);background:var(--panel)}.summary.good{border-color:rgba(0,255,140,.35);color:var(--g)}.summary.bad{border-color:rgba(255,61,90,.35);color:var(--r)}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--b);border-radius:14px;overflow:hidden}.top{padding:13px;display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid var(--b)}.tk{font-size:25px;font-weight:900}.dir{font-size:12px;padding:3px 8px;border-radius:99px;margin-left:6px}.call{color:var(--g)}.put{color:var(--r)}.dir.call{background:rgba(0,255,140,.1)}.dir.put{background:rgba(255,61,90,.12)}.score{font-size:28px;font-weight:900}.verde{color:var(--g)}.amarillo{color:var(--y)}.rojo{color:var(--r)}
-    .body{padding:13px}.kv{display:grid;grid-template-columns:1fr 1fr;gap:8px}.k{background:var(--panel2);border:1px solid var(--b);border-radius:9px;padding:9px}.k small{display:block;color:var(--mut);font-size:10px;text-transform:uppercase;margin-bottom:4px}.k b{font-size:14px}.full{grid-column:1/-1}.action{margin-top:12px;padding:11px;border-radius:10px;font-weight:900}.action.go{background:rgba(0,255,140,.1);border:1px solid rgba(0,255,140,.35);color:var(--g)}.action.wait{background:rgba(255,204,0,.1);border:1px solid rgba(255,204,0,.35);color:var(--y)}.action.no{background:rgba(255,61,90,.1);border:1px solid rgba(255,61,90,.35);color:var(--r)}
-    textarea{height:160px;font-family:monospace;font-size:12px}.manual{margin-top:16px}.hint{font-size:12px;line-height:1.5;color:var(--mut)}@media(max-width:780px){.controls{grid-template-columns:1fr 1fr}.hdr{align-items:start;flex-direction:column}}
+    body { background: #07080a; color: #0dff8c; font-family: 'Courier New', monospace; padding: 40px; }
+    h1 { font-size: 2rem; margin-bottom: 8px; }
+    .sub { color: #6b748f; font-size: .85rem; margin-bottom: 32px; }
+    .endpoint { background: #0d0f14; border: 1px solid #1d2235; border-radius: 8px; padding: 14px 18px; margin-bottom: 12px; }
+    .method { color: #ffcc00; font-weight: bold; margin-right: 10px; }
+    .path { color: #4d9fff; }
+    .desc { color: #6b748f; font-size: .8rem; margin-top: 4px; }
+    a { color: #0dff8c; }
   </style>
 </head>
 <body>
-<div class="w">
-  <div class="hdr">
-    <div><div class="logo">FLOW<span>SCAN</span> v3 MAC</div><div class="sub">Backend Python · filtros duros · listo para enchufar API real</div></div>
-    <div class="pill"> Servidor esperado: <b>https://flow-mac.onrender.com</b>
+  <h1>⚡ FlowScan Backend</h1>
+  <div class="sub">API de flujo inusual de opciones · Polygon.io · IBKR</div>
+
+  <div class="endpoint">
+    <span class="method">GET</span><span class="path">/api/health</span>
+    <div class="desc">Estado del servidor y verificacion de API key de Polygon</div>
+  </div>
+  <div class="endpoint">
+    <span class="method">GET</span><span class="path">/api/flow?tickers=NVDA,AMD&market=bullish</span>
+    <div class="desc">Flujo inusual rankeado con scoring. Sin tickers usa datos demo.</div>
+  </div>
+  <div class="endpoint">
+    <span class="method">GET</span><span class="path">/api/ticker/AMD</span>
+    <div class="desc">Flujo inusual de un ticker especifico via Polygon en tiempo real</div>
+  </div>
+  <div class="endpoint">
+    <span class="method">POST</span><span class="path">/api/manual</span>
+    <div class="desc">Envia tus propias alertas en JSON y recibe el ranking con scoring</div>
   </div>
 
-  <div class="controls">
-    <div class="box"><label>Mercado</label><select id="market"><option value="neutral">Neutral/Mixto</option><option value="bullish">Alcista</option><option value="bearish">Bajista</option><option value="volatile">Volátil</option></select></div>
-    <div class="box"><label>Premium mínimo</label><input id="minPremium" type="number" value="300000"></div>
-    <div class="box"><label>Vol/OI mínimo</label><input id="minVolOi" type="number" value="5" step="0.5"></div>
-    <div class="box"><label>Spread máximo %</label><input id="maxSpread" type="number" value="15" step="0.5"></div>
-    <div class="box"><label>Acción</label><button class="btn" onclick="loadFlow()">BUSCAR FLOW</button></div>
-  </div>
-
-  <div class="status" id="status">Pulsa <strong>BUSCAR FLOW</strong>. Si el backend está corriendo, cargará datos demo/manuales. Luego se cambia la fuente por API real.</div>
-  <div id="summary"></div>
-  <div class="grid" id="cards"></div>
-
-  <div class="manual box">
-    <label>Pegar flujo manual en JSON opcional</label>
-    <textarea id="manualJson" placeholder='[
-  {"ticker":"NVDA","direction":"CALL","contract":"NVDA C950","expiry":"2026-05-15","strike":950,"spot":914.2,"premium":850000,"volume":8200,"open_interest":920,"bid":7.8,"ask":8.2,"execution":"above_ask","catalyst":"AI momentum","momentum":"alcista sobre VWAP","vwap_trigger":"romper 918 con volumen","stop":"pierde VWAP","target_1":"930","target_2":"950"}
-]'></textarea>
-    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><button class="btn2" onclick="loadManual()">ANALIZAR JSON MANUAL</button><button class="btn2" onclick="copyTemplate()">COPIAR PLANTILLA</button></div>
-    <p class="hint">Esta parte sirve para pegar alertas que exportes de Unusual Whales/Barchart mientras aún no pagas API. Cuando tengas suscripción, el backend reemplaza DEMO_FLOW por llamadas reales.</p>
-  </div>
-</div>
-<script>
-const API='https://flow-mac.onrender.com';
-function params(){return `market=${market.value}&min_premium=${minPremium.value}&min_vol_oi=${minVolOi.value}&max_spread=${maxSpread.value}`}
-function money(n){return '$'+Number(n||0).toLocaleString('en-US',{maximumFractionDigits:0})}
-function cls(x){return x==='VERDE'?'verde':x==='AMARILLO'?'amarillo':'rojo'}
-function actionText(x){if(x==='VAMOS_CON_TODO')return 'Vamos con todo, Mac · pasa filtros duros'; if(x==='ESPERAR_CONFIRMACION')return 'Esperar confirmación · todavía no dispara'; return 'NO OPERAR · no cumple edge'}
-function render(data){
-  status.innerHTML=`Fuente: <strong>${data.source}</strong> · Mercado: <strong>${data.market_mode||market.value}</strong>`;
-  summary.className='summary '+(data.summary==='NO HAY NADA'?'bad':'good'); summary.textContent=data.summary;
-  cards.innerHTML='';
-  data.items.forEach(x=>{
-    const div=document.createElement('div'); div.className='card';
-    const isCall=x.direction==='CALL';
-    div.innerHTML=`<div class="top"><div><span class="tk ${isCall?'call':'put'}">${x.ticker}</span><span class="dir ${isCall?'call':'put'}">${x.direction}</span><div class="sub">${x.contract} · ${x.expiry}</div></div><div class="score ${cls(x.semaforo)}">${x.score}/10</div></div>
-    <div class="body"><div class="kv">
-      <div class="k"><small>Premium</small><b>${money(x.premium)}</b></div><div class="k"><small>Vol/OI</small><b>${x.vol_oi}x</b></div>
-      <div class="k"><small>Bid / Ask</small><b>${x.bid} / ${x.ask}</b></div><div class="k"><small>Spread</small><b>${x.spread_pct}%</b></div>
-      <div class="k"><small>Ejecución</small><b>${x.execution}</b></div><div class="k"><small>Spot / Strike</small><b>${x.spot} / ${x.strike}</b></div>
-      <div class="k full"><small>Trigger</small><b>${x.vwap_trigger}</b></div>
-      <div class="k"><small>Stop</small><b>${x.stop}</b></div><div class="k"><small>Targets</small><b>${x.target_1} / ${x.target_2}</b></div>
-      <div class="k full"><small>Catalizador</small><b>${x.catalyst}</b></div>
-    </div><div class="action ${x.action==='VAMOS_CON_TODO'?'go':x.action==='ESPERAR_CONFIRMACION'?'wait':'no'}">${actionText(x.action)}</div></div>`;
-    cards.appendChild(div);
-  });
-}
-async function loadFlow(){status.textContent='Consultando backend...'; const r=await fetch(`${API}/api/flow?${params()}`); render(await r.json())}
-async function loadManual(){
-  try{const items=JSON.parse(manualJson.value); const r=await fetch(`${API}/api/manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items,market:market.value,min_premium:Number(minPremium.value),min_vol_oi:Number(minVolOi.value),max_spread:Number(maxSpread.value)})}); render(await r.json())}
-  catch(e){status.innerHTML='<strong style="color:var(--r)">JSON inválido o backend apagado:</strong> '+e.message}
-}
-function copyTemplate(){manualJson.value='[{"ticker":"NVDA","direction":"CALL","contract":"NVDA C950","expiry":"2026-05-15","strike":950,"spot":914.2,"premium":850000,"volume":8200,"open_interest":920,"bid":7.8,"ask":8.2,"execution":"above_ask","catalyst":"AI momentum","momentum":"alcista sobre VWAP","vwap_trigger":"romper 918 con volumen","stop":"pierde VWAP","target_1":"930","target_2":"950"}]'}
-</script>
+  <p style="margin-top:32px;color:#1d2235">
+    Repo: <a href="https://github.com/artugo666-cmd/flow-mac">artugo666-cmd/flow-mac</a>
+  </p>
 </body>
 </html>
