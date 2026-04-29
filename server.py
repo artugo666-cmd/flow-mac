@@ -431,6 +431,93 @@ def api_ticker(ticker: str):
     })
 
 
+
+# ── ANTHROPIC ANALYZE ─────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+@app.route('/api/analyze', methods=['POST'])
+def api_analyze():
+    """
+    Recibe un ticker + contexto, llama a Anthropic Claude desde el servidor
+    y devuelve el analisis completo. Evita el problema CORS del navegador.
+    """
+    import json as _json
+
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY no configurada en Render'}), 503
+
+    payload  = request.get_json(force=True, silent=True) or {}
+    ticker   = str(payload.get('ticker', '')).upper()
+    raw      = str(payload.get('alert_raw', ticker))
+    comment  = str(payload.get('comment', ''))
+    market   = str(payload.get('market', 'neutral'))
+    cap_min  = str(payload.get('cap_min', '500'))
+    cap_max  = str(payload.get('cap_max', '1500'))
+
+    if not ticker:
+        return jsonify({'error': 'Falta el campo ticker'}), 400
+
+    mkt_map = {'bullish':'alcista','bearish':'bajista','neutral':'neutral/mixto','volatile':'muy volatil'}
+    mkt_txt = mkt_map.get(market, 'neutral/mixto')
+    cmt_ctx = f"\nInfo adicional: {comment}" if comment else ""
+
+    prompt = (
+        f"Analiza {ticker} para opciones. BUSCA EN INTERNET: precio actual, "
+        f"volumen vs promedio 20d, %vs MA5/MA20/MA50, noticias 7 dias, "
+        f"short interest, sector, compradores vs vendedores (OBV).\n"
+        f"Contexto: {raw}{cmt_ctx}\n"
+        f"Mercado: {mkt_txt}. Capital: ${cap_min}-${cap_max} IBKR.\n\n"
+        f"SCORING (max 10.0):\n"
+        f"V1 Catalizador(max3.0): earnings/M&A=3.0|upgrade=2.5|noticia=1.5|nada=0.0\n"
+        f"V2 Flujo(max2.5): >5M=2.5|2-5M=2.0|1-2M=1.5|<1M=0.5\n"
+        f"V3 Momentum(max2.0): sobreMA20+MA50+vol>150pct=2.0|sobreMA50=1.2|lateral=0.6|bajo=0.0\n"
+        f"V4 Sector(max1.5): alcista=1.5|neutral=0.8|cae=0.0\n"
+        f"V5 Short(max1.0): >20pct=1.0|10-20pct=0.6|<10pct=0.2\n"
+        f"VERDE>=7|AMARILLO>=4|ROJO<4\n\n"
+        f"Responde SOLO JSON sin markdown:\n"
+        f"{{\"ticker\":\"{ticker}\",\"type\":\"CALL\",\"score\":7.5,\"semaforo\":\"VERDE\","
+        f"\"pts_catalyst\":2.5,\"pts_flow\":2.0,\"pts_momentum\":1.5,\"pts_sector\":1.0,\"pts_short\":0.5,"
+        f"\"score_breakdown\":\"Cat 2.5+Flujo 2.0+Mom 1.5+Sec 1.0+Short 0.5=7.5\","
+        f"\"strike\":100,\"expiry\":\"jun 2025\",\"flow_usd\":\"$1.8M\",\"price\":\"$95\"," 
+        f"\"vol_vs_avg\":\"185%\",\"ma5_pct\":\"+6%\",\"ma20_pct\":\"+11%\",\"ma50_pct\":\"+18%\"," 
+        f"\"momentum\":\"ALCISTA\",\"rsi\":\"Normal 55\",\"short_interest\":\"12%\"," 
+        f"\"news\":\"noticia o ninguna\",\"sentiment\":\"POSITIVO\"," 
+        f"\"control\":\"COMPRADORES 71%\",\"control_detail\":\"OBV al alza\"," 
+        f"\"why\":\"razon en 2 oraciones\",\"risk\":\"riesgo en 1 oracion\",\"catalyst\":\"evento o ninguno\"," 
+        f"\"ez\":\"$90-92\",\"pm\":\"$120-200\",\"c5\":3,\"c15\":9,\"sl\":\"$85\"}}"
+    )
+
+    try:
+        resp = requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key':         ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type':      'application/json',
+            },
+            json={
+                'model':      'claude-sonnet-4-6',
+                'max_tokens': 1400,
+                'tools': [{'type': 'web_search_20250305', 'name': 'web_search'}],
+                'messages': [{'role': 'user', 'content': prompt}]
+            },
+            timeout=60
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return jsonify({'error': f'Error llamando a Anthropic: {str(e)}'}), 502
+
+    text  = ''.join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
+    start = text.find('{')
+    end   = text.rfind('}')
+    if start == -1 or end == -1:
+        return jsonify({'error': 'Claude no devolvio JSON', 'raw': text[:300]}), 502
+    try:
+        return jsonify(_json.loads(text[start:end+1]))
+    except Exception as e:
+        return jsonify({'error': f'JSON invalido: {str(e)}', 'raw': text[:300]}), 502
+
 # ── ARRANQUE ─────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
