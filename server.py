@@ -12,9 +12,10 @@ from flask_cors import CORS
 
 # ── CONFIG ───────────────────────────────────────────────────
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR      = os.path.join(BASE_DIR, 'static')
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 
-app = Flask(__name__, static_folder=BASE_DIR, static_url_path='')
+app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='/static')
 CORS(app)
 
 
@@ -193,7 +194,7 @@ def fetch_polygon_snapshot(ticker: str) -> Optional[FlowAlert]:
 # ── RUTAS ────────────────────────────────────────────────────
 @app.route('/')
 def home():
-    return send_from_directory(BASE_DIR, 'index.html')
+    return send_from_directory(STATIC_DIR, 'index.html')
 
 
 @app.route('/api/health')
