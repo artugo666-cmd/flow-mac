@@ -192,6 +192,52 @@ def score_alert(
 
 
 # ── POLYGON HELPER ───────────────────────────────────────────
+def fetch_polygon_snapshot(ticker: str) -> Optional[FlowAlert]:
+    """
+    Obtiene datos basicos de un ticker via Polygon snapshot.
+    Usado cuando no hay flujo inusual de opciones.
+    """
+    if not POLYGON_API_KEY:
+        return None
+    try:
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+        r = requests.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        ticker_data = data.get("ticker", {})
+        day   = ticker_data.get("day", {})
+        prev  = ticker_data.get("prevDay", {})
+        close = float(day.get("c", 0))
+        vol   = int(day.get("v", 0))
+        pvol  = int(prev.get("v", 1))
+        vol_ratio = round(vol / pvol, 2) if pvol > 0 else 1.0
+        change_pct = float(ticker_data.get("todaysChangePerc", 0))
+        momentum = "alcista" if change_pct > 1 else "bajista" if change_pct < -1 else "lateral"
+        return FlowAlert(
+            ticker        = ticker,
+            direction     = "CALL" if change_pct >= 0 else "PUT",
+            contract      = f"{ticker} snapshot",
+            expiry        = "N/A",
+            strike        = round(close * 1.05, 2),
+            spot          = close,
+            premium       = vol * close * 0.01,
+            volume        = vol,
+            open_interest = pvol,
+            bid           = round(close * 0.99, 2),
+            ask           = round(close * 1.01, 2),
+            execution     = "mid",
+            catalyst      = f"Cambio del dia: {change_pct:+.2f}%",
+            momentum      = momentum,
+            vwap_trigger  = f"precio actual ${close}",
+            stop          = str(round(close * 0.95, 2)),
+            target_1      = str(round(close * 1.05, 2)),
+            target_2      = str(round(close * 1.10, 2)),
+        )
+    except Exception as e:
+        print(f"Snapshot error {ticker}: {e}")
+        return None
+
+
 def fetch_polygon_flow(ticker: str) -> List[FlowAlert]:
     """
     Llama a Polygon.io para obtener snapshot de opciones de un ticker.
@@ -432,91 +478,56 @@ def api_ticker(ticker: str):
 
 
 
-# ── ANTHROPIC ANALYZE ─────────────────────────────────────────
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
+# ── ANALYZE TICKER via Polygon ───────────────────────────────
 @app.route('/api/analyze', methods=['POST'])
 def api_analyze():
     """
-    Recibe un ticker + contexto, llama a Anthropic Claude desde el servidor
-    y devuelve el analisis completo. Evita el problema CORS del navegador.
+    Recibe uno o varios tickers del frontend,
+    obtiene datos de Polygon y devuelve el analisis con scoring.
     """
-    import json as _json
+    payload     = request.get_json(force=True, silent=True) or {}
+    tickers_raw = payload.get('tickers', '')
+    market      = payload.get('market', 'neutral')
+    min_vol_oi  = float(payload.get('min_vol_oi', 1.0))
+    min_premium = float(payload.get('min_premium', 50_000))
+    max_spread  = float(payload.get('max_spread', 20))
 
-    if not ANTHROPIC_API_KEY:
-        return jsonify({'error': 'ANTHROPIC_API_KEY no configurada en Render'}), 503
+    if not tickers_raw:
+        return jsonify({'error': 'Falta el campo tickers'}), 400
 
-    payload  = request.get_json(force=True, silent=True) or {}
-    ticker   = str(payload.get('ticker', '')).upper()
-    raw      = str(payload.get('alert_raw', ticker))
-    comment  = str(payload.get('comment', ''))
-    market   = str(payload.get('market', 'neutral'))
-    cap_min  = str(payload.get('cap_min', '500'))
-    cap_max  = str(payload.get('cap_max', '1500'))
+    tickers = [t.strip().upper() for t in str(tickers_raw).split(',') if t.strip()]
+    if not tickers:
+        return jsonify({'error': 'No se encontraron tickers validos'}), 400
 
-    if not ticker:
-        return jsonify({'error': 'Falta el campo ticker'}), 400
+    all_alerts: List[FlowAlert] = []
+    for tk in tickers:
+        found = fetch_polygon_flow(tk)
+        if not found:
+            # Si Polygon no tiene flujo, crear una alerta basica con datos snapshot
+            snapshot = fetch_polygon_snapshot(tk)
+            if snapshot:
+                all_alerts.append(snapshot)
+        else:
+            all_alerts.extend(found)
 
-    mkt_map = {'bullish':'alcista','bearish':'bajista','neutral':'neutral/mixto','volatile':'muy volatil'}
-    mkt_txt = mkt_map.get(market, 'neutral/mixto')
-    cmt_ctx = f"\nInfo adicional: {comment}" if comment else ""
+    if not all_alerts:
+        return jsonify({
+            'source':  'polygon_realtime',
+            'summary': 'Sin flujo inusual detectado para los tickers solicitados. Mercado puede estar cerrado.',
+            'items':   []
+        })
 
-    prompt = (
-        f"Analiza {ticker} para opciones. BUSCA EN INTERNET: precio actual, "
-        f"volumen vs promedio 20d, %vs MA5/MA20/MA50, noticias 7 dias, "
-        f"short interest, sector, compradores vs vendedores (OBV).\n"
-        f"Contexto: {raw}{cmt_ctx}\n"
-        f"Mercado: {mkt_txt}. Capital: ${cap_min}-${cap_max} IBKR.\n\n"
-        f"SCORING (max 10.0):\n"
-        f"V1 Catalizador(max3.0): earnings/M&A=3.0|upgrade=2.5|noticia=1.5|nada=0.0\n"
-        f"V2 Flujo(max2.5): >5M=2.5|2-5M=2.0|1-2M=1.5|<1M=0.5\n"
-        f"V3 Momentum(max2.0): sobreMA20+MA50+vol>150pct=2.0|sobreMA50=1.2|lateral=0.6|bajo=0.0\n"
-        f"V4 Sector(max1.5): alcista=1.5|neutral=0.8|cae=0.0\n"
-        f"V5 Short(max1.0): >20pct=1.0|10-20pct=0.6|<10pct=0.2\n"
-        f"VERDE>=7|AMARILLO>=4|ROJO<4\n\n"
-        f"Responde SOLO JSON sin markdown:\n"
-        f"{{\"ticker\":\"{ticker}\",\"type\":\"CALL\",\"score\":7.5,\"semaforo\":\"VERDE\","
-        f"\"pts_catalyst\":2.5,\"pts_flow\":2.0,\"pts_momentum\":1.5,\"pts_sector\":1.0,\"pts_short\":0.5,"
-        f"\"score_breakdown\":\"Cat 2.5+Flujo 2.0+Mom 1.5+Sec 1.0+Short 0.5=7.5\","
-        f"\"strike\":100,\"expiry\":\"jun 2025\",\"flow_usd\":\"$1.8M\",\"price\":\"$95\"," 
-        f"\"vol_vs_avg\":\"185%\",\"ma5_pct\":\"+6%\",\"ma20_pct\":\"+11%\",\"ma50_pct\":\"+18%\"," 
-        f"\"momentum\":\"ALCISTA\",\"rsi\":\"Normal 55\",\"short_interest\":\"12%\"," 
-        f"\"news\":\"noticia o ninguna\",\"sentiment\":\"POSITIVO\"," 
-        f"\"control\":\"COMPRADORES 71%\",\"control_detail\":\"OBV al alza\"," 
-        f"\"why\":\"razon en 2 oraciones\",\"risk\":\"riesgo en 1 oracion\",\"catalyst\":\"evento o ninguno\"," 
-        f"\"ez\":\"$90-92\",\"pm\":\"$120-200\",\"c5\":3,\"c15\":9,\"sl\":\"$85\"}}"
-    )
+    ranked = [score_alert(x, market, max_spread, min_vol_oi, min_premium) for x in all_alerts]
+    ranked.sort(key=lambda x: x['score'], reverse=True)
+    verdes = sum(1 for x in ranked if x['semaforo'] == 'VERDE')
 
-    try:
-        resp = requests.post(
-            'https://api.anthropic.com/v1/messages',
-            headers={
-                'x-api-key':         ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-                'content-type':      'application/json',
-            },
-            json={
-                'model':      'claude-sonnet-4-6',
-                'max_tokens': 1400,
-                'tools': [{'type': 'web_search_20250305', 'name': 'web_search'}],
-                'messages': [{'role': 'user', 'content': prompt}]
-            },
-            timeout=60
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        return jsonify({'error': f'Error llamando a Anthropic: {str(e)}'}), 502
+    return jsonify({
+        'source':    'polygon_realtime',
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'summary':   'Sin setups hoy.' if verdes == 0 else f'{verdes} setup(s) con señal verde.',
+        'items':     ranked,
+    })
 
-    text  = ''.join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
-    start = text.find('{')
-    end   = text.rfind('}')
-    if start == -1 or end == -1:
-        return jsonify({'error': 'Claude no devolvio JSON', 'raw': text[:300]}), 502
-    try:
-        return jsonify(_json.loads(text[start:end+1]))
-    except Exception as e:
-        return jsonify({'error': f'JSON invalido: {str(e)}', 'raw': text[:300]}), 502
 
 # ── ARRANQUE ─────────────────────────────────────────────────
 if __name__ == '__main__':
