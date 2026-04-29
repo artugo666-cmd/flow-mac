@@ -1,62 +1,38 @@
 from __future__ import annotations
 
-import subprocess, sys
-
-def install(pkg):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
-
-try:
-    import requests
-except ImportError:
-    install("requests")
-    import requests
-
-try:
-    import flask
-except ImportError:
-    install("flask")
-
-try:
-    import flask_cors
-except ImportError:
-    install("flask-cors")
-
 import os
-from dataclasses import dataclass, asdict, field
+import json
+import requests
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-import os as _os
-app = Flask(__name__, static_folder=_os.path.dirname(_os.path.abspath(__file__)))
-CORS(app)
-
-# ============================================================
-# FlowScan Backend — Corregido
-# Fase 1: datos demo con scoring real
-# Fase 2: Polygon.io en tiempo real (ya conectado)
-# ============================================================
-
+# ── CONFIG ───────────────────────────────────────────────────
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 
+app = Flask(__name__, static_folder=BASE_DIR, static_url_path='')
+CORS(app)
 
-# ── MODELO DE ALERTA ────────────────────────────────────────
+
+# ── MODELO ───────────────────────────────────────────────────
 @dataclass
 class FlowAlert:
     ticker: str
-    direction: str        # CALL | PUT
+    direction: str
     contract: str
     expiry: str
     strike: float
     spot: float
-    premium: float        # dolares totales del flujo
+    premium: float
     volume: int
     open_interest: int
     bid: float
     ask: float
-    execution: str        # above_ask | ask | mid | below_bid
+    execution: str
     catalyst: str
     momentum: str
     vwap_trigger: str
@@ -80,70 +56,28 @@ class FlowAlert:
 
 # ── DATOS DEMO ───────────────────────────────────────────────
 DEMO_FLOW: List[FlowAlert] = [
-    FlowAlert('NVDA', 'CALL', 'NVDA 2026-05-15 C 950',  '2026-05-15', 950,  914.20, 850000, 8200, 920,  7.80, 8.20,  'above_ask', 'AI / semis momentum',              'alcista sobre VWAP', 'romper 918 con volumen 5m > promedio', 'pierde VWAP 5m', '930', '950'),
-    FlowAlert('AMD',  'CALL', 'AMD 2026-05-15 C 190',   '2026-05-15', 190,  181.50, 410000, 6500, 700,  2.10, 2.28,  'ask',       'semis sympathy + volumen fresco',   'alcista',            'romper 183.20 y sostener VWAP',        '181 bajo VWAP',  '187', '190'),
-    FlowAlert('TSLA', 'PUT',  'TSLA 2026-05-08 P 145',  '2026-05-08', 145,  151.10, 620000, 9800, 1300, 3.40, 3.75,  'above_ask', 'presión técnica / debilidad',        'bajista bajo VWAP',  'rechazo en 152 y pierde 150.50',       'recupera 153',   '147', '145'),
-    FlowAlert('AAPL', 'CALL', 'AAPL 2026-05-15 C 190',  '2026-05-15', 190,  184.80, 210000, 3000, 2600, 1.15, 1.32,  'mid',       'sin catalizador fuerte',             'lateral',            'solo si rompe 186 con volumen',         '183.50',         '188', '190'),
-    FlowAlert('RBLX', 'PUT',  'RBLX 2026-05-15 P 60',   '2026-05-15', 60,   63.20,  355000, 4400, 500,  1.70, 1.88,  'ask',       'debilidad growth / ruptura soporte', 'bajista',            'perder 62.80 con volumen',             '64.20',          '61',  '60'),
+    FlowAlert('NVDA','CALL','NVDA 2026-05-15 C 950','2026-05-15',950,914.20,850000,8200,920,7.80,8.20,'above_ask','AI / semis momentum','alcista sobre VWAP','romper 918 con volumen','pierde VWAP 5m','930','950'),
+    FlowAlert('AMD','CALL','AMD 2026-05-15 C 190','2026-05-15',190,181.50,410000,6500,700,2.10,2.28,'ask','semis sympathy + volumen fresco','alcista','romper 183.20 y sostener VWAP','181 bajo VWAP','187','190'),
+    FlowAlert('TSLA','PUT','TSLA 2026-05-08 P 145','2026-05-08',145,151.10,620000,9800,1300,3.40,3.75,'above_ask','presion tecnica / debilidad','bajista bajo VWAP','rechazo en 152 y pierde 150.50','recupera 153','147','145'),
+    FlowAlert('AAPL','CALL','AAPL 2026-05-15 C 190','2026-05-15',190,184.80,210000,3000,2600,1.15,1.32,'mid','sin catalizador fuerte','lateral','solo si rompe 186 con volumen','183.50','188','190'),
+    FlowAlert('RBLX','PUT','RBLX 2026-05-15 P 60','2026-05-15',60,63.20,355000,4400,500,1.70,1.88,'ask','debilidad growth / ruptura soporte','bajista','perder 62.80 con volumen','64.20','61','60'),
 ]
 
 
-# ── SISTEMA DE SCORING ───────────────────────────────────────
-def score_alert(
-    a: FlowAlert,
-    market_mode: str,
-    max_spread: float,
-    min_vol_oi: float,
-    min_premium: float
-) -> Dict[str, Any]:
-
+# ── SCORING ──────────────────────────────────────────────────
+def score_alert(a: FlowAlert, market_mode: str, max_spread: float, min_vol_oi: float, min_premium: float) -> Dict[str, Any]:
     vol_oi = a.vol_oi
     spread = a.spread_pct
 
-    # V1 — Catalizador (max 2.5)
-    pts_catalyst = 2.5 if a.catalyst and 'sin catalizador' not in a.catalyst.lower() else 0.5
-
-    # V2 — Flujo premium (max 2.5)
-    if a.premium >= 1_000_000:
-        pts_flow = 2.5
-    elif a.premium >= 500_000:
-        pts_flow = 2.0
-    elif a.premium >= 300_000:
-        pts_flow = 1.5
-    elif a.premium >= 150_000:
-        pts_flow = 0.8
-    else:
-        pts_flow = 0.3
-
-    # V3 — Vol / OI ratio (max 1.5)
-    if vol_oi >= 8:
-        pts_voloi = 1.5
-    elif vol_oi >= 5:
-        pts_voloi = 1.0
-    elif vol_oi >= 2:
-        pts_voloi = 0.5
-    else:
-        pts_voloi = 0.0
-
-    # V4 — Tipo de ejecucion (max 1.5) — above ask = institucional agresivo
-    if a.execution == 'above_ask':
-        pts_execution = 1.5
-    elif a.execution == 'ask':
-        pts_execution = 1.0
-    else:
-        pts_execution = 0.2
-
-    # V5 — Momentum alineado con direccion (max 2.0)
-    direction_alcista = 'alcista' in a.momentum.lower() and a.direction == 'CALL'
-    direction_bajista = 'bajista' in a.momentum.lower() and a.direction == 'PUT'
-    pts_momentum = 2.0 if (direction_alcista or direction_bajista) else 0.6
-
-    # V6 — Spread ajustado (max 1.0)
-    pts_spread = 1.0 if spread <= max_spread else 0.0
+    pts_catalyst  = 2.5 if a.catalyst and 'sin catalizador' not in a.catalyst.lower() else 0.5
+    pts_flow      = 2.5 if a.premium >= 1_000_000 else 2.0 if a.premium >= 500_000 else 1.5 if a.premium >= 300_000 else 0.8 if a.premium >= 150_000 else 0.3
+    pts_voloi     = 1.5 if vol_oi >= 8 else 1.0 if vol_oi >= 5 else 0.5 if vol_oi >= 2 else 0.0
+    pts_execution = 1.5 if a.execution == 'above_ask' else 1.0 if a.execution == 'ask' else 0.2
+    pts_momentum  = 2.0 if ('alcista' in a.momentum.lower() and a.direction == 'CALL') or ('bajista' in a.momentum.lower() and a.direction == 'PUT') else 0.6
+    pts_spread    = 1.0 if spread <= max_spread else 0.0
 
     raw = pts_catalyst + pts_flow + pts_voloi + pts_execution + pts_momentum + pts_spread
 
-    # Ajuste dinamico por regimen de mercado
     if market_mode == 'volatile':
         raw += 0.4 if a.execution in ('ask', 'above_ask') else -0.2
     elif market_mode == 'bearish' and a.direction == 'PUT':
@@ -151,342 +85,170 @@ def score_alert(
     elif market_mode == 'bullish' and a.direction == 'CALL':
         raw += 0.5
 
-    score = round(min(raw, 10.0), 1)
-
-    # Filtros duros para VERDE
-    passes = (
-        a.premium >= min_premium and
-        vol_oi >= min_vol_oi and
-        spread <= max_spread and
-        a.execution in ('ask', 'above_ask') and
-        score >= 7.0
-    )
+    score  = round(min(raw, 10.0), 1)
+    passes = a.premium >= min_premium and vol_oi >= min_vol_oi and spread <= max_spread and a.execution in ('ask', 'above_ask') and score >= 7.0
 
     if passes:
-        action   = 'VAMOS_CON_TODO'
-        semaforo = 'VERDE'
+        action, semaforo = 'VAMOS_CON_TODO', 'VERDE'
     elif score >= 5.0:
-        action   = 'ESPERAR_CONFIRMACION'
-        semaforo = 'AMARILLO'
+        action, semaforo = 'ESPERAR_CONFIRMACION', 'AMARILLO'
     else:
-        action   = 'NO_OPERAR'
-        semaforo = 'ROJO'
+        action, semaforo = 'NO_OPERAR', 'ROJO'
 
     d = asdict(a)
     d.update({
-        'vol_oi':          vol_oi,
-        'spread_pct':      spread,
-        'score':           score,
-        'semaforo':        semaforo,
-        'action':          action,
-        'passes_filters':  passes,
-        'score_breakdown': {
-            'catalyst':      pts_catalyst,
-            'premium_flow':  pts_flow,
-            'vol_oi_ratio':  pts_voloi,
-            'execution':     pts_execution,
-            'momentum':      pts_momentum,
-            'spread':        pts_spread,
-        }
+        'vol_oi': vol_oi, 'spread_pct': spread,
+        'score': score, 'semaforo': semaforo, 'action': action, 'passes_filters': passes,
+        'pts_catalyst': pts_catalyst, 'pts_flow': pts_flow,
+        'pts_momentum': pts_momentum, 'pts_sector': 0.8, 'pts_short': 0.2,
+        'score_breakdown': f'Cat {pts_catalyst}+Flujo {pts_flow}+Mom {pts_momentum}+Ejec {pts_execution}+Spread {pts_spread}={score}',
     })
     return d
 
 
-# ── POLYGON HELPER ───────────────────────────────────────────
+# ── POLYGON ──────────────────────────────────────────────────
+def fetch_polygon_flow(ticker: str) -> List[FlowAlert]:
+    if not POLYGON_API_KEY:
+        return []
+    try:
+        r = requests.get(
+            f"https://api.polygon.io/v3/snapshot/options/{ticker}",
+            params={"apiKey": POLYGON_API_KEY, "limit": 50, "order": "desc", "sort": "volume"},
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"Polygon error {ticker}: {e}")
+        return []
+
+    alerts = []
+    for item in data.get("results", []):
+        details = item.get("details", {})
+        day     = item.get("day", {})
+        last    = item.get("last_quote", {})
+        volume  = int(day.get("volume", 0))
+        oi      = int(item.get("open_interest", 0))
+        if volume == 0 or oi == 0 or volume / oi < 1.5:
+            continue
+        contract_type = details.get("contract_type", "call").upper()
+        strike  = float(details.get("strike_price", 0))
+        expiry  = details.get("expiration_date", "")
+        bid     = float(last.get("bid", 0))
+        ask     = float(last.get("ask", 0))
+        mid     = (bid + ask) / 2
+        premium = round(mid * volume * 100, 2)
+        last_p  = float(day.get("close", mid))
+        execution = "above_ask" if last_p >= ask else "ask" if last_p >= ask * 0.98 else "mid"
+        alerts.append(FlowAlert(
+            ticker=ticker, direction=contract_type,
+            contract=f"{ticker} {expiry} {contract_type[0]} {strike}",
+            expiry=expiry, strike=strike,
+            spot=float(item.get("underlying_asset", {}).get("price", 0)),
+            premium=premium, volume=volume, open_interest=oi,
+            bid=bid, ask=ask, execution=execution,
+            catalyst="flujo inusual via Polygon",
+            momentum="alcista" if contract_type == "CALL" else "bajista",
+            vwap_trigger=f"romper strike {strike} con volumen",
+            stop="", target_1=str(round(strike * 1.03, 2)), target_2=str(round(strike * 1.06, 2)),
+        ))
+    return alerts
+
+
 def fetch_polygon_snapshot(ticker: str) -> Optional[FlowAlert]:
-    """
-    Obtiene datos basicos de un ticker via Polygon snapshot.
-    Usado cuando no hay flujo inusual de opciones.
-    """
     if not POLYGON_API_KEY:
         return None
     try:
-        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
-        r = requests.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=10)
+        r = requests.get(
+            f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=10
+        )
         r.raise_for_status()
-        data = r.json()
-        ticker_data = data.get("ticker", {})
-        day   = ticker_data.get("day", {})
-        prev  = ticker_data.get("prevDay", {})
-        close = float(day.get("c", 0))
-        vol   = int(day.get("v", 0))
-        pvol  = int(prev.get("v", 1))
-        vol_ratio = round(vol / pvol, 2) if pvol > 0 else 1.0
-        change_pct = float(ticker_data.get("todaysChangePerc", 0))
-        momentum = "alcista" if change_pct > 1 else "bajista" if change_pct < -1 else "lateral"
+        td  = r.json().get("ticker", {})
+        day = td.get("day", {})
+        pv  = td.get("prevDay", {})
+        close     = float(day.get("c", 0))
+        vol       = int(day.get("v", 0))
+        pvol      = int(pv.get("v", 1))
+        change    = float(td.get("todaysChangePerc", 0))
+        momentum  = "alcista" if change > 1 else "bajista" if change < -1 else "lateral"
         return FlowAlert(
-            ticker        = ticker,
-            direction     = "CALL" if change_pct >= 0 else "PUT",
-            contract      = f"{ticker} snapshot",
-            expiry        = "N/A",
-            strike        = round(close * 1.05, 2),
-            spot          = close,
-            premium       = vol * close * 0.01,
-            volume        = vol,
-            open_interest = pvol,
-            bid           = round(close * 0.99, 2),
-            ask           = round(close * 1.01, 2),
-            execution     = "mid",
-            catalyst      = f"Cambio del dia: {change_pct:+.2f}%",
-            momentum      = momentum,
-            vwap_trigger  = f"precio actual ${close}",
-            stop          = str(round(close * 0.95, 2)),
-            target_1      = str(round(close * 1.05, 2)),
-            target_2      = str(round(close * 1.10, 2)),
+            ticker=ticker, direction="CALL" if change >= 0 else "PUT",
+            contract=f"{ticker} snapshot", expiry="N/A",
+            strike=round(close * 1.05, 2), spot=close,
+            premium=vol * close * 0.01, volume=vol, open_interest=max(pvol, 1),
+            bid=round(close * 0.99, 2), ask=round(close * 1.01, 2),
+            execution="mid", catalyst=f"Cambio del dia: {change:+.2f}%",
+            momentum=momentum, vwap_trigger=f"precio actual ${close}",
+            stop=str(round(close * 0.95, 2)),
+            target_1=str(round(close * 1.05, 2)),
+            target_2=str(round(close * 1.10, 2)),
         )
     except Exception as e:
         print(f"Snapshot error {ticker}: {e}")
         return None
 
 
-def fetch_polygon_flow(ticker: str) -> List[FlowAlert]:
-    """
-    Llama a Polygon.io para obtener snapshot de opciones de un ticker.
-    Filtra contratos con volumen inusual (vol/OI > 2) y los convierte a FlowAlert.
-    """
-    if not POLYGON_API_KEY:
-        return []
-
-    url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-    params = {
-        "apiKey": POLYGON_API_KEY,
-        "limit":  50,
-        "order":  "desc",
-        "sort":   "volume",
-    }
-
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        print(f"Polygon error for {ticker}: {e}")
-        return []
-
-    alerts = []
-    results = data.get("results", [])
-
-    for item in results:
-        details = item.get("details", {})
-        greeks  = item.get("greeks", {})
-        day     = item.get("day", {})
-        last    = item.get("last_quote", {})
-
-        volume = int(day.get("volume", 0))
-        oi     = int(item.get("open_interest", 0))
-        if volume == 0 or oi == 0:
-            continue
-
-        vol_oi_ratio = volume / oi
-        if vol_oi_ratio < 1.5:   # solo flujo inusual
-            continue
-
-        contract_type = details.get("contract_type", "call").upper()
-        strike        = float(details.get("strike_price", 0))
-        expiry        = details.get("expiration_date", "")
-        bid           = float(last.get("bid", 0))
-        ask           = float(last.get("ask", 0))
-        mid           = (bid + ask) / 2
-        premium       = round(mid * volume * 100, 2)
-
-        # Determinar tipo de ejecucion aproximado
-        last_price = float(day.get("close", mid))
-        if last_price >= ask:
-            execution = "above_ask"
-        elif last_price >= ask * 0.98:
-            execution = "ask"
-        else:
-            execution = "mid"
-
-        alert = FlowAlert(
-            ticker        = ticker,
-            direction     = contract_type,
-            contract      = f"{ticker} {expiry} {contract_type[0]} {strike}",
-            expiry        = expiry,
-            strike        = strike,
-            spot          = float(item.get("underlying_asset", {}).get("price", 0)),
-            premium       = premium,
-            volume        = volume,
-            open_interest = oi,
-            bid           = bid,
-            ask           = ask,
-            execution     = execution,
-            catalyst      = "flujo inusual detectado via Polygon",
-            momentum      = "alcista" if contract_type == "CALL" else "bajista",
-            vwap_trigger  = f"romper strike {strike} con volumen",
-            stop          = "",
-            target_1      = str(round(strike * 1.03, 2)),
-            target_2      = str(round(strike * 1.06, 2)),
-        )
-        alerts.append(alert)
-
-    return alerts
-
-
 # ── RUTAS ────────────────────────────────────────────────────
 @app.route('/')
 def home():
-    dir_path = _os.path.dirname(_os.path.abspath(__file__))
-    return send_from_directory(dir_path, 'index.html')
+    return send_from_directory(BASE_DIR, 'index.html')
 
 
 @app.route('/api/health')
 def health():
-    polygon_ok = bool(POLYGON_API_KEY)
     return jsonify({
-        'ok':          True,
-        'service':     'FlowScan Backend',
-        'version':     '1.0',
-        'time':        datetime.now().isoformat(timespec='seconds'),
-        'polygon_key': 'configurada' if polygon_ok else 'FALTA — agrega POLYGON_API_KEY en Render',
+        'ok': True,
+        'service': 'FlowScan 8',
+        'version': '2.0',
+        'time': datetime.now().isoformat(timespec='seconds'),
+        'polygon_key': 'configurada' if POLYGON_API_KEY else 'FALTA',
     })
 
 
 @app.route('/api/flow')
 def api_flow():
-    """
-    Devuelve alertas rankeadas.
-    Si POLYGON_API_KEY esta configurada, busca flujo real de los tickers solicitados.
-    Si no, devuelve datos demo.
-    """
-    market_mode  = request.args.get('market',      'neutral')
-    max_spread   = float(request.args.get('max_spread',   15))
-    min_vol_oi   = float(request.args.get('min_vol_oi',    5))
-    min_premium  = float(request.args.get('min_premium', 300_000))
-    tickers_raw  = request.args.get('tickers', '')   # ej: "NVDA,AMD,TSLA"
+    market_mode = request.args.get('market', 'neutral')
+    max_spread  = float(request.args.get('max_spread', 15))
+    min_vol_oi  = float(request.args.get('min_vol_oi', 2))
+    min_premium = float(request.args.get('min_premium', 100_000))
+    tickers_raw = request.args.get('tickers', '')
 
-    # Fuente de datos: Polygon real o demo
     if POLYGON_API_KEY and tickers_raw:
-        tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
-        flow_data: List[FlowAlert] = []
+        tickers   = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
+        flow_data = []
         for tk in tickers:
-            flow_data.extend(fetch_polygon_flow(tk))
+            found = fetch_polygon_flow(tk)
+            if found:
+                flow_data.extend(found)
+            else:
+                snap = fetch_polygon_snapshot(tk)
+                if snap:
+                    flow_data.append(snap)
         source = 'polygon_realtime'
     else:
         flow_data = DEMO_FLOW
-        source    = 'demo_manual'
+        source    = 'demo'
 
     if not flow_data:
-        return jsonify({
-            'source':  source,
-            'summary': 'Sin datos. Verifica POLYGON_API_KEY y tickers.',
-            'items':   [],
-        })
+        return jsonify({'source': source, 'summary': 'Sin flujo inusual detectado hoy.', 'items': []})
 
     ranked = [score_alert(x, market_mode, max_spread, min_vol_oi, min_premium) for x in flow_data]
     ranked.sort(key=lambda x: x['score'], reverse=True)
-
     verdes = sum(1 for x in ranked if x['semaforo'] == 'VERDE')
-    summary = 'NO HAY NADA QUE OPERE HOY' if verdes == 0 else f'{verdes} setup(s) pasan todos los filtros — listos para entrar.'
 
     return jsonify({
-        'source':      source,
+        'source': source,
         'market_mode': market_mode,
-        'timestamp':   datetime.now().isoformat(timespec='seconds'),
-        'filters': {
-            'max_spread':  max_spread,
-            'min_vol_oi':  min_vol_oi,
-            'min_premium': min_premium,
-        },
-        'summary': summary,
-        'items':   ranked,
-    })
-
-
-@app.route('/api/manual', methods=['POST'])
-def api_manual():
-    """
-    Recibe alertas manuales en JSON y las rankea con el mismo scoring.
-    Util para pegar las alertas de tu grupo de Discord/Telegram.
-    """
-    payload     = request.get_json(force=True, silent=True) or {}
-    rows        = payload.get('items', [])
-    market_mode = payload.get('market',      'neutral')
-    max_spread  = float(payload.get('max_spread',   15))
-    min_vol_oi  = float(payload.get('min_vol_oi',    5))
-    min_premium = float(payload.get('min_premium', 300_000))
-
-    if not rows:
-        return jsonify({'error': 'Manda items en el body JSON'}), 400
-
-    alerts = []
-    for r in rows:
-        try:
-            alerts.append(FlowAlert(
-                ticker        = str(r.get('ticker',       '')).upper(),
-                direction     = str(r.get('direction',    'CALL')).upper(),
-                contract      = str(r.get('contract',     '')),
-                expiry        = str(r.get('expiry',       '')),
-                strike        = float(r.get('strike',     0)),
-                spot          = float(r.get('spot',       0)),
-                premium       = float(r.get('premium',    0)),
-                volume        = int(r.get('volume',       0)),
-                open_interest = int(r.get('open_interest',0)),
-                bid           = float(r.get('bid',        0)),
-                ask           = float(r.get('ask',        0)),
-                execution     = str(r.get('execution',    'mid')),
-                catalyst      = str(r.get('catalyst',     '')),
-                momentum      = str(r.get('momentum',     'lateral')),
-                vwap_trigger  = str(r.get('vwap_trigger', '')),
-                stop          = str(r.get('stop',         '')),
-                target_1      = str(r.get('target_1',     '')),
-                target_2      = str(r.get('target_2',     '')),
-            ))
-        except Exception as e:
-            print(f"Error parsing row {r}: {e}")
-            continue
-
-    if not alerts:
-        return jsonify({'error': 'Ninguna alerta valida en el payload'}), 400
-
-    ranked = [score_alert(x, market_mode, max_spread, min_vol_oi, min_premium) for x in alerts]
-    ranked.sort(key=lambda x: x['score'], reverse=True)
-    verdes = sum(1 for x in ranked if x['semaforo'] == 'VERDE')
-
-    return jsonify({
-        'source':  'manual_payload',
-        'summary': 'NO HAY NADA' if verdes == 0 else f'{verdes} setup(s) pasan filtros duros.',
-        'items':   ranked,
-    })
-
-
-@app.route('/api/ticker/<ticker>')
-def api_ticker(ticker: str):
-    """
-    Endpoint rapido para ver flujo inusual de un ticker especifico via Polygon.
-    Ejemplo: GET /api/ticker/AMD
-    """
-    if not POLYGON_API_KEY:
-        return jsonify({'error': 'POLYGON_API_KEY no configurada en Render'}), 503
-
-    market_mode = request.args.get('market',      'neutral')
-    max_spread  = float(request.args.get('max_spread',   15))
-    min_vol_oi  = float(request.args.get('min_vol_oi',    2))
-    min_premium = float(request.args.get('min_premium', 100_000))
-
-    alerts = fetch_polygon_flow(ticker.upper())
-    if not alerts:
-        return jsonify({'ticker': ticker.upper(), 'message': 'Sin flujo inusual detectado hoy.', 'items': []})
-
-    ranked = [score_alert(x, market_mode, max_spread, min_vol_oi, min_premium) for x in alerts]
-    ranked.sort(key=lambda x: x['score'], reverse=True)
-
-    return jsonify({
-        'ticker':    ticker.upper(),
-        'source':    'polygon_realtime',
         'timestamp': datetime.now().isoformat(timespec='seconds'),
-        'items':     ranked,
+        'summary': f'{verdes} setup(s) con señal verde.' if verdes else 'Sin setups claros hoy.',
+        'items': ranked,
     })
 
 
-
-# ── ANALYZE TICKER via Polygon ───────────────────────────────
 @app.route('/api/analyze', methods=['POST'])
 def api_analyze():
-    """
-    Recibe uno o varios tickers del frontend,
-    obtiene datos de Polygon y devuelve el analisis con scoring.
-    """
     payload     = request.get_json(force=True, silent=True) or {}
     tickers_raw = payload.get('tickers', '')
     market      = payload.get('market', 'neutral')
@@ -498,37 +260,48 @@ def api_analyze():
         return jsonify({'error': 'Falta el campo tickers'}), 400
 
     tickers = [t.strip().upper() for t in str(tickers_raw).split(',') if t.strip()]
-    if not tickers:
-        return jsonify({'error': 'No se encontraron tickers validos'}), 400
-
     all_alerts: List[FlowAlert] = []
     for tk in tickers:
         found = fetch_polygon_flow(tk)
-        if not found:
-            # Si Polygon no tiene flujo, crear una alerta basica con datos snapshot
-            snapshot = fetch_polygon_snapshot(tk)
-            if snapshot:
-                all_alerts.append(snapshot)
-        else:
+        if found:
             all_alerts.extend(found)
+        else:
+            snap = fetch_polygon_snapshot(tk)
+            if snap:
+                all_alerts.append(snap)
 
     if not all_alerts:
-        return jsonify({
-            'source':  'polygon_realtime',
-            'summary': 'Sin flujo inusual detectado para los tickers solicitados. Mercado puede estar cerrado.',
-            'items':   []
-        })
+        return jsonify({'source': 'polygon_realtime', 'summary': 'Sin datos disponibles.', 'items': []})
 
     ranked = [score_alert(x, market, max_spread, min_vol_oi, min_premium) for x in all_alerts]
     ranked.sort(key=lambda x: x['score'], reverse=True)
     verdes = sum(1 for x in ranked if x['semaforo'] == 'VERDE')
 
     return jsonify({
-        'source':    'polygon_realtime',
+        'source': 'polygon_realtime',
         'timestamp': datetime.now().isoformat(timespec='seconds'),
-        'summary':   'Sin setups hoy.' if verdes == 0 else f'{verdes} setup(s) con señal verde.',
-        'items':     ranked,
+        'summary': f'{verdes} setup(s) con señal verde.' if verdes else 'Sin setups claros.',
+        'items': ranked,
     })
+
+
+@app.route('/api/ticker/<ticker>')
+def api_ticker(ticker: str):
+    if not POLYGON_API_KEY:
+        return jsonify({'error': 'POLYGON_API_KEY no configurada'}), 503
+    market     = request.args.get('market', 'neutral')
+    min_vol_oi = float(request.args.get('min_vol_oi', 1.0))
+    min_premium= float(request.args.get('min_premium', 50_000))
+    alerts     = fetch_polygon_flow(ticker.upper())
+    if not alerts:
+        snap = fetch_polygon_snapshot(ticker.upper())
+        if snap:
+            alerts = [snap]
+    if not alerts:
+        return jsonify({'ticker': ticker.upper(), 'message': 'Sin datos hoy.', 'items': []})
+    ranked = [score_alert(x, market, 20, min_vol_oi, min_premium) for x in alerts]
+    ranked.sort(key=lambda x: x['score'], reverse=True)
+    return jsonify({'ticker': ticker.upper(), 'source': 'polygon_realtime', 'timestamp': datetime.now().isoformat(timespec='seconds'), 'items': ranked})
 
 
 # ── ARRANQUE ─────────────────────────────────────────────────
