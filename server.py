@@ -1,7 +1,27 @@
 from __future__ import annotations
 
+import subprocess, sys
+
+def install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+try:
+    import requests
+except ImportError:
+    install("requests")
+    import requests
+
+try:
+    import flask
+except ImportError:
+    install("flask")
+
+try:
+    import flask_cors
+except ImportError:
+    install("flask-cors")
+
 import os
-import requests
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
