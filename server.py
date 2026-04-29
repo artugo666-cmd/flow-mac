@@ -129,7 +129,7 @@ def fetch_polygon_flow(ticker: str) -> List[FlowAlert]:
         last    = item.get("last_quote", {})
         volume  = int(day.get("volume", 0))
         oi      = int(item.get("open_interest", 0))
-        if volume == 0 or oi == 0 or volume / oi < 1.5:
+        if volume == 0 or oi == 0:
             continue
         contract_type = details.get("contract_type", "call").upper()
         strike  = float(details.get("strike_price", 0))
@@ -214,8 +214,8 @@ def health():
 def api_flow():
     market_mode = request.args.get('market', 'neutral')
     max_spread  = float(request.args.get('max_spread', 15))
-    min_vol_oi  = float(request.args.get('min_vol_oi', 2))
-    min_premium = float(request.args.get('min_premium', 100_000))
+    min_vol_oi  = float(request.args.get('min_vol_oi', 0.5))
+    min_premium = float(request.args.get('min_premium', 10_000))
     tickers_raw = request.args.get('tickers', '')
 
     if POLYGON_API_KEY and tickers_raw:
@@ -234,8 +234,10 @@ def api_flow():
         flow_data = DEMO_FLOW
         source    = 'demo'
 
+    # Si no hay datos reales, usar demo para mostrar algo siempre
     if not flow_data:
-        return jsonify({'source': source, 'summary': 'Sin flujo inusual detectado hoy.', 'items': []})
+        flow_data = DEMO_FLOW
+        source = 'demo_fallback'
 
     ranked = [score_alert(x, market_mode, max_spread, min_vol_oi, min_premium) for x in flow_data]
     ranked.sort(key=lambda x: x['score'], reverse=True)
