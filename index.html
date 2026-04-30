@@ -544,61 +544,151 @@ function buildCard(d,idx){
   var sc=parseFloat(d.score)||5;
   var rc=sc>=7?'rh':sc>=4?'rm':'rl';
   var sl=sc>=7?{cls:'acg',text:'ENTRAR — espera la zona y abre posicion'}:sc>=4?{cls:'acy',text:'ESPERAR — aguarda confirmacion tecnica'}:{cls:'acr',text:'NO OPERAR — no reune criterios hoy'};
-  var momOk=call?d.momentum==='alcista':d.momentum==='bajista';
-  var mc=momOk?'g':d.momentum==='lateral'?'y':'r';
-  var vc2=(d.vol_vs_avg||'').match(/1[5-9]\d%|[2-9]\d\d%/i)?'g':'y';
   var scColor=sc>=7?'rgba(13,255,140,.12)':sc>=4?'rgba(255,204,0,.12)':'rgba(255,61,90,.12)';
   var scTxt=sc>=7?'var(--grn)':sc>=4?'var(--yel)':'var(--red)';
-  var sb=d.score_breakdown||{};
-  var catPts=parseFloat(d.pts_catalyst||sb.catalyst||0);
-  var floPts=parseFloat(d.pts_flow||sb.premium_flow||0);
-  var momPts=parseFloat(d.pts_momentum||sb.momentum||0);
-  var secPts=parseFloat(d.pts_sector||0.8);
-  var shoPts=parseFloat(d.pts_short||0.2);
-  var sbH='<div class="sbars">'+sbar('Catalizador',catPts,3.0)+sbar('Flujo opciones',floPts,2.5)+sbar('Momentum tecnico',momPts,2.0)+sbar('Sector / Macro',secPts,1.5)+sbar('Short / Squeeze',shoPts,1.0)+'</div>';
-  var bdH=(d.score_breakdown&&typeof d.score_breakdown==='string')?'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:.52rem;color:var(--m2);background:var(--s2);padding:6px 15px;border-bottom:1px solid var(--bdr)">📐 '+d.score_breakdown+'</div>':'';
+
+  // Computed values
+  var price    = parseFloat(d.spot||0);
+  var chgPct   = d.change_pct||'N/A';
+  var chgColor = (chgPct+'').includes('+')?'g':'r';
+  var vol      = d.volume?parseInt(d.volume).toLocaleString():'N/A';
+  var relVol   = d.rel_volume?parseFloat(d.rel_volume).toFixed(2)+'x':'N/A';
+  var relColor = parseFloat(d.rel_volume||0)>=2?'g':parseFloat(d.rel_volume||0)>=1.5?'y':'r';
+  var rsi      = d.rsi||'N/A';
+  var rsiVal   = parseFloat(d.rsi_value||50);
+  var rsiColor = rsiVal>=70?'r':rsiVal<=30?'b':'g';
+  var mom      = (d.momentum||'N/A').toUpperCase();
+  var momColor = mom==='ALCISTA'?'g':mom==='BAJISTA'?'r':'y';
+  var ma5      = d.ma5_pct||'N/A';  var ma5c = (ma5+'').includes('+')?'g':'r';
+  var ma20     = d.ma20_pct||'N/A'; var ma20c = (ma20+'').includes('+')?'g':'r';
+  var ma50     = d.ma50_pct||'N/A'; var ma50c = (ma50+'').includes('+')?'g':'r';
+  var ma200    = d.ma200_pct||'N/A';var ma200c= (ma200+'').includes('+')?'g':'r';
+  var vwap     = d.vwap||'N/A';
+  var high     = d.high?'$'+parseFloat(d.high).toFixed(2):'N/A';
+  var low      = d.low?'$'+parseFloat(d.low).toFixed(2):'N/A';
+  var spotDisp = price?'$'+price.toFixed(2):(d.price||'N/A');
+
+  // Risk data
+  var shortF   = d.short_float||'N/A';
+  var shortP   = parseFloat(d.short_pct||0);
+  var shortColor = shortP>=20?'r':shortP>=10?'y':'g';
+  var target   = d.target_price||'N/A';
+  var recom    = d.recommendation||'N/A';
+  var beta     = d.beta||'N/A';
+  var perfW    = d.perf_week||'N/A';
+  var perfM    = d.perf_month||'N/A';
+  var perfY    = d.perf_ytd||'N/A';
+  var h52      = d.high_52w||'N/A';
+  var l52      = d.low_52w||'N/A';
+  var instOwn  = d.inst_own||'N/A';
+
+  // News
+  var newsArr  = d.news||[];
+  var newsH = '';
+  if(newsArr.length){
+    newsH = '<div style="padding:10px 15px;border-top:1px solid var(--bdr);background:var(--s1)">'
+      +'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:.52rem;color:var(--m2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:7px">📰 Noticias recientes (Finviz)</div>'
+      +newsArr.slice(0,4).map(function(n){
+        return '<div style="font-size:.72rem;color:var(--txt);padding:4px 0;border-bottom:1px solid var(--bdr);line-height:1.5">'
+          +'<a href="'+n.url+'" target="_blank" style="color:var(--blu);text-decoration:none">'+n.title+'</a></div>';
+      }).join('')
+    +'</div>';
+  }
+
+  // Score bars
+  var catPts=parseFloat(d.pts_catalyst||0);
+  var floPts=parseFloat(d.pts_flow||0);
+  var momPts=parseFloat(d.pts_momentum||0);
+  var secPts=parseFloat(d.pts_sector||0);
+  var shoPts=parseFloat(d.pts_short||0);
+  var sbH='<div class="sbars">'+sbar('Catalizador / Noticia',catPts,3.0)+sbar('Volumen inusual',floPts,2.5)+sbar('Momentum tecnico',momPts,2.0)+sbar('Sector / Macro (MA200)',secPts,1.5)+sbar('Short interest / Squeeze',shoPts,1.0)+'</div>';
+  var bdH=d.score_breakdown?'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:.52rem;color:var(--m2);background:var(--s2);padding:6px 15px;border-bottom:1px solid var(--bdr)">📐 '+d.score_breakdown+'</div>':'';
   var cmtH=d._comment?'<div style="margin-top:5px;font-family:\'IBM Plex Mono\',monospace;font-size:.55rem;color:var(--yel);background:rgba(255,204,0,.07);padding:4px 8px;border-radius:4px;border-left:2px solid var(--yel)">💬 '+d._comment+'</div>':'';
-  var spotDisp=d.spot?'$'+parseFloat(d.spot).toFixed(2):(d.price||'N/A');
-  var premDisp=d.premium?'$'+(d.premium>=1000000?(d.premium/1000000).toFixed(1)+'M':d.premium>=1000?(d.premium/1000).toFixed(0)+'K':d.premium):(d.flow_usd||'N/A');
-  var volDisp=d.volume?d.volume.toLocaleString():'N/A';
-  var oiDisp=d.open_interest?d.open_interest.toLocaleString():'N/A';
-  var voiDisp=d.vol_oi?parseFloat(d.vol_oi).toFixed(2)+'x':'N/A';
-  var execDisp=d.execution||'N/A';
-  var execColor=d.execution==='above_ask'?'g':d.execution==='ask'?'y':'r';
-  var entH=sc>=4?'<div class="ent"><div class="ei"><div class="el">Precio stock</div><div class="ev">'+spotDisp+'</div></div><div class="ei"><div class="el">Premium total</div><div class="ev">'+premDisp+'</div></div><div class="ei"><div class="el">Stop / Target</div><div class="ev" style="color:var(--red)">'+(d.stop||d.sl||'N/A')+' / '+(d.target_1||'N/A')+'</div></div><div class="ei"><div class="el">Ejecucion</div><div class="ev '+(execColor)+'">'+execDisp.replace('_',' ').toUpperCase()+'</div></div></div>':'<div style="padding:9px 15px;background:rgba(255,61,90,.05);border-top:1px solid var(--bdr);font-family:\'IBM Plex Mono\',monospace;font-size:.6rem;color:var(--red)">✗ Score bajo — no operar</div>';
+
   var card=document.createElement('div');
   card.className='card '+(call?'call':'put')+(sc<4?' skip':'');
   card.setAttribute('data-score',sc);
   card.id='card-'+d.ticker;
   card.style.animationDelay=(idx*.06)+'s';
   card.innerHTML=
+
+    // 1. ACTION BANNER
     '<div class="acbanner '+sl.cls+'"><div class="dot"></div>'+sl.text+'</div>'
+
+    // 2. TICKER HEADER + SCORE
     +'<div class="ct"><div class="cb"></div><div class="cm">'
-      +'<div><div class="tkr"><span class="tk">'+d.ticker+'</span><span class="tp">'+type+'</span><span class="sc-pill" style="background:'+scColor+';color:'+scTxt+'">'+sc+'/10</span></div>'
-      +'<div class="csub">Strike <b style="color:var(--txt)">$'+(d.strike||'N/A')+'</b> · Vence <b style="color:var(--txt)">'+(d.expiry||'N/A')+'</b> · Contrato: <b style="color:var(--m2)">'+(d.contract||'N/A')+'</b></div>'
-      +cmtH+'</div>'
+      +'<div>'
+        +'<div class="tkr"><span class="tk">'+d.ticker+'</span><span class="tp">'+type+'</span><span class="sc-pill" style="background:'+scColor+';color:'+scTxt+'">'+sc+'/10</span></div>'
+        +'<div class="csub" style="margin-top:4px">'
+          +'<span style="color:'+chgColor==='g'?'var(--grn)':'var(--red)'+'">'+chgPct+'</span>'
+          +' · Precio: <b style="color:var(--txt)">'+spotDisp+'</b>'
+          +' · VWAP: <b style="color:var(--yel)">'+vwap+'</b>'
+        +'</div>'
+        +cmtH
+      +'</div>'
       +'<div class="ring '+rc+'">'+sc+'</div>'
     +'</div></div>'
+
+    // 3. SCORE BREAKDOWN
     +bdH+sbH
-    +'<div class="dg">'
-      +'<div class="dc"><div class="dl">Precio stock</div><div class="dv b">'+spotDisp+'</div></div>'
-      +'<div class="dc"><div class="dl">Volumen contratos</div><div class="dv y">'+volDisp+'</div></div>'
-      +'<div class="dc"><div class="dl">Open interest</div><div class="dv">'+oiDisp+'</div></div>'
-      +'<div class="dc"><div class="dl">Vol / OI ratio</div><div class="dv '+(parseFloat(d.vol_oi||0)>=2?'g':parseFloat(d.vol_oi||0)>=1?'y':'r')+'">'+voiDisp+'</div></div>'
-      +'<div class="dc"><div class="dl">Premium flujo</div><div class="dv '+(call?'g':'r')+'">'+premDisp+'</div></div>'
-      +'<div class="dc"><div class="dl">Ejecucion</div><div class="dv '+execColor+'">'+execDisp.replace('_',' ').toUpperCase()+'</div></div>'
-      +'<div class="dc"><div class="dl">Momentum</div><div class="dv '+(momOk?'g':'r')+'">'+(d.momentum||'N/A').toUpperCase()+'</div></div>'
-      +'<div class="dc"><div class="dl">Catalyst</div><div class="dv" style="font-size:.72rem">'+(d.catalyst||'N/A')+'</div></div>'
-      +'<div class="dc"><div class="dl">Spread bid/ask</div><div class="dv '+(parseFloat(d.spread_pct||99)<15?'g':'r')+'">'+(d.spread_pct?parseFloat(d.spread_pct).toFixed(1)+'%':'N/A')+'</div></div>'
-      +'<div class="dc full"><div class="dl">VWAP / Trigger de entrada</div><div class="dv" style="font-size:.72rem;color:var(--yel)">'+(d.vwap_trigger||d.ez||'N/A')+'</div></div>'
+
+    // BLOQUE A: PRECIO Y VOLUMEN (lo primero que necesitas ver)
+    +'<div style="background:var(--s2);border-bottom:1px solid var(--bdr)">'
+      +'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:.54rem;color:var(--yel);letter-spacing:.1em;text-transform:uppercase;padding:7px 15px 4px">A — Precio y Volumen</div>'
+      +'<div class="dg">'
+        +'<div class="dc"><div class="dl">Precio actual</div><div class="dv b">'+spotDisp+'</div></div>'
+        +'<div class="dc"><div class="dl">Cambio dia</div><div class="dv '+chgColor+'">'+chgPct+'</div></div>'
+        +'<div class="dc"><div class="dl">VWAP</div><div class="dv y">'+vwap+'</div></div>'
+        +'<div class="dc"><div class="dl">High / Low dia</div><div class="dv" style="font-size:.72rem">'+high+' / '+low+'</div></div>'
+        +'<div class="dc"><div class="dl">Volumen hoy</div><div class="dv">'+vol+'</div></div>'
+        +'<div class="dc"><div class="dl">Rel Vol vs avg</div><div class="dv '+relColor+'">'+relVol+'</div></div>'
+      +'</div>'
     +'</div>'
+
+    // BLOQUE B: RSI, MOMENTUM Y MEDIAS MOVILES
+    +'<div style="background:var(--s1);border-bottom:1px solid var(--bdr)">'
+      +'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:.54rem;color:var(--yel);letter-spacing:.1em;text-transform:uppercase;padding:7px 15px 4px">B — RSI, Momentum y Medias Moviles</div>'
+      +'<div class="dg">'
+        +'<div class="dc"><div class="dl">RSI 14</div><div class="dv '+rsiColor+'">'+rsi+'</div></div>'
+        +'<div class="dc"><div class="dl">Momentum</div><div class="dv '+momColor+'">'+mom+'</div></div>'
+        +'<div class="dc"><div class="dl">vs MA5</div><div class="dv '+ma5c+'">'+ma5+'</div></div>'
+        +'<div class="dc"><div class="dl">vs MA20</div><div class="dv '+ma20c+'">'+ma20+'</div></div>'
+        +'<div class="dc"><div class="dl">vs MA50</div><div class="dv '+ma50c+'">'+ma50+'</div></div>'
+        +'<div class="dc"><div class="dl">vs MA200</div><div class="dv '+ma200c+'">'+ma200+'</div></div>'
+      +'</div>'
+    +'</div>'
+
+    // BLOQUE C: RIESGO Y CONTEXTO
+    +'<div style="background:var(--s2);border-bottom:1px solid var(--bdr)">'
+      +'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:.54rem;color:var(--yel);letter-spacing:.1em;text-transform:uppercase;padding:7px 15px 4px">C — Riesgo y Contexto</div>'
+      +'<div class="dg">'
+        +'<div class="dc"><div class="dl">Short Float</div><div class="dv '+shortColor+'">'+shortF+'</div></div>'
+        +'<div class="dc"><div class="dl">PT Analistas</div><div class="dv g">'+target+'</div></div>'
+        +'<div class="dc"><div class="dl">Recomendacion</div><div class="dv y">'+recom+'</div></div>'
+        +'<div class="dc"><div class="dl">Perf Semana</div><div class="dv '+((perfW+'').includes('-')?'r':'g')+'">'+perfW+'</div></div>'
+        +'<div class="dc"><div class="dl">Perf Mes</div><div class="dv '+((perfM+'').includes('-')?'r':'g')+'">'+perfM+'</div></div>'
+        +'<div class="dc"><div class="dl">Perf YTD</div><div class="dv '+((perfY+'').includes('-')?'r':'g')+'">'+perfY+'</div></div>'
+        +'<div class="dc"><div class="dl">52W Alto</div><div class="dv">'+h52+'</div></div>'
+        +'<div class="dc"><div class="dl">52W Bajo</div><div class="dv">'+l52+'</div></div>'
+        +'<div class="dc"><div class="dl">Beta</div><div class="dv">'+beta+'</div></div>'
+        +'<div class="dc full"><div class="dl">Inst. Ownership</div><div class="dv">'+instOwn+'</div></div>'
+      +'</div>'
+    +'</div>'
+
+    // BLOQUE D: ANALISIS Y DECISION
     +'<div class="ab">'
-      +'<div class="as"><div class="al">'+(sc>=5?'✅ Por que considerar':'❌ Por que NO operar')+'</div><div class="at">'+(d.catalyst||d.vwap_trigger||'Sin analisis adicional.')+'</div></div>'
-      +'<div class="as"><div class="al">⚠ Stop / Invalidacion</div><div class="at">Stop en <b style="color:var(--red)">'+(d.stop||'N/A')+'</b> · Target 1: <b style="color:var(--grn)">'+(d.target_1||'N/A')+'</b> · Target 2: <b style="color:var(--grn)">'+(d.target_2||'N/A')+'</b></div></div>'
+      +'<div class="as"><div class="al">'+(sc>=7?'🟢 POR QUE ENTRAR':sc>=4?'🟡 POR QUE ESPERAR':'🔴 POR QUE NO OPERAR')+'</div><div class="at">'+(d.why||d.catalyst||'Sin analisis.')+'</div></div>'
+      +'<div class="as"><div class="al">⚠ Riesgo / Invalidacion</div><div class="at">'+(d.risk||'Monitorear VWAP como soporte.')+'</div></div>'
+      +'<div class="as"><div class="al">🎯 Stop · Target 1 · Target 2</div><div class="at">Stop: <b style="color:var(--red)">'+(d.stop||'N/A')+'</b> &nbsp;·&nbsp; T1: <b style="color:var(--grn)">'+(d.target_1||'N/A')+'</b> &nbsp;·&nbsp; T2: <b style="color:var(--grn)">'+(d.target_2||'N/A')+'</b></div></div>'
+      +'<div class="as"><div class="al">📍 Zona de entrada sugerida</div><div class="at" style="color:var(--yel)">'+(d.ez||d.vwap_trigger||'Ver VWAP en IBKR')+'</div></div>'
     +'</div>'
-    +entH;
+
+    // BLOQUE E: NOTICIAS
+    +newsH;
+
   return card;
 }
+
 
 function addFooter(container){
   var btn=document.createElement('button');btn.className='exp-btn';btn.innerHTML='📄 EXPORTAR A PDF';btn.onclick=exportPDF;container.appendChild(btn);
@@ -643,319 +733,3 @@ function exportPDF(){
 </script>
 </body>
 </html>
-
-from __future__ import annotations
-
-import os
-import json
-import requests
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-
-# ── CONFIG ───────────────────────────────────────────────────
-BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-
-app = Flask(__name__)
-CORS(app)
-
-
-# ── MODELO ───────────────────────────────────────────────────
-@dataclass
-class FlowAlert:
-    ticker: str
-    direction: str
-    contract: str
-    expiry: str
-    strike: float
-    spot: float
-    premium: float
-    volume: int
-    open_interest: int
-    bid: float
-    ask: float
-    execution: str
-    catalyst: str
-    momentum: str
-    vwap_trigger: str
-    stop: str
-    target_1: str
-    target_2: str
-
-    @property
-    def vol_oi(self) -> float:
-        if self.open_interest <= 0:
-            return 999.0
-        return round(self.volume / self.open_interest, 2)
-
-    @property
-    def spread_pct(self) -> float:
-        mid = (self.bid + self.ask) / 2
-        if mid <= 0:
-            return 999.0
-        return round(((self.ask - self.bid) / mid) * 100, 2)
-
-
-# ── DATOS DEMO ───────────────────────────────────────────────
-DEMO_FLOW: List[FlowAlert] = [
-    FlowAlert('NVDA','CALL','NVDA 2026-05-15 C 950','2026-05-15',950,914.20,850000,8200,920,7.80,8.20,'above_ask','AI / semis momentum','alcista sobre VWAP','romper 918 con volumen','pierde VWAP 5m','930','950'),
-    FlowAlert('AMD','CALL','AMD 2026-05-15 C 190','2026-05-15',190,181.50,410000,6500,700,2.10,2.28,'ask','semis sympathy + volumen fresco','alcista','romper 183.20 y sostener VWAP','181 bajo VWAP','187','190'),
-    FlowAlert('TSLA','PUT','TSLA 2026-05-08 P 145','2026-05-08',145,151.10,620000,9800,1300,3.40,3.75,'above_ask','presion tecnica / debilidad','bajista bajo VWAP','rechazo en 152 y pierde 150.50','recupera 153','147','145'),
-    FlowAlert('AAPL','CALL','AAPL 2026-05-15 C 190','2026-05-15',190,184.80,210000,3000,2600,1.15,1.32,'mid','sin catalizador fuerte','lateral','solo si rompe 186 con volumen','183.50','188','190'),
-    FlowAlert('RBLX','PUT','RBLX 2026-05-15 P 60','2026-05-15',60,63.20,355000,4400,500,1.70,1.88,'ask','debilidad growth / ruptura soporte','bajista','perder 62.80 con volumen','64.20','61','60'),
-]
-
-
-# ── SCORING ──────────────────────────────────────────────────
-def score_alert(a: FlowAlert, market_mode: str, max_spread: float, min_vol_oi: float, min_premium: float) -> Dict[str, Any]:
-    vol_oi = a.vol_oi
-    spread = a.spread_pct
-
-    pts_catalyst  = 2.5 if a.catalyst and 'sin catalizador' not in a.catalyst.lower() else 0.5
-    pts_flow      = 2.5 if a.premium >= 1_000_000 else 2.0 if a.premium >= 500_000 else 1.5 if a.premium >= 300_000 else 0.8 if a.premium >= 150_000 else 0.3
-    pts_voloi     = 1.5 if vol_oi >= 8 else 1.0 if vol_oi >= 5 else 0.5 if vol_oi >= 2 else 0.0
-    pts_execution = 1.5 if a.execution == 'above_ask' else 1.0 if a.execution == 'ask' else 0.2
-    pts_momentum  = 2.0 if ('alcista' in a.momentum.lower() and a.direction == 'CALL') or ('bajista' in a.momentum.lower() and a.direction == 'PUT') else 0.6
-    pts_spread    = 1.0 if spread <= max_spread else 0.0
-
-    raw = pts_catalyst + pts_flow + pts_voloi + pts_execution + pts_momentum + pts_spread
-
-    if market_mode == 'volatile':
-        raw += 0.4 if a.execution in ('ask', 'above_ask') else -0.2
-    elif market_mode == 'bearish' and a.direction == 'PUT':
-        raw += 0.5
-    elif market_mode == 'bullish' and a.direction == 'CALL':
-        raw += 0.5
-
-    score  = round(min(raw, 10.0), 1)
-    passes = a.premium >= min_premium and vol_oi >= min_vol_oi and spread <= max_spread and a.execution in ('ask', 'above_ask') and score >= 7.0
-
-    if passes:
-        action, semaforo = 'VAMOS_CON_TODO', 'VERDE'
-    elif score >= 5.0:
-        action, semaforo = 'ESPERAR_CONFIRMACION', 'AMARILLO'
-    else:
-        action, semaforo = 'NO_OPERAR', 'ROJO'
-
-    d = asdict(a)
-    d.update({
-        'vol_oi': vol_oi, 'spread_pct': spread,
-        'score': score, 'semaforo': semaforo, 'action': action, 'passes_filters': passes,
-        'pts_catalyst': pts_catalyst, 'pts_flow': pts_flow,
-        'pts_momentum': pts_momentum, 'pts_sector': 0.8, 'pts_short': 0.2,
-        'score_breakdown': f'Cat {pts_catalyst}+Flujo {pts_flow}+Mom {pts_momentum}+Ejec {pts_execution}+Spread {pts_spread}={score}',
-    })
-    return d
-
-
-# ── POLYGON ──────────────────────────────────────────────────
-def fetch_polygon_flow(ticker: str) -> List[FlowAlert]:
-    if not POLYGON_API_KEY:
-        return []
-    try:
-        r = requests.get(
-            f"https://api.polygon.io/v3/snapshot/options/{ticker}",
-            params={"apiKey": POLYGON_API_KEY, "limit": 50, "order": "desc", "sort": "volume"},
-            timeout=10
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        print(f"Polygon error {ticker}: {e}")
-        return []
-
-    alerts = []
-    for item in data.get("results", []):
-        details = item.get("details", {})
-        day     = item.get("day", {})
-        last    = item.get("last_quote", {})
-        volume  = int(day.get("volume", 0))
-        oi      = int(item.get("open_interest", 0))
-        if volume == 0 or oi == 0:
-            continue
-        contract_type = details.get("contract_type", "call").upper()
-        strike  = float(details.get("strike_price", 0))
-        expiry  = details.get("expiration_date", "")
-        bid     = float(last.get("bid", 0))
-        ask     = float(last.get("ask", 0))
-        mid     = (bid + ask) / 2
-        premium = round(mid * volume * 100, 2)
-        last_p  = float(day.get("close", mid))
-        execution = "above_ask" if last_p >= ask else "ask" if last_p >= ask * 0.98 else "mid"
-        alerts.append(FlowAlert(
-            ticker=ticker, direction=contract_type,
-            contract=f"{ticker} {expiry} {contract_type[0]} {strike}",
-            expiry=expiry, strike=strike,
-            spot=float(item.get("underlying_asset", {}).get("price", 0)),
-            premium=premium, volume=volume, open_interest=oi,
-            bid=bid, ask=ask, execution=execution,
-            catalyst="flujo inusual via Polygon",
-            momentum="alcista" if contract_type == "CALL" else "bajista",
-            vwap_trigger=f"romper strike {strike} con volumen",
-            stop="", target_1=str(round(strike * 1.03, 2)), target_2=str(round(strike * 1.06, 2)),
-        ))
-    return alerts
-
-
-def fetch_polygon_snapshot(ticker: str) -> Optional[FlowAlert]:
-    if not POLYGON_API_KEY:
-        return None
-    try:
-        r = requests.get(
-            f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
-            params={"apiKey": POLYGON_API_KEY},
-            timeout=10
-        )
-        r.raise_for_status()
-        td  = r.json().get("ticker", {})
-        day = td.get("day", {})
-        pv  = td.get("prevDay", {})
-        close     = float(day.get("c", 0))
-        vol       = int(day.get("v", 0))
-        pvol      = int(pv.get("v", 1))
-        change    = float(td.get("todaysChangePerc", 0))
-        momentum  = "alcista" if change > 1 else "bajista" if change < -1 else "lateral"
-        return FlowAlert(
-            ticker=ticker, direction="CALL" if change >= 0 else "PUT",
-            contract=f"{ticker} snapshot", expiry="N/A",
-            strike=round(close * 1.05, 2), spot=close,
-            premium=vol * close * 0.01, volume=vol, open_interest=max(pvol, 1),
-            bid=round(close * 0.99, 2), ask=round(close * 1.01, 2),
-            execution="mid", catalyst=f"Cambio del dia: {change:+.2f}%",
-            momentum=momentum, vwap_trigger=f"precio actual ${close}",
-            stop=str(round(close * 0.95, 2)),
-            target_1=str(round(close * 1.05, 2)),
-            target_2=str(round(close * 1.10, 2)),
-        )
-    except Exception as e:
-        print(f"Snapshot error {ticker}: {e}")
-        return None
-
-
-# ── RUTAS ────────────────────────────────────────────────────
-@app.route('/')
-def home():
-    index_path = os.path.join(BASE_DIR, 'index.html')
-    with open(index_path, 'r', encoding='utf-8') as f:
-        html = f.read()
-    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
-
-
-@app.route('/api/health')
-def health():
-    return jsonify({
-        'ok': True,
-        'service': 'FlowScan 8',
-        'version': '2.0',
-        'time': datetime.now().isoformat(timespec='seconds'),
-        'polygon_key': 'configurada' if POLYGON_API_KEY else 'FALTA',
-    })
-
-
-@app.route('/api/flow')
-def api_flow():
-    market_mode = request.args.get('market', 'neutral')
-    max_spread  = float(request.args.get('max_spread', 15))
-    min_vol_oi  = float(request.args.get('min_vol_oi', 0.5))
-    min_premium = float(request.args.get('min_premium', 10_000))
-    tickers_raw = request.args.get('tickers', '')
-
-    if POLYGON_API_KEY and tickers_raw:
-        tickers   = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
-        flow_data = []
-        for tk in tickers:
-            found = fetch_polygon_flow(tk)
-            if found:
-                flow_data.extend(found)
-            else:
-                snap = fetch_polygon_snapshot(tk)
-                if snap:
-                    flow_data.append(snap)
-        source = 'polygon_realtime'
-    else:
-        flow_data = DEMO_FLOW
-        source    = 'demo'
-
-    # Si no hay datos reales, usar demo para mostrar algo siempre
-    if not flow_data:
-        flow_data = DEMO_FLOW
-        source = 'demo_fallback'
-
-    ranked = [score_alert(x, market_mode, max_spread, min_vol_oi, min_premium) for x in flow_data]
-    ranked.sort(key=lambda x: x['score'], reverse=True)
-    verdes = sum(1 for x in ranked if x['semaforo'] == 'VERDE')
-
-    return jsonify({
-        'source': source,
-        'market_mode': market_mode,
-        'timestamp': datetime.now().isoformat(timespec='seconds'),
-        'summary': f'{verdes} setup(s) con señal verde.' if verdes else 'Sin setups claros hoy.',
-        'items': ranked,
-    })
-
-
-@app.route('/api/analyze', methods=['POST'])
-def api_analyze():
-    payload     = request.get_json(force=True, silent=True) or {}
-    tickers_raw = payload.get('tickers', '')
-    market      = payload.get('market', 'neutral')
-    min_vol_oi  = float(payload.get('min_vol_oi', 1.0))
-    min_premium = float(payload.get('min_premium', 50_000))
-    max_spread  = float(payload.get('max_spread', 20))
-
-    if not tickers_raw:
-        return jsonify({'error': 'Falta el campo tickers'}), 400
-
-    tickers = [t.strip().upper() for t in str(tickers_raw).split(',') if t.strip()]
-    all_alerts: List[FlowAlert] = []
-    for tk in tickers:
-        found = fetch_polygon_flow(tk)
-        if found:
-            all_alerts.extend(found)
-        else:
-            snap = fetch_polygon_snapshot(tk)
-            if snap:
-                all_alerts.append(snap)
-
-    if not all_alerts:
-        return jsonify({'source': 'polygon_realtime', 'summary': 'Sin datos disponibles.', 'items': []})
-
-    ranked = [score_alert(x, market, max_spread, min_vol_oi, min_premium) for x in all_alerts]
-    ranked.sort(key=lambda x: x['score'], reverse=True)
-    verdes = sum(1 for x in ranked if x['semaforo'] == 'VERDE')
-
-    return jsonify({
-        'source': 'polygon_realtime',
-        'timestamp': datetime.now().isoformat(timespec='seconds'),
-        'summary': f'{verdes} setup(s) con señal verde.' if verdes else 'Sin setups claros.',
-        'items': ranked,
-    })
-
-
-@app.route('/api/ticker/<ticker>')
-def api_ticker(ticker: str):
-    if not POLYGON_API_KEY:
-        return jsonify({'error': 'POLYGON_API_KEY no configurada'}), 503
-    market     = request.args.get('market', 'neutral')
-    min_vol_oi = float(request.args.get('min_vol_oi', 1.0))
-    min_premium= float(request.args.get('min_premium', 50_000))
-    alerts     = fetch_polygon_flow(ticker.upper())
-    if not alerts:
-        snap = fetch_polygon_snapshot(ticker.upper())
-        if snap:
-            alerts = [snap]
-    if not alerts:
-        return jsonify({'ticker': ticker.upper(), 'message': 'Sin datos hoy.', 'items': []})
-    ranked = [score_alert(x, market, 20, min_vol_oi, min_premium) for x in alerts]
-    ranked.sort(key=lambda x: x['score'], reverse=True)
-    return jsonify({'ticker': ticker.upper(), 'source': 'polygon_realtime', 'timestamp': datetime.now().isoformat(timespec='seconds'), 'items': ranked})
-
-
-# ── ARRANQUE ─────────────────────────────────────────────────
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
