@@ -413,6 +413,74 @@ def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
         ]
 
 
+def get_yahoo_most_active() -> List[Dict[str, Any]]:
+    """Get most active stocks from Yahoo Finance screener."""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+            params={"scrIds": "most_actives", "count": 25},
+            headers=HEADERS,
+            timeout=10
+        )
+        r.raise_for_status()
+        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        results = []
+        for q in quotes:
+            ticker = q.get("symbol", "")
+            if not ticker or len(ticker) > 6:
+                continue
+            vol = int(q.get("regularMarketVolume", 0))
+            avg = int(q.get("averageDailyVolume3Month", 1))
+            rel = round(vol / avg, 2) if avg > 0 else 1.0
+            chg = float(q.get("regularMarketChangePercent", 0))
+            results.append({
+                "ticker":     ticker,
+                "mc_volume":  vol,
+                "mc_rel_vol": rel,
+                "mc_chg_pct": chg,
+                "mc_bullish": chg >= 0,
+                "source":     "yahoo_most_active",
+            })
+        results.sort(key=lambda x: x.get("mc_rel_vol", 0), reverse=True)
+        print(f"Yahoo most active: {len(results)} tickers")
+        return results[:15]
+    except Exception as e:
+        print(f"Yahoo most active error: {e}")
+        return []
+
+def get_yahoo_trending() -> List[Dict[str, Any]]:
+    """Get trending tickers from Yahoo Finance."""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/trending/US",
+            params={"count": 20},
+            headers=HEADERS,
+            timeout=10
+        )
+        r.raise_for_status()
+        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        results = []
+        seen = set()
+        for q in quotes:
+            ticker = q.get("symbol", "")
+            if not ticker or len(ticker) > 6 or ticker in seen:
+                continue
+            seen.add(ticker)
+            results.append({
+                "ticker":     ticker,
+                "mc_volume":  0,
+                "mc_rel_vol": 2.0,
+                "mc_chg_pct": 0,
+                "mc_bullish": True,
+                "source":     "yahoo_trending",
+            })
+        print(f"Yahoo trending: {len(results)} tickers")
+        return results[:15]
+    except Exception as e:
+        print(f"Yahoo trending error: {e}")
+        return []
+
+
 def get_market_pulse() -> Dict[str, Any]:
     """Get SPY, QQQ, IWM, VIX to determine market sentiment."""
     pulse = {}
@@ -852,34 +920,72 @@ def api_pulse():
 @app.route('/api/scan')
 def api_scan():
     """
-    Autonomous scan:
-    1. Get market pulse (SPY/QQQ/IWM/VIX)
-    2. Get unusual options from Market Chameleon
-    3. Analyze top tickers with Yahoo + Finviz
+    Autonomous scan with multiple data sources and fallbacks:
+    1. Market pulse (SPY/QQQ/IWM/VIX)
+    2. Unusual Whales free flow (primary)
+    3. Yahoo Finance most active (fallback 1)
+    4. Yahoo Finance trending (fallback 2)
+    5. Analyze top tickers with full Yahoo + Finviz data
     """
     market = get_market_pulse()
-    mc_list = get_market_chameleon_unusual()
 
-    if not mc_list:
-        # Fallback to popular tickers if MC scraping fails
-        mc_list = [{"ticker": t, "mc_rel_vol": 1.0, "mc_volume": 0} 
-                   for t in ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN"]]
+    # Try sources in order of quality
+    source_name = "unknown"
+    ticker_list = []
 
-    # Analyze top 8 by relative volume
+    # Source 1: Unusual Whales / Market Chameleon
+    ticker_list = get_market_chameleon_unusual()
+    if ticker_list:
+        source_name = ticker_list[0].get("source", "unusual_whales")
+    
+    # Source 2: Yahoo most active (always reliable)
+    yahoo_active = get_yahoo_most_active()
+    
+    # Source 3: Yahoo trending
+    yahoo_trend = get_yahoo_trending()
+
+    # Merge all sources, prioritize by rel_vol
+    seen = set()
+    merged = []
+    for t in ticker_list + yahoo_active + yahoo_trend:
+        tk = t.get("ticker", "")
+        if tk and tk not in seen and tk not in ("SPY","QQQ","IWM","VIX","TLT","GLD"):
+            seen.add(tk)
+            merged.append(t)
+
+    # Sort by relative volume descending
+    merged.sort(key=lambda x: x.get("mc_rel_vol", 0), reverse=True)
+
+    if not merged:
+        # Ultimate fallback
+        merged = [{"ticker": t, "mc_rel_vol": 1.5, "mc_volume": 0, "mc_chg_pct": 0, "mc_bullish": True}
+                  for t in ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN","INTC","PLTR"]]
+        source_name = "fallback_default"
+
+    # Analyze top 10 tickers
     items = []
-    for mc in mc_list[:8]:
+    for mc in merged[:10]:
         result = analyze_ticker(mc["ticker"], market=market, mc_data=mc)
         if "error" not in result:
             items.append(result)
 
     items.sort(key=lambda x: x.get("score", 0), reverse=True)
     verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
+    
+    # Build summary message
+    top = items[0] if items else None
+    if verdes > 0:
+        summary = f"{verdes} setup(s) con señal verde. Mejor: {top['ticker']} {top['score']}/10 — {top['direction']}."
+    elif items:
+        summary = f"{len(items)} tickers analizados. Ninguno reune criterios verdes hoy. Esperar mejores setups."
+    else:
+        summary = "Sin datos disponibles. Verifica conexion."
 
     return jsonify({
-        "source":    "yahoo+finviz+market_chameleon",
+        "source":    source_name,
         "market":    market,
         "timestamp": datetime.now().isoformat(timespec='seconds'),
-        "summary":   f"{verdes} setup(s) con señal verde de {len(items)} analizados." if verdes else f"{len(items)} tickers analizados. Sin señales verdes claras.",
+        "summary":   summary,
         "items":     items,
     })
 
