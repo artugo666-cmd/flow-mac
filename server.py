@@ -38,54 +38,67 @@ def health():
 
 # ── POLYGON STOCK SNAPSHOT ────────────────────────────────────
 def get_polygon_stock(ticker: str) -> Dict[str, Any]:
-    """Get stock price, volume, change from Polygon."""
+    """Get stock data using /v2/aggs/prev — works on basic Polygon plan."""
     if not POLYGON_API_KEY:
         return {}
     try:
+        # Get last 2 days of data to calculate change
         r = requests.get(
-            f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
-            params={"apiKey": POLYGON_API_KEY},
+            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/2024-01-01/2030-01-01",
+            params={"apiKey": POLYGON_API_KEY, "limit": 2, "sort": "desc", "adjusted": "true"},
             timeout=10
         )
         r.raise_for_status()
-        td  = r.json().get("ticker", {})
-        day = td.get("day", {})
-        prev= td.get("prevDay", {})
-        min_data = td.get("min", {})
+        results = r.json().get("results", [])
+        if not results:
+            return {}
+
+        today = results[0]
+        prev  = results[1] if len(results) > 1 else {}
+
+        price      = round(float(today.get("c", 0)), 2)
+        prev_close = round(float(prev.get("c", price)), 2)
+        volume     = int(today.get("v", 0))
+        prev_vol   = int(prev.get("v", 1))
+        change_abs = round(price - prev_close, 2)
+        change_pct = round((change_abs / prev_close * 100) if prev_close else 0, 2)
+        vwap       = round(float(today.get("vw", price)), 2)
+
         return {
-            "price":        round(float(day.get("c") or 0), 2),
-            "open":         round(float(day.get("o") or 0), 2),
-            "high":         round(float(day.get("h") or 0), 2),
-            "low":          round(float(day.get("l") or 0), 2),
-            "volume":       int(day.get("v") or 0),
-            "vwap":         round(float(day.get("vw") or 0), 2),
-            "prev_close":   round(float(prev.get("c") or 0), 2),
-            "prev_volume":  int(prev.get("v") or 1),
-            "change_pct":   round(float(td.get("todaysChangePerc") or 0), 2),
-            "change_abs":   round(float(td.get("todaysChange") or 0), 2),
-            "min_price":    round(float(min_data.get("c") or 0), 2),
+            "price":       price,
+            "open":        round(float(today.get("o", 0)), 2),
+            "high":        round(float(today.get("h", 0)), 2),
+            "low":         round(float(today.get("l", 0)), 2),
+            "volume":      volume,
+            "vwap":        vwap,
+            "prev_close":  prev_close,
+            "prev_volume": prev_vol,
+            "change_pct":  change_pct,
+            "change_abs":  change_abs,
+            "source":      "polygon_aggs",
         }
     except Exception as e:
-        print(f"Polygon stock error {ticker}: {e}")
+        print(f"Polygon aggs error {ticker}: {e}")
         return {}
 
 
 def get_polygon_aggregates(ticker: str) -> Dict[str, Any]:
-    """Get 50-day and 20-day and 5-day moving averages from Polygon."""
+    """Get moving averages from Polygon /v1/indicators/sma."""
     if not POLYGON_API_KEY:
         return {}
-    try:
-        results = {}
-        for window in [5, 20, 50, 200]:
+    results = {}
+    for window in [5, 20, 50, 200]:
+        try:
             r = requests.get(
                 f"https://api.polygon.io/v1/indicators/sma/{ticker}",
                 params={
-                    "apiKey": POLYGON_API_KEY,
-                    "window": window,
+                    "apiKey":      POLYGON_API_KEY,
+                    "window":      window,
                     "series_type": "close",
-                    "order": "desc",
-                    "limit": 1,
-                    "timespan": "day",
+                    "order":       "desc",
+                    "limit":       1,
+                    "timespan":    "day",
+                    "adjusted":    "true",
                 },
                 timeout=10
             )
@@ -93,26 +106,26 @@ def get_polygon_aggregates(ticker: str) -> Dict[str, Any]:
             vals = r.json().get("results", {}).get("values", [])
             if vals:
                 results[f"sma{window}"] = round(float(vals[0].get("value", 0)), 2)
-        return results
-    except Exception as e:
-        print(f"Polygon SMA error {ticker}: {e}")
-        return {}
+        except Exception as e:
+            print(f"SMA{window} error {ticker}: {e}")
+    return results
 
 
 def get_polygon_rsi(ticker: str) -> Optional[float]:
-    """Get RSI from Polygon."""
+    """Get RSI14 from Polygon /v1/indicators/rsi."""
     if not POLYGON_API_KEY:
         return None
     try:
         r = requests.get(
             f"https://api.polygon.io/v1/indicators/rsi/{ticker}",
             params={
-                "apiKey": POLYGON_API_KEY,
-                "window": 14,
+                "apiKey":      POLYGON_API_KEY,
+                "window":      14,
                 "series_type": "close",
-                "order": "desc",
-                "limit": 1,
-                "timespan": "day",
+                "order":       "desc",
+                "limit":       1,
+                "timespan":    "day",
+                "adjusted":    "true",
             },
             timeout=10
         )
@@ -122,7 +135,7 @@ def get_polygon_rsi(ticker: str) -> Optional[float]:
             return round(float(vals[0].get("value", 0)), 1)
         return None
     except Exception as e:
-        print(f"Polygon RSI error {ticker}: {e}")
+        print(f"RSI error {ticker}: {e}")
         return None
 
 
@@ -346,16 +359,74 @@ def compute_score(stock: Dict, sma: Dict, rsi: Optional[float], finviz: Dict, al
     }
 
 
+def get_yahoo_price(ticker: str) -> Dict[str, Any]:
+    """Get stock price from Yahoo Finance as fallback."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml",
+        }
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={"interval": "1d", "range": "5d"},
+            headers=headers,
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return {}
+        meta = result[0].get("meta", {})
+        indicators = result[0].get("indicators", {})
+        quote = indicators.get("quote", [{}])[0]
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+        # Get last valid values
+        price = meta.get("regularMarketPrice", 0)
+        prev_close = meta.get("chartPreviousClose", 0)
+        volume = meta.get("regularMarketVolume", 0)
+        change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0
+        # Average volume from last 5 days
+        valid_vols = [v for v in volumes if v]
+        avg_vol = int(sum(valid_vols) / len(valid_vols)) if valid_vols else 1
+        rel_vol = round(volume / avg_vol, 2) if avg_vol > 0 else 1.0
+        day_high = meta.get("regularMarketDayHigh", 0)
+        day_low  = meta.get("regularMarketDayLow", 0)
+        day_open = meta.get("regularMarketOpen", 0)
+        return {
+            "price":       round(float(price), 2),
+            "open":        round(float(day_open), 2),
+            "high":        round(float(day_high), 2),
+            "low":         round(float(day_low), 2),
+            "volume":      int(volume),
+            "vwap":        round(float(meta.get("regularMarketPrice", price)), 2),
+            "prev_close":  round(float(prev_close), 2),
+            "prev_volume": avg_vol,
+            "change_pct":  change_pct,
+            "change_abs":  round(float(price - prev_close), 2),
+            "rel_volume":  rel_vol,
+            "source":      "yahoo",
+        }
+    except Exception as e:
+        print(f"Yahoo error {ticker}: {e}")
+        return {}
+
+
 # ── FULL TICKER ANALYSIS ──────────────────────────────────────
 def analyze_ticker(ticker: str, alert_context: str = "", comment: str = "") -> Dict[str, Any]:
     """Full analysis of a ticker using Polygon + Finviz."""
     ticker = ticker.upper().strip()
 
-    # Parallel-ish data fetching
-    stock   = get_polygon_stock(ticker)
-    sma     = get_polygon_aggregates(ticker)
-    rsi     = get_polygon_rsi(ticker)
-    finviz  = get_finviz_data(ticker)
+    # Get stock data - Polygon first, Yahoo as fallback
+    stock = get_polygon_stock(ticker)
+    if not stock or not stock.get("price"):
+        print(f"Polygon empty for {ticker}, trying Yahoo...")
+        stock = get_yahoo_price(ticker)
+
+    sma    = get_polygon_aggregates(ticker)
+    rsi    = get_polygon_rsi(ticker)
+    finviz = get_finviz_data(ticker)
 
     if not stock and not finviz:
         return {
@@ -490,6 +561,81 @@ def analyze_ticker(ticker: str, alert_context: str = "", comment: str = "") -> D
         "source":         "polygon+finviz",
         "timestamp":      datetime.now().isoformat(timespec='seconds'),
     }
+
+
+@app.route('/api/debug')
+def api_debug():
+    """Test Polygon connection directly and show raw response."""
+    results = {}
+
+    # Test 1: Basic stock snapshot
+    try:
+        r = requests.get(
+            "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/NVDA",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=10
+        )
+        results["polygon_snapshot"] = {
+            "status": r.status_code,
+            "ok": r.status_code == 200,
+            "response": r.json() if r.status_code == 200 else r.text[:300]
+        }
+    except Exception as e:
+        results["polygon_snapshot"] = {"error": str(e)}
+
+    # Test 2: SMA indicator
+    try:
+        r2 = requests.get(
+            "https://api.polygon.io/v1/indicators/sma/NVDA",
+            params={"apiKey": POLYGON_API_KEY, "window": 50, "timespan": "day", "limit": 1},
+            timeout=10
+        )
+        results["polygon_sma"] = {
+            "status": r2.status_code,
+            "ok": r2.status_code == 200,
+            "response": r2.json() if r2.status_code == 200 else r2.text[:300]
+        }
+    except Exception as e:
+        results["polygon_sma"] = {"error": str(e)}
+
+    # Test 3: Yahoo Finance
+    try:
+        r3 = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/NVDA",
+            params={"interval": "1d", "range": "2d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        meta = r3.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+        results["yahoo"] = {
+            "status": r3.status_code,
+            "ok": r3.status_code == 200,
+            "price": meta.get("regularMarketPrice"),
+            "volume": meta.get("regularMarketVolume"),
+            "change_pct": meta.get("regularMarketChangePercent"),
+        }
+    except Exception as e:
+        results["yahoo"] = {"error": str(e)}
+
+    # Test 4: Finviz
+    try:
+        r4 = requests.get(
+            "https://finviz.com/quote.ashx?t=NVDA",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        results["finviz"] = {
+            "status": r4.status_code,
+            "ok": r4.status_code == 200,
+            "has_data": "Short Float" in r4.text
+        }
+    except Exception as e:
+        results["finviz"] = {"error": str(e)}
+
+    results["polygon_key_prefix"] = POLYGON_API_KEY[:8] + "..." if POLYGON_API_KEY else "NO KEY"
+    results["timestamp"] = datetime.now().isoformat()
+
+    return jsonify(results)
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────
