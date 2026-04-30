@@ -97,12 +97,15 @@ def get_yahoo(ticker: str) -> Dict[str, Any]:
         # Use last 20 days for avg volume (excludes today)
         avg_vol = int(sum(vols_d[-21:-1]) / 20) if len(vols_d) >= 21 else int(sum(vols_d) / max(len(vols_d), 1))
 
-        prev    = float(meta2.get("chartPreviousClose") or meta1.get("chartPreviousClose") or price)
+        prev    = float(meta1.get("chartPreviousClose") or meta2.get("chartPreviousClose") or 0)
         day_hi  = float(meta1.get("regularMarketDayHigh") or 0)
         day_lo  = float(meta1.get("regularMarketDayLow") or 0)
         day_op  = float(meta1.get("regularMarketOpen") or 0)
-        chg_abs = round(price - prev, 2)
-        chg_pct = round((chg_abs / prev * 100) if prev else 0, 2)
+        # Use Yahoo's own change calculation (most accurate)
+        chg_pct = round(float(meta1.get("regularMarketChangePercent") or 0), 2)
+        chg_abs = round(float(meta1.get("regularMarketChange") or (price - prev)), 2)
+        if not prev and price and chg_pct:
+            prev = round(price / (1 + chg_pct/100), 2)
         rel_vol = round(vol_today / avg_vol, 2) if avg_vol > 0 else 1.0
 
         return {
@@ -159,54 +162,184 @@ def get_yahoo(ticker: str) -> Dict[str, Any]:
 
 
 def get_finviz(ticker: str) -> Dict[str, Any]:
-    """RSI, MAs, short float, news, analyst targets from Finviz."""
+    """Get fundamentals from Yahoo Finance (replaces Finviz - no cloud blocking)."""
     try:
-        r = requests.get(
-            f"https://finviz.com/quote.ashx?t={ticker}&ty=c&ta=1&p=d",
-            headers=HEADERS,
-            timeout=15
-        )
-        html = r.text
         data = {}
-        fields = {
-            "short_float":    r"Short Float[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "short_ratio":    r"Short Ratio[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "avg_volume":     r"Avg Volume[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "rel_volume":     r"Rel Volume[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "rsi14":          r"RSI.{1,10}14.{1,10}</td>\s*<td[^>]*>([^<]+)</td>",
-            "beta":           r"Beta[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "target_price":   r"Target Price[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "recommendation": r"Recom[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "52w_high":       r"52W High[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "52w_low":        r"52W Low[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "inst_own":       r"Inst Own[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "insider_own":    r"Insider Own[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "perf_week":      r"Perf Week[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "perf_month":     r"Perf Month[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "perf_ytd":       r"Perf YTD[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "sma20_pct":      r"SMA20[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "sma50_pct":      r"SMA50[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "sma200_pct":     r"SMA200[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "atr":            r"ATR[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "earnings_date":  r"Earnings[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "sector":         r"Sector[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "industry":       r"Industry[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-        }
-        for key, pat in fields.items():
-            m = re.search(pat, html, re.IGNORECASE)
-            if m:
-                data[key] = re.sub(r'<[^>]+>', '', m.group(1)).strip()
 
-        # News
-        news = re.findall(
-            r'class="news-link-container"[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>([^<]+)</a>',
-            html, re.DOTALL
+        # Quote summary - fundamentals
+        r1 = requests.get(
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+            params={
+                "modules": "summaryDetail,defaultKeyStatistics,financialData,recommendationTrend,upgradeDowngradeHistory,calendarEvents,assetProfile"
+            },
+            headers=HEADERS,
+            timeout=12
         )
-        data["news"] = [{"url": n[0], "title": n[1].strip()} for n in news[:5]]
+        r1.raise_for_status()
+        result = r1.json().get("quoteSummary", {}).get("result", [{}])[0]
 
+        summary    = result.get("summaryDetail", {})
+        keystats   = result.get("defaultKeyStatistics", {})
+        findata    = result.get("financialData", {})
+        rectrend   = result.get("recommendationTrend", {}).get("trend", [{}])
+        calendar   = result.get("calendarEvents", {})
+        profile    = result.get("assetProfile", {})
+
+        def fval(d, k):
+            v = d.get(k, {})
+            if isinstance(v, dict):
+                return v.get("fmt") or v.get("raw")
+            return v
+
+        # Short float
+        short_pct = fval(keystats, "shortPercentOfFloat")
+        if short_pct:
+            try:
+                sp = float(str(short_pct).replace('%',''))
+                data["short_float"] = f"{sp:.1f}%"
+                data["short_pct_raw"] = sp * 100 if sp < 1 else sp
+            except:
+                data["short_float"] = str(short_pct)
+                data["short_pct_raw"] = 0
+
+        # Beta
+        beta = fval(summary, "beta")
+        data["beta"] = str(round(float(beta), 2)) if beta else "N/A"
+
+        # Target price
+        tp = fval(findata, "targetMeanPrice")
+        data["target_price"] = f"${float(tp):.2f}" if tp else "N/A"
+
+        # Recommendation
+        rec = fval(findata, "recommendationKey")
+        rec_map = {"strong_buy":"Strong Buy","buy":"Buy","hold":"Hold","sell":"Sell","strong_sell":"Strong Sell"}
+        data["recommendation"] = rec_map.get(str(rec).lower(), str(rec).title()) if rec else "N/A"
+
+        # Sector / Industry
+        data["sector"]   = profile.get("sector", "N/A")
+        data["industry"] = profile.get("industry", "N/A")
+
+        # Earnings date
+        earn_dates = calendar.get("earnings", {}).get("earningsDate", [])
+        if earn_dates:
+            ts = earn_dates[0].get("raw", 0)
+            if ts:
+                from datetime import datetime as dt
+                data["earnings_date"] = dt.fromtimestamp(ts).strftime("%d-%b-%Y")
+            else:
+                data["earnings_date"] = "N/A"
+        else:
+            data["earnings_date"] = "N/A"
+
+        # 52W high/low
+        data["52w_high"] = f"${float(fval(summary,'fiftyTwoWeekHigh')):.2f}" if fval(summary,'fiftyTwoWeekHigh') else "N/A"
+        data["52w_low"]  = f"${float(fval(summary,'fiftyTwoWeekLow')):.2f}"  if fval(summary,'fiftyTwoWeekLow')  else "N/A"
+
+        # Institutional ownership
+        data["inst_own"] = str(fval(keystats, "heldPercentInstitutions") or "N/A")
+
+        # Insider ownership
+        data["insider_own"] = str(fval(keystats, "heldPercentInsiders") or "N/A")
+
+        # Get RSI and MAs from Yahoo chart
+        r2 = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={"interval": "1d", "range": "1y", "indicators": "sma"},
+            headers=HEADERS,
+            timeout=12
+        )
+        r2.raise_for_status()
+        res2  = r2.json().get("chart", {}).get("result", [])
+        if res2:
+            meta2  = res2[0].get("meta", {})
+            closes = res2[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            closes = [c for c in closes if c is not None]
+            price  = float(meta2.get("regularMarketPrice") or 0)
+
+            if closes and price:
+                # Calculate SMAs
+                def sma(n):
+                    vals = closes[-n:]
+                    return round(sum(vals)/len(vals), 2) if len(vals) >= n else None
+
+                sma20  = sma(20)
+                sma50  = sma(50)
+                sma200 = sma(200)
+                sma5   = sma(5)
+
+                def pct_diff(ma):
+                    if ma and price:
+                        d = round((price - ma) / ma * 100, 2)
+                        return f"+{d:.2f}%" if d >= 0 else f"{d:.2f}%"
+                    return "N/A"
+
+                data["sma20_pct"]  = pct_diff(sma20)
+                data["sma50_pct"]  = pct_diff(sma50)
+                data["sma200_pct"] = pct_diff(sma200)
+                data["sma5_pct"]   = pct_diff(sma5)
+
+                # RSI 14
+                if len(closes) >= 15:
+                    diffs  = [closes[i]-closes[i-1] for i in range(1,len(closes))]
+                    gains  = [max(d,0) for d in diffs[-14:]]
+                    losses = [max(-d,0) for d in diffs[-14:]]
+                    ag = sum(gains)/14
+                    al = sum(losses)/14
+                    if al == 0:
+                        rsi = 100.0
+                    else:
+                        rs  = ag/al
+                        rsi = round(100 - 100/(1+rs), 1)
+                    data["rsi14"] = str(rsi)
+
+                # Performance
+                def perf(days):
+                    if len(closes) >= days+1:
+                        old = closes[-days-1]
+                        pct = (price - old)/old*100
+                        return f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                    return "N/A"
+
+                data["perf_week"]  = perf(5)
+                data["perf_month"] = perf(21)
+                data["perf_ytd"]   = perf(min(len(closes)-1, 252))
+
+        # ATR (14-day)
+        try:
+            r3 = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                params={"interval":"1d","range":"30d"},
+                headers=HEADERS, timeout=10
+            )
+            res3 = r3.json().get("chart",{}).get("result",[])
+            if res3:
+                q3 = res3[0].get("indicators",{}).get("quote",[{}])[0]
+                highs  = [h for h in (q3.get("high") or []) if h]
+                lows   = [l for l in (q3.get("low") or []) if l]
+                cls    = [c for c in (q3.get("close") or []) if c]
+                if len(highs) >= 14:
+                    trs = [max(highs[i]-lows[i], abs(highs[i]-cls[i-1]), abs(lows[i]-cls[i-1])) for i in range(1,min(15,len(highs)))]
+                    data["atr"] = f"${round(sum(trs[-14:])/14, 2)}"
+        except:
+            data["atr"] = "N/A"
+
+        # News from Yahoo
+        try:
+            r4 = requests.get(
+                f"https://query2.finance.yahoo.com/v1/finance/search",
+                params={"q": ticker, "newsCount": 5, "quotesCount": 0},
+                headers=HEADERS, timeout=8
+            )
+            news_data = r4.json().get("news", [])
+            data["news"] = [{"title": n.get("title",""), "url": n.get("link","")} for n in news_data[:5]]
+        except:
+            data["news"] = []
+
+        data["rel_volume"] = None  # Will use Yahoo main
         return data
+
     except Exception as e:
-        print(f"Finviz error {ticker}: {e}")
+        print(f"Yahoo fundamentals error {ticker}: {e}")
         return {}
 
 
