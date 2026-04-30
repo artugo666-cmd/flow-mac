@@ -1040,18 +1040,57 @@ def api_analyze():
     alert_raw   = payload.get('alert_raw', '')
     comment     = payload.get('comment', '')
     market_mode = payload.get('market', 'neutral')
+    direction   = payload.get('direction', '')
+    strike      = payload.get('strike', '')
+    expiry      = payload.get('expiry', '')
+    zona        = payload.get('zona', '')
+    premium     = payload.get('premium', '')
 
     if not tickers_raw:
         return jsonify({'error': 'Falta el campo tickers'}), 400
 
     market  = get_market_pulse()
     tickers = [t.strip().upper() for t in str(tickers_raw).split(',') if t.strip()]
-    ctx     = alert_raw or comment or ""
-    items   = []
 
+    # Build rich context from alert data
+    ctx_parts = []
+    if alert_raw:
+        ctx_parts.append(alert_raw)
+    if direction:
+        ctx_parts.append(f"Direccion: {direction}")
+    if strike:
+        ctx_parts.append(f"Strike: ${strike}")
+    if expiry:
+        ctx_parts.append(f"Vence: {expiry}")
+    if zona:
+        ctx_parts.append(f"Zona de interes: ${zona}")
+    if premium:
+        ctx_parts.append(f"Premium: {premium}")
+    if comment and comment not in ctx_parts:
+        ctx_parts.append(comment)
+    ctx = " | ".join(ctx_parts) if ctx_parts else ""
+
+    items = []
     for tk in tickers:
         result = analyze_ticker(tk, alert_context=ctx, market=market)
         if "error" not in result:
+            # Override direction from alert if provided
+            if direction:
+                result["direction"] = direction.upper()
+                result["type"] = direction.upper()
+            # Override strike from alert if provided
+            if strike:
+                try:
+                    result["strike"] = float(strike)
+                except:
+                    pass
+            # Override expiry from alert if provided
+            if expiry:
+                result["expiry"] = expiry
+            # Add zona de interes
+            if zona:
+                result["zona_interes"] = zona
+                result["ez"] = f"${zona} zona de interes"
             items.append(result)
 
     if not items:
