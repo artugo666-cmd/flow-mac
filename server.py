@@ -102,10 +102,12 @@ def get_yahoo(ticker: str) -> Dict[str, Any]:
         day_lo  = float(meta1.get("regularMarketDayLow") or 0)
         day_op  = float(meta1.get("regularMarketOpen") or 0)
         # Use Yahoo's own change calculation (most accurate)
-        chg_pct = round(float(meta1.get("regularMarketChangePercent") or 0), 2)
-        chg_abs = round(float(meta1.get("regularMarketChange") or (price - prev)), 2)
-        if not prev and price and chg_pct:
-            prev = round(price / (1 + chg_pct/100), 2)
+        chg_pct = round(float(meta1.get("regularMarketChangePercent") or meta2.get("regularMarketChangePercent") or 0), 2)
+        chg_abs = round(float(meta1.get("regularMarketChange") or meta2.get("regularMarketChange") or 0), 2)
+        # If still zero, calculate from prev close
+        if chg_pct == 0.0 and prev and price:
+            chg_abs = round(price - prev, 2)
+            chg_pct = round(chg_abs / prev * 100, 2) if prev else 0
         rel_vol = round(vol_today / avg_vol, 2) if avg_vol > 0 else 1.0
 
         return {
@@ -679,7 +681,14 @@ def compute_score(
     else:
         pts_short = 0.1
 
-    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier
+    # RSI moderate penalty - sobrecomprado/vendido extremo baja 0.5 pts
+    rsi_penalty = 0.0
+    if rsi_val >= 78:
+        rsi_penalty = -0.5
+    elif rsi_val <= 22:
+        rsi_penalty = -0.3  # sobrevendido es menos penalizado porque puede ser oportunidad
+
+    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier + rsi_penalty
     score = round(min(max(raw, 0), 10.0), 1)
 
     # Semaforo
@@ -698,12 +707,16 @@ def compute_score(
     else:
         rsi_label = f"Normal ({rsi_val:.0f})"
 
-    # Momentum
-    if chg_pct > 1.5:
+    # Momentum - considers both price change AND unusual volume
+    if rel_vol >= 2.0 and chg_pct > 0.5:
+        momentum = "ALCISTA FUERTE"
+    elif rel_vol >= 2.0 and chg_pct < -0.5:
+        momentum = "BAJISTA FUERTE"
+    elif chg_pct > 1.5 or (chg_pct > 0.5 and rel_vol >= 1.5):
         momentum = "ALCISTA FUERTE"
     elif chg_pct > 0.3:
         momentum = "ALCISTA"
-    elif chg_pct < -1.5:
+    elif chg_pct < -1.5 or (chg_pct < -0.5 and rel_vol >= 1.5):
         momentum = "BAJISTA FUERTE"
     elif chg_pct < -0.3:
         momentum = "BAJISTA"
