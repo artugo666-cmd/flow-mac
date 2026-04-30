@@ -620,7 +620,7 @@ function buildCard(d,idx){
       +'<div>'
         +'<div class="tkr"><span class="tk">'+d.ticker+'</span><span class="tp">'+type+'</span><span class="sc-pill" style="background:'+scColor+';color:'+scTxt+'">'+sc+'/10</span></div>'
         +'<div class="csub" style="margin-top:4px">'
-          +'<span style="color:'+chgColor==='g'?'var(--grn)':'var(--red)'+'">'+chgPct+'</span>'
+          +'<span style="color:'+(chgColor==='g'?'var(--grn)':'var(--red)')+'">'+chgPct+'</span>'
           +' · Precio: <b style="color:var(--txt)">'+spotDisp+'</b>'
           +' · VWAP: <b style="color:var(--yel)">'+vwap+'</b>'
         +'</div>'
