@@ -160,7 +160,7 @@ textarea::placeholder{color:var(--m1)}
 <div class="hdr">
   <div>
     <div class="logo">FLOW<span class="g">SCAN</span> <span class="y">8</span></div>
-    <div class="logo-s">UNUSUAL OPTIONS · POLYGON.IO · IBKR</div>
+    <div class="logo-s">UNUSUAL OPTIONS · YAHOO · FINVIZ · MARKET CHAMELEON</div>
   </div>
   <div class="hdr-r">
     <span class="sdot" id="sdot"></span><span id="sstat" style="font-family:'IBM Plex Mono',monospace;font-size:.58rem">Conectando...</span><br>
@@ -425,6 +425,8 @@ function runManual(){
   var done=0;
   items.forEach(function(it,i){
     setTimeout(function(){
+      // Fetch market pulse first
+      fetch(BASE+'/api/pulse').then(function(rp){return rp.json();}).then(function(mp){window._lastMarket=mp;}).catch(function(){});
       fetch(BASE+'/api/analyze',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
@@ -462,6 +464,8 @@ function finishManual(){
   }
   if(results.length){
     document.getElementById('res').insertBefore(buildSummary(results,'📊 Mis Alertas'),document.getElementById('res').firstChild);
+    // Insert market pulse before summary if available
+    if(window._lastMarket) { var pe=document.createElement('div'); pe.innerHTML=renderMarketPulse(window._lastMarket); document.getElementById('res').insertBefore(pe.firstChild, document.getElementById('res').firstChild); }
     addFooter(document.getElementById('res'));
   }
   document.getElementById('pg').className='pg';setOff(false);busy=false;
@@ -488,6 +492,34 @@ function parseAlerts(raw){
 }
 
 /* ── RENDER ── */
+function renderMarketPulse(market) {
+  if (!market || !market.sentiment) return '';
+  var spy = market.SPY || {};
+  var qqq = market.QQQ || {};
+  var iwm = market.IWM || {};
+  var vix = market.VIX || {};
+  var sc = market.sentiment;
+  var bc = sc==='ALCISTA'?'var(--grn)':sc==='BAJISTA'?'var(--red)':'var(--yel)';
+  var em = market.emoji || '➡️';
+  function chgSpan(v) {
+    var c = parseFloat(v||0);
+    var col = c>0?'var(--grn)':c<0?'var(--red)':'var(--m2)';
+    return '<span style="color:'+col+'">'+(c>0?'+':'')+c.toFixed(2)+'%</span>';
+  }
+  return '<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:10px;overflow:hidden;margin-bottom:14px">'
+    +'<div style="background:var(--s2);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--bdr)">'
+      +'<div style="font-family:'Bebas Neue',sans-serif;font-size:1rem;letter-spacing:.08em;color:'+bc+'">'+em+' PULSO DEL MERCADO — '+sc+'</div>'
+      +'<div style="font-family:'IBM Plex Mono',monospace;font-size:.55rem;color:var(--m2)">VIX: <b style="color:'+(parseFloat(market.vix_price||20)>=25?'var(--red)':'var(--grn)')+'">'+parseFloat(market.vix_price||0).toFixed(1)+'</b> · Riesgo: <b>'+market.vix_risk+'</b></div>'
+    +'</div>'
+    +'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--bdr)">'
+      +'<div style="background:var(--s1);padding:10px 14px"><div style="font-family:'IBM Plex Mono',monospace;font-size:.5rem;color:var(--m1);margin-bottom:3px">SPY</div><div style="font-size:.85rem;font-weight:700">$'+parseFloat(spy.price||0).toFixed(2)+'</div><div style="font-size:.7rem">'+chgSpan(spy.change_pct)+'</div></div>'
+      +'<div style="background:var(--s1);padding:10px 14px"><div style="font-family:'IBM Plex Mono',monospace;font-size:.5rem;color:var(--m1);margin-bottom:3px">QQQ</div><div style="font-size:.85rem;font-weight:700">$'+parseFloat(qqq.price||0).toFixed(2)+'</div><div style="font-size:.7rem">'+chgSpan(qqq.change_pct)+'</div></div>'
+      +'<div style="background:var(--s1);padding:10px 14px"><div style="font-family:'IBM Plex Mono',monospace;font-size:.5rem;color:var(--m1);margin-bottom:3px">IWM</div><div style="font-size:.85rem;font-weight:700">$'+parseFloat(iwm.price||0).toFixed(2)+'</div><div style="font-size:.7rem">'+chgSpan(iwm.change_pct)+'</div></div>'
+      +'<div style="background:var(--s1);padding:10px 14px"><div style="font-family:'IBM Plex Mono',monospace;font-size:.5rem;color:var(--m1);margin-bottom:3px">VIX</div><div style="font-size:.85rem;font-weight:700;color:'+(parseFloat(market.vix_price||20)>=25?'var(--red)':'var(--grn)')+'">'+parseFloat(market.vix_price||0).toFixed(1)+'</div><div style="font-size:.7rem">'+chgSpan(vix.change_pct)+'</div></div>'
+    +'</div>'
+  +'</div>';
+}
+
 function renderResults(items, summary, source){
   var res=document.getElementById('res');
   res.innerHTML='';
