@@ -162,185 +162,145 @@ def get_yahoo(ticker: str) -> Dict[str, Any]:
 
 
 def get_finviz(ticker: str) -> Dict[str, Any]:
-    """Get fundamentals from Yahoo Finance (replaces Finviz - no cloud blocking)."""
+    """Get fundamentals and technicals from Yahoo Finance."""
+    data = {}
+
+    # 1. Fundamentals from quoteSummary
     try:
-        data = {}
-
-        # Quote summary - fundamentals
-        r1 = requests.get(
+        r = requests.get(
             f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
-            params={
-                "modules": "summaryDetail,defaultKeyStatistics,financialData,recommendationTrend,upgradeDowngradeHistory,calendarEvents,assetProfile"
-            },
-            headers=HEADERS,
-            timeout=12
+            params={"modules": "summaryDetail,defaultKeyStatistics,financialData,assetProfile,calendarEvents"},
+            headers=HEADERS, timeout=12
         )
-        r1.raise_for_status()
-        result = r1.json().get("quoteSummary", {}).get("result", [{}])[0]
+        r.raise_for_status()
+        res = r.json().get("quoteSummary", {}).get("result", [])
+        if res:
+            sd  = res[0].get("summaryDetail", {})
+            ks  = res[0].get("defaultKeyStatistics", {})
+            fd  = res[0].get("financialData", {})
+            ap  = res[0].get("assetProfile", {})
+            cal = res[0].get("calendarEvents", {})
 
-        summary    = result.get("summaryDetail", {})
-        keystats   = result.get("defaultKeyStatistics", {})
-        findata    = result.get("financialData", {})
-        rectrend   = result.get("recommendationTrend", {}).get("trend", [{}])
-        calendar   = result.get("calendarEvents", {})
-        profile    = result.get("assetProfile", {})
+            def v(d, k):
+                x = d.get(k, {})
+                return (x.get("fmt") or x.get("raw")) if isinstance(x, dict) else x
 
-        def fval(d, k):
-            v = d.get(k, {})
-            if isinstance(v, dict):
-                return v.get("fmt") or v.get("raw")
-            return v
+            sf = v(ks, "shortPercentOfFloat")
+            if sf is not None:
+                try:
+                    sfv = float(sf)
+                    sfv = sfv * 100 if sfv < 1 else sfv
+                    data["short_float"] = f"{sfv:.1f}%"
+                    data["short_pct_raw"] = sfv
+                except:
+                    pass
 
-        # Short float
-        short_pct = fval(keystats, "shortPercentOfFloat")
-        if short_pct:
-            try:
-                sp = float(str(short_pct).replace('%',''))
-                data["short_float"] = f"{sp:.1f}%"
-                data["short_pct_raw"] = sp * 100 if sp < 1 else sp
-            except:
-                data["short_float"] = str(short_pct)
-                data["short_pct_raw"] = 0
+            beta = v(sd, "beta")
+            data["beta"] = f"{float(beta):.2f}" if beta else "N/A"
 
-        # Beta
-        beta = fval(summary, "beta")
-        data["beta"] = str(round(float(beta), 2)) if beta else "N/A"
+            tp = v(fd, "targetMeanPrice")
+            data["target_price"] = f"${float(tp):.2f}" if tp else "N/A"
 
-        # Target price
-        tp = fval(findata, "targetMeanPrice")
-        data["target_price"] = f"${float(tp):.2f}" if tp else "N/A"
+            rec = str(v(fd, "recommendationKey") or "")
+            rec_map = {"strong_buy":"Strong Buy","buy":"Buy","hold":"Hold","sell":"Sell","strong_sell":"Strong Sell"}
+            data["recommendation"] = rec_map.get(rec.lower(), rec.title()) if rec else "N/A"
 
-        # Recommendation
-        rec = fval(findata, "recommendationKey")
-        rec_map = {"strong_buy":"Strong Buy","buy":"Buy","hold":"Hold","sell":"Sell","strong_sell":"Strong Sell"}
-        data["recommendation"] = rec_map.get(str(rec).lower(), str(rec).title()) if rec else "N/A"
+            data["sector"]   = ap.get("sector", "N/A")
+            data["industry"] = ap.get("industry", "N/A")
 
-        # Sector / Industry
-        data["sector"]   = profile.get("sector", "N/A")
-        data["industry"] = profile.get("industry", "N/A")
-
-        # Earnings date
-        earn_dates = calendar.get("earnings", {}).get("earningsDate", [])
-        if earn_dates:
-            ts = earn_dates[0].get("raw", 0)
-            if ts:
-                from datetime import datetime as dt
-                data["earnings_date"] = dt.fromtimestamp(ts).strftime("%d-%b-%Y")
+            ed = cal.get("earnings", {}).get("earningsDate", [])
+            if ed:
+                ts = ed[0].get("raw", 0)
+                data["earnings_date"] = datetime.fromtimestamp(ts).strftime("%d-%b-%Y") if ts else "N/A"
             else:
                 data["earnings_date"] = "N/A"
-        else:
-            data["earnings_date"] = "N/A"
 
-        # 52W high/low
-        data["52w_high"] = f"${float(fval(summary,'fiftyTwoWeekHigh')):.2f}" if fval(summary,'fiftyTwoWeekHigh') else "N/A"
-        data["52w_low"]  = f"${float(fval(summary,'fiftyTwoWeekLow')):.2f}"  if fval(summary,'fiftyTwoWeekLow')  else "N/A"
+            h52 = v(sd, "fiftyTwoWeekHigh")
+            l52 = v(sd, "fiftyTwoWeekLow")
+            data["52w_high"] = f"${float(h52):.2f}" if h52 else "N/A"
+            data["52w_low"]  = f"${float(l52):.2f}" if l52 else "N/A"
 
-        # Institutional ownership
-        data["inst_own"] = str(fval(keystats, "heldPercentInstitutions") or "N/A")
+            ii = v(ks, "heldPercentInstitutions")
+            data["inst_own"] = f"{float(ii)*100:.1f}%" if ii else "N/A"
+            ins = v(ks, "heldPercentInsiders")
+            data["insider_own"] = f"{float(ins)*100:.1f}%" if ins else "N/A"
 
-        # Insider ownership
-        data["insider_own"] = str(fval(keystats, "heldPercentInsiders") or "N/A")
+    except Exception as e:
+        print(f"quoteSummary error {ticker}: {e}")
 
-        # Get RSI and MAs from Yahoo chart
+    # 2. MAs, RSI, Performance from 1-year daily prices
+    try:
         r2 = requests.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-            params={"interval": "1d", "range": "1y", "indicators": "sma"},
-            headers=HEADERS,
-            timeout=12
+            params={"interval": "1d", "range": "1y"},
+            headers=HEADERS, timeout=12
         )
         r2.raise_for_status()
-        res2  = r2.json().get("chart", {}).get("result", [])
+        res2 = r2.json().get("chart", {}).get("result", [])
         if res2:
-            meta2  = res2[0].get("meta", {})
-            closes = res2[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-            closes = [c for c in closes if c is not None]
-            price  = float(meta2.get("regularMarketPrice") or 0)
+            meta   = res2[0].get("meta", {})
+            quote2 = res2[0].get("indicators", {}).get("quote", [{}])[0]
+            closes = [c for c in (quote2.get("close") or []) if c is not None]
+            highs  = [h for h in (quote2.get("high") or [])  if h is not None]
+            lows   = [l for l in (quote2.get("low") or [])   if l is not None]
+            price  = float(meta.get("regularMarketPrice") or 0)
 
             if closes and price:
-                # Calculate SMAs
                 def sma(n):
-                    vals = closes[-n:]
-                    return round(sum(vals)/len(vals), 2) if len(vals) >= n else None
+                    return round(sum(closes[-n:]) / n, 2) if len(closes) >= n else None
 
-                sma20  = sma(20)
-                sma50  = sma(50)
-                sma200 = sma(200)
-                sma5   = sma(5)
-
-                def pct_diff(ma):
+                def pct(ma):
                     if ma and price:
                         d = round((price - ma) / ma * 100, 2)
                         return f"+{d:.2f}%" if d >= 0 else f"{d:.2f}%"
                     return "N/A"
 
-                data["sma20_pct"]  = pct_diff(sma20)
-                data["sma50_pct"]  = pct_diff(sma50)
-                data["sma200_pct"] = pct_diff(sma200)
-                data["sma5_pct"]   = pct_diff(sma5)
+                data["sma5_pct"]   = pct(sma(5))
+                data["sma20_pct"]  = pct(sma(20))
+                data["sma50_pct"]  = pct(sma(50))
+                data["sma200_pct"] = pct(sma(200))
 
-                # RSI 14
                 if len(closes) >= 15:
-                    diffs  = [closes[i]-closes[i-1] for i in range(1,len(closes))]
-                    gains  = [max(d,0) for d in diffs[-14:]]
-                    losses = [max(-d,0) for d in diffs[-14:]]
-                    ag = sum(gains)/14
-                    al = sum(losses)/14
-                    if al == 0:
-                        rsi = 100.0
-                    else:
-                        rs  = ag/al
-                        rsi = round(100 - 100/(1+rs), 1)
+                    diffs  = [closes[i]-closes[i-1] for i in range(1, len(closes))][-14:]
+                    gains  = [max(d, 0) for d in diffs]
+                    losses = [max(-d, 0) for d in diffs]
+                    ag = sum(gains) / 14
+                    al = sum(losses) / 14
+                    rsi = round(100 - 100 / (1 + ag/al), 1) if al > 0 else 100.0
                     data["rsi14"] = str(rsi)
 
-                # Performance
                 def perf(days):
-                    if len(closes) >= days+1:
+                    if len(closes) > days:
                         old = closes[-days-1]
-                        pct = (price - old)/old*100
-                        return f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                        p = (price - old) / old * 100
+                        return f"+{p:.2f}%" if p >= 0 else f"{p:.2f}%"
                     return "N/A"
 
                 data["perf_week"]  = perf(5)
                 data["perf_month"] = perf(21)
                 data["perf_ytd"]   = perf(min(len(closes)-1, 252))
 
-        # ATR (14-day)
-        try:
-            r3 = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-                params={"interval":"1d","range":"30d"},
-                headers=HEADERS, timeout=10
-            )
-            res3 = r3.json().get("chart",{}).get("result",[])
-            if res3:
-                q3 = res3[0].get("indicators",{}).get("quote",[{}])[0]
-                highs  = [h for h in (q3.get("high") or []) if h]
-                lows   = [l for l in (q3.get("low") or []) if l]
-                cls    = [c for c in (q3.get("close") or []) if c]
-                if len(highs) >= 14:
-                    trs = [max(highs[i]-lows[i], abs(highs[i]-cls[i-1]), abs(lows[i]-cls[i-1])) for i in range(1,min(15,len(highs)))]
-                    data["atr"] = f"${round(sum(trs[-14:])/14, 2)}"
-        except:
-            data["atr"] = "N/A"
-
-        # News from Yahoo
-        try:
-            r4 = requests.get(
-                f"https://query2.finance.yahoo.com/v1/finance/search",
-                params={"q": ticker, "newsCount": 5, "quotesCount": 0},
-                headers=HEADERS, timeout=8
-            )
-            news_data = r4.json().get("news", [])
-            data["news"] = [{"title": n.get("title",""), "url": n.get("link","")} for n in news_data[:5]]
-        except:
-            data["news"] = []
-
-        data["rel_volume"] = None  # Will use Yahoo main
-        return data
+                if len(highs) >= 15:
+                    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+                           for i in range(max(1,len(highs)-14), len(highs))]
+                    data["atr"] = f"${round(sum(trs)/len(trs), 2)}"
 
     except Exception as e:
-        print(f"Yahoo fundamentals error {ticker}: {e}")
-        return {}
+        print(f"Yahoo historical error {ticker}: {e}")
+
+    # 3. News
+    try:
+        r3 = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": ticker, "newsCount": 5, "quotesCount": 0},
+            headers=HEADERS, timeout=8
+        )
+        r3.raise_for_status()
+        data["news"] = [{"title": n.get("title",""), "url": n.get("link","")} for n in r3.json().get("news", [])[:5]]
+    except:
+        data["news"] = []
+
+    return data
 
 
 def get_stocktwits_sentiment(ticker: str) -> Dict[str, Any]:
