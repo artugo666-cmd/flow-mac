@@ -173,7 +173,7 @@ def get_finviz(ticker: str) -> Dict[str, Any]:
             "short_ratio":    r"Short Ratio[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
             "avg_volume":     r"Avg Volume[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
             "rel_volume":     r"Rel Volume[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
-            "rsi14":          r"RSI \(14\)[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
+            "rsi14":          r"RSI.{1,10}14.{1,10}</td>\s*<td[^>]*>([^<]+)</td>",
             "beta":           r"Beta[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
             "target_price":   r"Target Price[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
             "recommendation": r"Recom[^<]*</td>\s*<td[^>]*>([^<]+)</td>",
@@ -236,68 +236,62 @@ def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
     try:
         r = requests.get(
             "https://marketchameleon.com/Reports/UnusualOptionVolumeReport",
-            headers=HEADERS,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://marketchameleon.com/",
+            },
             timeout=20
         )
         html = r.text
 
-        # Parse table rows
-        rows = re.findall(
-            r'<tr[^>]*>.*?</tr>',
-            html, re.DOTALL
-        )
+        # Find all ticker symbols from the vol links
+        tickers_raw = re.findall(r'href="/vol/([A-Z]{1,6})[/"?]', html)
 
+        # Find relative volumes - pattern: number followed by x or just decimal > 1
+        # Also find from table data patterns
         results = []
-        for row in rows:
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-            if len(cells) < 8:
+        seen = set()
+
+        for ticker in tickers_raw:
+            if ticker in seen:
                 continue
+            if ticker in ('ETF', 'SPY', 'QQQ', 'IWM', 'VIX', 'TLT', 'GLD', 'SLV'):
+                continue
+            seen.add(ticker)
 
-            # Extract ticker symbol
-            ticker_m = re.search(r'/vol/([A-Z]{1,6})/', row)
-            if not ticker_m:
-                ticker_m = re.search(r'symbol["\s]*[:=]["\s]*([A-Z]{1,6})', row)
-            if not ticker_m:
-                # Try to find symbol link
-                sym_m = re.search(r'href="/vol/([A-Z]+)"', row)
-                if not sym_m:
-                    continue
-                ticker = sym_m.group(1)
-            else:
-                ticker = ticker_m.group(1)
+            # Try to find relative volume near this ticker in HTML
+            idx = html.find(f'/vol/{ticker}')
+            if idx == -1:
+                continue
+            snippet = html[idx:idx+500]
 
-            # Clean cell text
-            clean = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+            # Look for relative volume number
+            rv_match = re.search(r'(\d+\.?\d*)\s*(?:x|</td>)', snippet)
+            rel_vol = float(rv_match.group(1)) if rv_match else 1.5
 
-            # Extract numbers
-            def num(s):
-                try:
-                    return float(re.sub(r'[,$%]', '', s))
-                except:
-                    return 0.0
+            # Look for volume number
+            vol_match = re.search(r'([\d,]{4,})', snippet)
+            volume = int(vol_match.group(1).replace(',','')) if vol_match else 0
 
-            vol_text     = next((c for c in clean if re.match(r'[\d,]+', c)), '0')
-            rel_vol_text = next((c for c in clean if re.match(r'[\d.]+x?$', c) and float(re.sub(r'[^\d.]','',c) or 0) > 0.5), '1.0')
-            chg_text     = next((c for c in clean if re.match(r'[+-]?\d+\.?\d*%', c)), '0%')
+            # Look for change
+            chg_match = re.search(r'([+-]?\d+\.?\d*)%', snippet)
+            chg = float(chg_match.group(1)) if chg_match else 0.0
 
-            if ticker and num(vol_text) > 0:
+            if rel_vol >= 1.2:
                 results.append({
-                    "ticker":      ticker,
-                    "mc_volume":   int(num(vol_text)),
-                    "mc_rel_vol":  num(rel_vol_text),
-                    "mc_chg_pct":  num(chg_text.replace('%','')),
-                    "mc_bullish":  'bullish' in row.lower() or 'call' in row.lower(),
+                    "ticker":     ticker,
+                    "mc_volume":  volume,
+                    "mc_rel_vol": rel_vol,
+                    "mc_chg_pct": chg,
+                    "mc_bullish": chg >= 0,
                 })
 
-        # Deduplicate and sort by relative volume
-        seen = set()
-        unique = []
-        for r in sorted(results, key=lambda x: x.get("mc_rel_vol", 0), reverse=True):
-            if r["ticker"] not in seen and r["ticker"] not in ('ETF','SPY','QQQ','IWM'):
-                seen.add(r["ticker"])
-                unique.append(r)
-
-        return unique[:25]
+        # Sort by rel_vol desc
+        results.sort(key=lambda x: x.get("mc_rel_vol", 0), reverse=True)
+        print(f"Market Chameleon: found {len(results)} tickers")
+        return results[:25]
 
     except Exception as e:
         print(f"Market Chameleon error: {e}")
@@ -307,10 +301,11 @@ def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
 def get_market_pulse() -> Dict[str, Any]:
     """Get SPY, QQQ, IWM, VIX to determine market sentiment."""
     pulse = {}
-    for sym in ['SPY', 'QQQ', 'IWM', 'VIX']:
+    for sym in ['SPY', 'QQQ', 'IWM', '^VIX']:
         data = get_yahoo(sym)
         if data:
-            pulse[sym] = {
+            key = 'VIX' if sym == '^VIX' else sym
+            pulse[key] = {
                 "price":      data.get("price", 0),
                 "change_pct": data.get("change_pct", 0),
                 "volume":     data.get("volume", 0),
@@ -322,7 +317,11 @@ def get_market_pulse() -> Dict[str, Any]:
     qqq_chg  = pulse.get("QQQ", {}).get("change_pct", 0)
     iwm_chg  = pulse.get("IWM", {}).get("change_pct", 0)
     vix_chg  = pulse.get("VIX", {}).get("change_pct", 0)
-    vix_price= pulse.get("VIX", {}).get("price", 20)
+    vix_price= pulse.get("VIX", {}).get("price", 0)
+    if not vix_price:
+        vix_data = get_yahoo("^VIX")
+        vix_price = vix_data.get("price", 20)
+        pulse["VIX"] = vix_data
 
     avg_market = (spy_chg + qqq_chg + iwm_chg) / 3
     if vix_price >= 30:
