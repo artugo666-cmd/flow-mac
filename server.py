@@ -628,18 +628,20 @@ def compute_score(
         pts_catalyst = 0.5
 
     # ── V2 VOLUMEN INUSUAL (max 2.5) ─────────────────────────
-    if rel_vol >= 5:
-        pts_vol = 2.5
+    if rel_vol >= 10:
+        pts_vol = 2.5   # extremo - institucional masivo
+    elif rel_vol >= 5:
+        pts_vol = 2.3   # muy inusual
     elif rel_vol >= 3:
-        pts_vol = 2.0
+        pts_vol = 2.0   # inusual claro
     elif rel_vol >= 2:
-        pts_vol = 1.5
+        pts_vol = 1.5   # moderadamente inusual
     elif rel_vol >= 1.5:
-        pts_vol = 1.0
+        pts_vol = 1.0   # algo de actividad
     elif rel_vol >= 1.2:
-        pts_vol = 0.6
+        pts_vol = 0.6   # normal alto
     else:
-        pts_vol = 0.2
+        pts_vol = 0.2   # sin actividad inusual
 
     # ── V3 MOMENTUM TECNICO (max 2.0) ────────────────────────
     if direction == "CALL":
@@ -681,15 +683,31 @@ def compute_score(
     else:
         pts_short = 0.1
 
-    # RSI moderate penalty - sobrecomprado/vendido extremo baja 0.5 pts
+    # RSI moderate penalty
     rsi_penalty = 0.0
     if rsi_val >= 78:
         rsi_penalty = -0.5
     elif rsi_val <= 22:
-        rsi_penalty = -0.3  # sobrevendido es menos penalizado porque puede ser oportunidad
+        rsi_penalty = -0.3
 
-    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier + rsi_penalty
+    # Penalty for extreme same-day move - risk/reward already changed
+    move_penalty = 0.0
+    abs_chg = abs(chg_pct)
+    if abs_chg >= 20:
+        move_penalty = -1.5  # movimiento extremo - prima inflada
+    elif abs_chg >= 15:
+        move_penalty = -1.0  # movimiento muy grande
+    elif abs_chg >= 10:
+        move_penalty = -0.5  # movimiento grande - precaucion
+
+    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier + rsi_penalty + move_penalty
     score = round(min(max(raw, 0), 10.0), 1)
+    
+    # Add move penalty info to score breakdown
+    if move_penalty < 0:
+        move_note = f" MovExtrem{move_penalty}"
+    else:
+        move_note = ""
 
     # Semaforo
     if score >= 7.0:
@@ -783,7 +801,7 @@ def compute_score(
         "pts_momentum":    round(pts_mom, 1),
         "pts_sector":      round(pts_sector, 1),
         "pts_short":       round(pts_short, 1),
-        "score_breakdown": f"Cat {pts_catalyst:.1f}+Vol {pts_vol:.1f}+Mom {pts_mom:.1f}+Sector {pts_sector:.1f}+Short {pts_short:.1f}={score}",
+        "score_breakdown": f"Cat {pts_catalyst:.1f}+Vol {pts_vol:.1f}+Mom {pts_mom:.1f}+Sector {pts_sector:.1f}+Short {pts_short:.1f}{move_note}={score}",
         "momentum":        momentum,
         "rsi":             rsi_label,
         "rsi_value":       rsi_val,
