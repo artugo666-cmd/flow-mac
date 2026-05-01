@@ -475,60 +475,79 @@ function finishAlerts(){
 }
 
 function parseAlerts(raw){
-  var out=[],seen={};
-  raw.replace(/\r/g,'').split('\n').forEach(function(line){
-    line=line.trim();if(!line)return;
+  var out=[], seen={};
 
-    // Skip comment lines
-    if(line.startsWith('>>')||line.startsWith('//')||line.startsWith('#')){
-      var n=line.replace(/^(>>|\/\/|#)+\s*/,'').trim();
-      if(n&&out.length)out[out.length-1].comment=(out[out.length-1].comment?out[out.length-1].comment+' | ':'')+n;
+  // Clean up special characters and emojis
+  // Clean Discord special chars, emojis, channel references
+  raw = raw.replace(/#[\s\S]*?lista-de-seguimiento/g,'')
+           .replace(/[\u{1F000}-\u{1FFFF}]/gu,'')
+           .replace(/[\u{2600}-\u{26FF}]/gu,'')
+           .replace(/[\u{2700}-\u{27BF}]/gu,'')
+           .replace(/📋|⁠|・|#/g,'')
+           .replace(/\(editado\)/gi,'')
+           .replace(/Alertas inusuales:/gi,'')
+           .trim();
+
+  // Split into individual alerts - each starts with a ticker (1-6 uppercase letters followed by space+number or space+word)
+  // We split on pattern: newline OR when we see a new TICKER at start
+  var lines = raw.replace(/\r/g,'').split('\n');
+  var allLines = [];
+
+  lines.forEach(function(line){
+    line = line.trim();
+    if(!line) return;
+    // Each line is one alert - but also handle if multiple alerts on same line
+    var parts = line.split(/(?=\b[A-Z]{2,6}\s+(?:\d+(?:\.\d+)?\s+(?:mil|millon)|\d{3,}))/);
+    parts.forEach(function(p){ if(p.trim()) allLines.push(p.trim()); });
+  });
+
+  allLines.forEach(function(line){
+    line = line.trim();
+    if(!line) return;
+    if(line.startsWith('>>') || line.startsWith('//') || line.startsWith('#')){
+      var n = line.replace(/^(>>|\/\/|#)+\s*/,'').trim();
+      if(n && out.length) out[out.length-1].comment += ' | '+n;
       return;
     }
 
-    // Format: "TER 790 mil dolares calls vencen 18 junio strike 400 (328 zona interes)"
-    // Extract ticker - first word that is all caps 1-6 chars
-    var tickerM = line.match(/^([A-Z]{1,6})/);
+    // Must start with a ticker
+    var tickerM = line.match(/^([A-Z]{1,6})\b/);
     if(!tickerM) return;
     var ticker = tickerM[1];
     if(seen[ticker]) return;
     seen[ticker] = 1;
 
-    // Extract direction
-    var direction = 'CALL';
-    if(/\bputs?\b/i.test(line)) direction = 'PUT';
-    else if(/\bcalls?\b/i.test(line)) direction = 'CALL';
+    // Direction
+    var direction = /\bputs?\b/i.test(line) ? 'PUT' : 'CALL';
 
-    // Extract premium amount
-    var premiumStr = '';
-    var premM = line.match(/(\d+(?:\.\d+)?[, ]?(?:mil|millon(?:es)?|million)?(?:\s+d[oó]lares)?)/i);
-    if(premM) premiumStr = premM[0].trim();
+    // Premium
+    var premM = line.match(/(\d+(?:\.\d+)?)\s*(?:mil(?:lones?)?|mill?o?n?e?s?)?\s*d[oó]?lares?/i);
+    var premiumStr = premM ? premM[0].trim() : '';
 
-    // Extract strike
-    var strikeStr = '';
+    // Strike
     var strikeM = line.match(/strike\s+([\d.]+)/i);
-    if(strikeM) strikeStr = strikeM[1];
+    var strikeStr = strikeM ? strikeM[1] : '';
 
-    // Extract expiry
-    var expiryStr = '';
+    // Expiry
     var expiryM = line.match(/vencen?\s+(\d+\s+\w+)/i);
-    if(expiryM) expiryStr = expiryM[1];
+    var expiryStr = expiryM ? expiryM[1] : '';
 
-    // Extract zona de interes
-    var zonaStr = '';
+    // Zona de interes
     var zonaM = line.match(/\(([\d.]+)\s+zona/i);
-    if(zonaM) zonaStr = zonaM[1];
+    var zonaStr = zonaM ? zonaM[1] : '';
 
-    // Build context string for analysis
-    var context = direction+' '+expiryStr+' strike '+strikeStr;
-    if(zonaStr) context += ' zona interes '+zonaStr;
-    if(premiumStr) context += ' premium '+premiumStr;
+    // Build context
+    var ctx = direction;
+    if(expiryStr) ctx += ' vence '+expiryStr;
+    if(strikeStr) ctx += ' strike $'+strikeStr;
+    if(zonaStr) ctx += ' zona interes $'+zonaStr;
+    if(premiumStr) ctx += ' premium '+premiumStr;
 
     out.push({
       ticker:    ticker,
       raw:       line,
       simple:    false,
-      comment:   context,
+      comment:   ctx,
       direction: direction,
       strike:    strikeStr,
       expiry:    expiryStr,
@@ -537,13 +556,14 @@ function parseAlerts(raw){
     });
   });
 
-  // Also handle comma-separated simple tickers
+  // Fallback: simple comma-separated tickers
   if(!out.length){
     raw.split(',').forEach(function(p){
-      var m=p.trim().toUpperCase().match(/^([A-Z]{1,6})/);
-      if(m&&!seen[m[1]]){seen[m[1]]=1;out.push({ticker:m[1],raw:p.trim(),simple:true,comment:''});}
+      var m = p.trim().toUpperCase().match(/^([A-Z]{1,6})/);
+      if(m && !seen[m[1]]){ seen[m[1]]=1; out.push({ticker:m[1],raw:p.trim(),simple:true,comment:''}); }
     });
   }
+
   return out;
 }
 
