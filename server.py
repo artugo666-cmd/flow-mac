@@ -21,6 +21,271 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# ══════════════════════════════════════════════════════════════
+# WATCHLIST PERSISTENTE
+# Guardada en watchlist.json en el mismo directorio del server.
+# Se puede editar via /api/watchlist (GET/POST/DELETE).
+# Siempre se escanea independientemente de los screeners.
+# ══════════════════════════════════════════════════════════════
+
+WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
+
+DEFAULT_WATCHLIST = [
+    "NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN",
+    "INTC","QCOM","PLTR","SMCI","MSTR","COIN","ARM","CRWD",
+    "NFLX","UBER","SHOP","SQ","SOFI","RIVN","NIO","MU","AVGO",
+]
+
+def load_watchlist() -> List[str]:
+    """Load watchlist from JSON file. Falls back to default if missing."""
+    try:
+        if os.path.exists(WATCHLIST_FILE):
+            with open(WATCHLIST_FILE, "r") as f:
+                data = json.load(f)
+                tickers = [t.upper().strip() for t in data.get("tickers", []) if t.strip()]
+                return tickers if tickers else DEFAULT_WATCHLIST
+    except Exception as e:
+        print(f"Watchlist load error: {e}")
+    return list(DEFAULT_WATCHLIST)
+
+def save_watchlist(tickers: List[str]) -> bool:
+    """Save watchlist to JSON file."""
+    try:
+        with open(WATCHLIST_FILE, "w") as f:
+            json.dump({
+                "tickers":  [t.upper().strip() for t in tickers],
+                "updated":  datetime.now().isoformat(timespec='seconds'),
+                "count":    len(tickers),
+            }, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Watchlist save error: {e}")
+        return False
+
+# Initialize watchlist file if missing
+if not os.path.exists(WATCHLIST_FILE):
+    save_watchlist(DEFAULT_WATCHLIST)
+
+
+# ══════════════════════════════════════════════════════════════
+# CATALYST DETECTION (pre-movimiento)
+# Detecta catalizadores ANTES de que el precio se mueva:
+#   - Analyst upgrades/downgrades recientes (Yahoo quoteSummary)
+#   - Earnings próximos (< 7 días)
+#   - Implied Volatility spike vs histórico
+#   - Noticias con palabras clave de alto impacto
+# ══════════════════════════════════════════════════════════════
+
+# Palabras clave de alto impacto en títulos de noticias
+HIGH_IMPACT_KEYWORDS = [
+    # Analyst actions
+    "upgrade","upgraded","downgrade","downgraded","outperform","overweight",
+    "price target","raises target","cuts target","initiates","initiated",
+    # Corporate events
+    "merger","acquisition","acquired","buyout","takeover","deal","partnership",
+    "contract","awarded","wins","joint venture","collaboration","licensing",
+    # Earnings/guidance
+    "beats","beat","misses","miss","raises guidance","lowers guidance",
+    "revenue beat","eps beat","record revenue","record earnings",
+    # Regulatory/macro
+    "fda approval","approved","clearance","sec","investigation","lawsuit",
+    "tariff","sanction","export","ban","restriction",
+    # Tech/product
+    "launch","launches","released","announces","breakthrough","ai chip",
+    "snapdragon","foundry","fab","manufacturing",
+]
+
+IMPACT_SCORE_MAP = {
+    # Highest impact
+    "upgrade": 3, "upgraded": 3, "merger": 3, "acquisition": 3,
+    "acquired": 3, "buyout": 3, "fda approval": 3, "approved": 3,
+    "beats": 2, "beat": 2, "record revenue": 3, "record earnings": 3,
+    # High impact
+    "outperform": 2, "overweight": 2, "raises target": 2, "price target": 1,
+    "partnership": 2, "contract": 2, "awarded": 2, "wins": 2,
+    "raises guidance": 2, "revenue beat": 2, "eps beat": 2,
+    "launch": 1, "launches": 1, "announced": 1, "breakthrough": 2,
+    # Moderate
+    "downgrade": -2, "downgraded": -2, "misses": -2, "miss": -2,
+    "lowers guidance": -2, "investigation": -1, "lawsuit": -1,
+    "ban": -1, "restriction": -1,
+}
+
+def score_news_title(title: str) -> Tuple[int, List[str]]:
+    """
+    Score a news title by keyword matches.
+    Returns (score, matched_keywords).
+    Positive = bullish catalyst, Negative = bearish catalyst.
+    """
+    title_lower = title.lower()
+    total_score = 0
+    matched = []
+    for kw, pts in IMPACT_SCORE_MAP.items():
+        if kw in title_lower:
+            total_score += pts
+            matched.append(kw)
+    return total_score, matched
+
+
+def get_catalyst_data(ticker: str) -> Dict[str, Any]:
+    """
+    Detect pre-movement catalysts for a ticker:
+    1. Recent analyst actions (upgrades/downgrades/target changes)
+    2. Earnings proximity (< 7 days = high alert)
+    3. News impact score from keyword analysis
+    4. Implied volatility rank (IV spike = options market expecting move)
+
+    Returns a catalyst dict with signal strength 0-10.
+    """
+    result = {
+        "ticker":           ticker,
+        "catalyst_score":   0,
+        "catalyst_signal":  "NONE",
+        "analyst_action":   None,
+        "earnings_days":    None,
+        "earnings_alert":   False,
+        "iv_rank":          None,
+        "iv_spike":         False,
+        "top_news_score":   0,
+        "top_news_title":   None,
+        "top_news_kws":     [],
+        "catalysts_found":  [],
+    }
+
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+            params={"modules": "upgradeDowngradeHistory,calendarEvents,financialData,defaultKeyStatistics"},
+            headers=HEADERS, timeout=12
+        )
+        r.raise_for_status()
+        res = r.json().get("quoteSummary", {}).get("result", [])
+        if not res:
+            return result
+
+        # ── 1. ANALYST UPGRADES / DOWNGRADES ─────────────────
+        udh = res[0].get("upgradeDowngradeHistory", {}).get("history", [])
+        if udh:
+            # Look at last 5 days of analyst actions
+            cutoff = datetime.now().timestamp() - (5 * 86400)
+            recent_actions = [a for a in udh if a.get("epochGradeDate", 0) >= cutoff]
+            if recent_actions:
+                latest = recent_actions[0]
+                action  = latest.get("action", "")
+                firm    = latest.get("firm", "")
+                to_grd  = latest.get("toGrade", "")
+                from_grd = latest.get("fromGrade", "")
+                action_str = f"{firm}: {action} → {to_grd}" if to_grd else f"{firm}: {action}"
+                result["analyst_action"] = action_str
+
+                if action.lower() in ("up", "upgrade", "init"):
+                    result["catalyst_score"] += 3
+                    result["catalysts_found"].append(f"Upgrade reciente: {action_str}")
+                elif action.lower() in ("down", "downgrade"):
+                    result["catalyst_score"] -= 2
+                    result["catalysts_found"].append(f"Downgrade reciente: {action_str}")
+                elif action.lower() in ("main", "reit", "reiterate"):
+                    result["catalyst_score"] += 1
+                    result["catalysts_found"].append(f"Reiteración: {action_str}")
+
+        # ── 2. EARNINGS PROXIMITY ─────────────────────────────
+        cal = res[0].get("calendarEvents", {})
+        earn_dates = cal.get("earnings", {}).get("earningsDate", [])
+        if earn_dates:
+            ts = earn_dates[0].get("raw", 0)
+            if ts:
+                days_until = (ts - datetime.now().timestamp()) / 86400
+                result["earnings_days"] = round(days_until, 0)
+                if 0 <= days_until <= 2:
+                    result["catalyst_score"] += 4
+                    result["earnings_alert"] = True
+                    result["catalysts_found"].append(f"⚠️ EARNINGS HOY/MAÑANA ({days_until:.0f}d)")
+                elif days_until <= 5:
+                    result["catalyst_score"] += 3
+                    result["earnings_alert"] = True
+                    result["catalysts_found"].append(f"Earnings en {days_until:.0f} días — volatilidad inminente")
+                elif days_until <= 14:
+                    result["catalyst_score"] += 1
+                    result["catalysts_found"].append(f"Earnings en {days_until:.0f} días")
+
+        # ── 3. IMPLIED VOLATILITY from options chain ──────────
+        # Use currentRatio of IV from financialData as proxy
+        fd = res[0].get("financialData", {})
+        ks = res[0].get("defaultKeyStatistics", {})
+
+        # Beta as volatility proxy when IV not available
+        beta_raw = ks.get("beta", {})
+        beta = float(beta_raw.get("raw", 0)) if isinstance(beta_raw, dict) else float(beta_raw or 0)
+        if beta >= 2.0:
+            result["iv_spike"] = True
+            result["catalyst_score"] += 1
+            result["catalysts_found"].append(f"Beta {beta:.1f} — alta volatilidad implícita")
+
+    except Exception as e:
+        print(f"Catalyst data error {ticker}: {e}")
+
+    # ── 4. NEWS IMPACT SCORE ──────────────────────────────────
+    try:
+        r2 = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": ticker, "newsCount": 8, "quotesCount": 0},
+            headers=HEADERS, timeout=8
+        )
+        r2.raise_for_status()
+        news_items = r2.json().get("news", [])
+        best_score = 0
+        best_title = None
+        best_kws   = []
+
+        for item in news_items:
+            title = item.get("title", "")
+            if not title:
+                continue
+            # Only consider news from last 48 hours
+            pub_time = item.get("providerPublishTime", 0)
+            if pub_time and (datetime.now().timestamp() - pub_time) > 172800:
+                continue
+            ns, kws = score_news_title(title)
+            if abs(ns) > abs(best_score):
+                best_score = ns
+                best_title = title
+                best_kws   = kws
+
+        result["top_news_score"] = best_score
+        result["top_news_title"] = best_title
+        result["top_news_kws"]   = best_kws
+
+        if best_score >= 3:
+            result["catalyst_score"] += 3
+            result["catalysts_found"].append(f"Noticia alto impacto ({best_score}pts): {best_title[:70] if best_title else ''}")
+        elif best_score >= 2:
+            result["catalyst_score"] += 2
+            result["catalysts_found"].append(f"Noticia relevante: {best_title[:70] if best_title else ''}")
+        elif best_score >= 1:
+            result["catalyst_score"] += 1
+            result["catalysts_found"].append(f"Noticia: {best_title[:70] if best_title else ''}")
+        elif best_score <= -2:
+            result["catalyst_score"] -= 2
+            result["catalysts_found"].append(f"Noticia negativa: {best_title[:70] if best_title else ''}")
+
+    except Exception as e:
+        print(f"News catalyst error {ticker}: {e}")
+
+    # ── SIGNAL LABEL ──────────────────────────────────────────
+    cs = result["catalyst_score"]
+    if cs >= 6:
+        result["catalyst_signal"] = "🚨 CATALIZADOR FUERTE"
+    elif cs >= 4:
+        result["catalyst_signal"] = "⚡ CATALIZADOR MODERADO"
+    elif cs >= 2:
+        result["catalyst_signal"] = "📌 CATALIZADOR LEVE"
+    elif cs <= -2:
+        result["catalyst_signal"] = "⚠️ CATALIZADOR NEGATIVO"
+    else:
+        result["catalyst_signal"] = "NONE"
+
+    return result
+
 
 # ── SERVE HTML ────────────────────────────────────────────────
 @app.route('/')
@@ -326,93 +591,282 @@ def get_stocktwits_sentiment(ticker: str) -> Dict[str, Any]:
         return {}
 
 
-def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
-    """Scrape Unusual Whales free flow page - 15min delay, no login needed."""
+def get_options_flow_real(ticker: str) -> Dict[str, Any]:
+    """
+    Fetch real options chain from Yahoo Finance for a specific ticker.
+    Returns the REAL vol/OI ratio (the correct metric for unusual options activity).
+    vol/OI > 1.5 = unusual, > 3.0 = very unusual, > 5.0 = institutional sweep.
+    """
     try:
-        url = "https://unusualwhales.com/live-options-flow/free"
-        params = {
-            "limit": 50,
-            "excluded_tags[]": ["bid_side", "mid_side", "no_side"],
-            "min_ask_pct": 0.7,
-            "option_type": "calls",
+        # Step 1: Get available expiration dates
+        r = requests.get(
+            f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
+            headers=HEADERS,
+            timeout=12
+        )
+        r.raise_for_status()
+        data = r.json()
+        result = data.get("optionChain", {}).get("result", [])
+        if not result:
+            return {}
+
+        dates = result[0].get("expirationDates", [])
+        current_price = result[0].get("quote", {}).get("regularMarketPrice", 0)
+
+        # Step 2: Analyze next 2 expirations (closest = most sensitive to unusual activity)
+        best_call_vol_oi = 0.0
+        best_put_vol_oi  = 0.0
+        total_call_vol   = 0
+        total_put_vol    = 0
+        total_call_oi    = 0
+        total_put_oi     = 0
+        atm_call_vol_oi  = 0.0  # ATM = most significant signal
+        atm_put_vol_oi   = 0.0
+        dominant_side    = "NEUTRAL"
+        top_strikes      = []
+
+        for exp_ts in dates[:3]:  # Check next 3 expirations
+            r2 = requests.get(
+                f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
+                params={"date": exp_ts},
+                headers=HEADERS,
+                timeout=12
+            )
+            r2.raise_for_status()
+            d2 = r2.json()
+            res2 = d2.get("optionChain", {}).get("result", [])
+            if not res2:
+                continue
+
+            calls = res2[0].get("options", [{}])[0].get("calls", [])
+            puts  = res2[0].get("options", [{}])[0].get("puts", [])
+
+            for c in calls:
+                vol = int(c.get("volume", 0) or 0)
+                oi  = int(c.get("openInterest", 0) or 0)
+                strike = float(c.get("strike", 0) or 0)
+                total_call_vol += vol
+                total_call_oi  += oi
+                if oi > 50 and vol > 0:  # Minimum threshold to avoid noise
+                    ratio = vol / oi
+                    if ratio > best_call_vol_oi:
+                        best_call_vol_oi = round(ratio, 2)
+                    # ATM = within 5% of current price
+                    if current_price and abs(strike - current_price) / current_price <= 0.05:
+                        if ratio > atm_call_vol_oi:
+                            atm_call_vol_oi = round(ratio, 2)
+                    if ratio >= 1.5:
+                        top_strikes.append({
+                            "type": "CALL", "strike": strike,
+                            "vol": vol, "oi": oi, "ratio": round(ratio, 2)
+                        })
+
+            for p in puts:
+                vol = int(p.get("volume", 0) or 0)
+                oi  = int(p.get("openInterest", 0) or 0)
+                strike = float(p.get("strike", 0) or 0)
+                total_put_vol += vol
+                total_put_oi  += oi
+                if oi > 50 and vol > 0:
+                    ratio = vol / oi
+                    if ratio > best_put_vol_oi:
+                        best_put_vol_oi = round(ratio, 2)
+                    if current_price and abs(strike - current_price) / current_price <= 0.05:
+                        if ratio > atm_put_vol_oi:
+                            atm_put_vol_oi = round(ratio, 2)
+                    if ratio >= 1.5:
+                        top_strikes.append({
+                            "type": "PUT", "strike": strike,
+                            "vol": vol, "oi": oi, "ratio": round(ratio, 2)
+                        })
+
+        # Put/Call ratio (< 0.7 = bullish, > 1.3 = bearish)
+        pc_ratio = round(total_put_vol / total_call_vol, 2) if total_call_vol > 0 else 1.0
+
+        # Dominant side by volume
+        if total_call_vol > total_put_vol * 1.3:
+            dominant_side = "CALL"
+        elif total_put_vol > total_call_vol * 1.3:
+            dominant_side = "PUT"
+        else:
+            dominant_side = "NEUTRAL"
+
+        # Best vol/OI ratio overall (max of calls/puts, weighted toward dominant)
+        best_vol_oi = max(best_call_vol_oi, best_put_vol_oi)
+
+        # Sort top strikes by ratio
+        top_strikes.sort(key=lambda x: x["ratio"], reverse=True)
+
+        # Map vol/OI to rel_vol scale used by scoring engine
+        # vol/OI >= 5.0 → institutional sweep → rel_vol 10
+        # vol/OI >= 3.0 → very unusual       → rel_vol 5-7
+        # vol/OI >= 1.5 → unusual             → rel_vol 3-4
+        # vol/OI >= 0.8 → elevated            → rel_vol 1.5-2
+        # vol/OI <  0.5 → normal              → rel_vol 1.0
+        if best_vol_oi >= 5.0:
+            mapped_rel_vol = 10.0
+        elif best_vol_oi >= 3.0:
+            mapped_rel_vol = round(5.0 + (best_vol_oi - 3.0) / 2.0 * 2, 1)
+        elif best_vol_oi >= 1.5:
+            mapped_rel_vol = round(3.0 + (best_vol_oi - 1.5) / 1.5 * 1, 1)
+        elif best_vol_oi >= 0.8:
+            mapped_rel_vol = round(1.5 + (best_vol_oi - 0.8) / 0.7 * 0.5, 1)
+        else:
+            mapped_rel_vol = 1.0
+
+        return {
+            "best_vol_oi":      best_vol_oi,
+            "best_call_vol_oi": best_call_vol_oi,
+            "best_put_vol_oi":  best_put_vol_oi,
+            "atm_call_vol_oi":  atm_call_vol_oi,
+            "atm_put_vol_oi":   atm_put_vol_oi,
+            "total_call_vol":   total_call_vol,
+            "total_put_vol":    total_put_vol,
+            "total_call_oi":    total_call_oi,
+            "total_put_oi":     total_put_oi,
+            "pc_ratio":         pc_ratio,
+            "dominant_side":    dominant_side,
+            "mapped_rel_vol":   mapped_rel_vol,
+            "top_strikes":      top_strikes[:5],
+            "is_unusual":       best_vol_oi >= 1.5,
+            "is_sweep":         best_vol_oi >= 5.0,
         }
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-        html = r.text
-
-        results = []
-        seen = set()
-
-        # Extract ticker symbols from flow table
-        tickers = re.findall(r'<td[^>]*>\s*<[^>]*>\s*([A-Z]{1,6})\s*</[^>]*>\s*</td>', html)
-        if not tickers:
-            # Try alternate pattern
-            tickers = re.findall(r'"ticker"\s*:\s*"([A-Z]{1,6})"', html)
-        if not tickers:
-            tickers = re.findall(r'/stock/([A-Z]{1,6})[/"?]', html)
-
-        # Extract premiums
-        premiums = re.findall(r'\$(\d+(?:\.\d+)?)[KMB]', html)
-
-        for i, ticker in enumerate(tickers):
-            if ticker in seen:
-                continue
-            if ticker in ('ETF', 'SPY', 'QQQ', 'IWM', 'VIX', 'TLT'):
-                continue
-            seen.add(ticker)
-
-            # Get premium value
-            prem = 0
-            if i < len(premiums):
-                pv = premiums[i]
-                try:
-                    prem = float(pv) * 1000  # K suffix
-                except:
-                    prem = 0
-
-            results.append({
-                "ticker":     ticker,
-                "mc_volume":  prem,
-                "mc_rel_vol": 2.0,  # UW already filters for unusual
-                "mc_chg_pct": 0.0,
-                "mc_bullish": True,  # We filtered for calls/ask side
-                "source":     "unusual_whales",
-            })
-
-        print(f"Unusual Whales: found {len(results)} tickers")
-
-        # If scraping failed, use Market Chameleon as backup
-        if not results:
-            print("UW scraping failed, trying Market Chameleon...")
-            try:
-                r2 = requests.get(
-                    "https://marketchameleon.com/Reports/UnusualOptionVolumeReport",
-                    headers=HEADERS, timeout=20
-                )
-                tickers2 = re.findall(r'href="/vol/([A-Z]{1,6})[/"?]', r2.text)
-                seen2 = set()
-                for tk in tickers2:
-                    if tk not in seen2 and tk not in ('SPY','QQQ','IWM','VIX','ETF'):
-                        seen2.add(tk)
-                        results.append({"ticker": tk, "mc_volume": 0, "mc_rel_vol": 2.0, "mc_chg_pct": 0, "mc_bullish": True})
-                print(f"Market Chameleon backup: {len(results)} tickers")
-            except:
-                pass
-
-        # Final fallback - hot tickers today
-        if not results:
-            results = [
-                {"ticker": t, "mc_volume": 0, "mc_rel_vol": 1.5, "mc_chg_pct": 0, "mc_bullish": True}
-                for t in ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN","INTC","SPY"]
-            ]
-
-        return results[:15]
 
     except Exception as e:
-        print(f"Unusual Whales error: {e}")
-        return [
-            {"ticker": t, "mc_volume": 0, "mc_rel_vol": 1.5, "mc_chg_pct": 0, "mc_bullish": True}
-            for t in ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN"]
-        ]
+        print(f"Options chain error {ticker}: {e}")
+        return {}
+
+
+def get_options_unusual_screener() -> List[Dict[str, Any]]:
+    """
+    Detect tickers with unusual options activity by scanning Yahoo most-active
+    and calculating REAL vol/OI ratios from the options chain.
+    This replaces the broken UW scraper.
+
+    Strategy:
+    1. Get ~25 most active stocks from Yahoo screener
+    2. Get Yahoo trending tickers
+    3. For each candidate, fetch real options chain
+    4. Filter by vol/OI >= 1.5 (unusual threshold)
+    5. Return sorted by vol/OI descending (highest = most institutional)
+    """
+    candidates = set()
+
+    # Source A: Yahoo most active (highest stock volume today)
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+            params={"scrIds": "most_actives", "count": 30},
+            headers=HEADERS, timeout=10
+        )
+        r.raise_for_status()
+        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        for q in quotes:
+            tk = q.get("symbol", "")
+            if tk and len(tk) <= 5 and tk.isalpha():
+                candidates.add(tk)
+        print(f"Options screener: {len(candidates)} candidates from most_actives")
+    except Exception as e:
+        print(f"Most active error: {e}")
+
+    # Source B: Yahoo trending
+    try:
+        r2 = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/trending/US",
+            params={"count": 20},
+            headers=HEADERS, timeout=10
+        )
+        r2.raise_for_status()
+        quotes2 = r2.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        for q in quotes2:
+            tk = q.get("symbol", "")
+            if tk and len(tk) <= 5 and tk.isalpha():
+                candidates.add(tk)
+        print(f"Options screener: {len(candidates)} total candidates after trending")
+    except Exception as e:
+        print(f"Trending error: {e}")
+
+    # Source C: Always include high-beta watchlist (never miss these)
+    WATCHLIST = ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN",
+                 "INTC","QCOM","PLTR","SMCI","MSTR","COIN","ARM","CRWD",
+                 "NFLX","UBER","SHOP","SQ","SOFI","LCID","RIVN","NIO"]
+    for tk in WATCHLIST:
+        candidates.add(tk)
+
+    # Exclude ETFs and indices
+    EXCLUDE = {"SPY","QQQ","IWM","VIX","TLT","GLD","SLV","XLF","XLE","XLK","DIA","EEM"}
+    candidates -= EXCLUDE
+
+    print(f"Options screener: scanning {len(candidates)} candidates for real vol/OI...")
+
+    # Fetch options chain for each candidate and filter
+    results = []
+    checked = 0
+    for ticker in list(candidates)[:35]:  # Cap at 35 to avoid timeout
+        opts = get_options_flow_real(ticker)
+        if not opts:
+            continue
+        checked += 1
+
+        best_vol_oi   = opts.get("best_vol_oi", 0)
+        mapped_rel_vol = opts.get("mapped_rel_vol", 1.0)
+        dominant_side  = opts.get("dominant_side", "NEUTRAL")
+        pc_ratio       = opts.get("pc_ratio", 1.0)
+        is_unusual     = opts.get("is_unusual", False)
+
+        # Get stock change % for context
+        try:
+            yq = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                params={"interval": "1d", "range": "1d"},
+                headers=HEADERS, timeout=6
+            )
+            yq.raise_for_status()
+            meta = yq.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            chg_pct = float(meta.get("regularMarketChangePercent", 0))
+            vol_today = int(meta.get("regularMarketVolume", 0))
+            avg_vol = int(meta.get("averageDailyVolume3Month", 1) or 1)
+            stock_rel_vol = round(vol_today / avg_vol, 2) if avg_vol else 1.0
+        except:
+            chg_pct = 0.0
+            stock_rel_vol = 1.0
+
+        results.append({
+            "ticker":          ticker,
+            "mc_volume":       opts.get("total_call_vol", 0) + opts.get("total_put_vol", 0),
+            "mc_rel_vol":      mapped_rel_vol,      # ← NOW based on REAL vol/OI
+            "mc_chg_pct":      chg_pct,
+            "mc_bullish":      dominant_side == "CALL" or chg_pct >= 0,
+            "source":          "yahoo_options_chain",
+            # Extra options data passed through to scoring
+            "opt_vol_oi":      best_vol_oi,
+            "opt_call_vol_oi": opts.get("best_call_vol_oi", 0),
+            "opt_put_vol_oi":  opts.get("best_put_vol_oi", 0),
+            "opt_atm_call":    opts.get("atm_call_vol_oi", 0),
+            "opt_atm_put":     opts.get("atm_put_vol_oi", 0),
+            "opt_pc_ratio":    pc_ratio,
+            "opt_dominant":    dominant_side,
+            "opt_is_sweep":    opts.get("is_sweep", False),
+            "opt_top_strikes": opts.get("top_strikes", []),
+            "stock_rel_vol":   stock_rel_vol,
+            "is_unusual":      is_unusual,
+        })
+
+    print(f"Options screener: checked {checked}, found {sum(1 for r in results if r['is_unusual'])} unusual")
+
+    # Sort by vol/OI ratio descending — highest = most institutional interest
+    results.sort(key=lambda x: x.get("opt_vol_oi", 0), reverse=True)
+
+    # If nothing unusual found, return all sorted (so at least we have data)
+    return results[:15]
+
+
+def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
+    """
+    Primary: Real options vol/OI from Yahoo Finance options chain.
+    This replaces the broken Unusual Whales + Market Chameleon scrapers.
+    """
+    return get_options_unusual_screener()
 
 
 def get_yahoo_most_active() -> List[Dict[str, Any]]:
@@ -547,7 +1001,8 @@ def compute_score(
     st: Dict,
     market: Dict,
     alert_context: str = "",
-    mc_data: Dict = None
+    mc_data: Dict = None,
+    catalyst: Dict = None,
 ) -> Dict[str, Any]:
 
     price     = yahoo.get("price", 0)
@@ -555,7 +1010,29 @@ def compute_score(
     rel_vol   = yahoo.get("rel_volume", 1.0)
     volume    = yahoo.get("volume", 0)
 
-    # Override rel_vol with Finviz (more accurate) or Market Chameleon
+    # ── CATALYST DATA ─────────────────────────────────────────
+    cat_score    = catalyst.get("catalyst_score", 0) if catalyst else 0
+    cat_signal   = catalyst.get("catalyst_signal", "NONE") if catalyst else "NONE"
+    cat_analyst  = catalyst.get("analyst_action") if catalyst else None
+    cat_earn_days = catalyst.get("earnings_days") if catalyst else None
+    cat_earn_alert = catalyst.get("earnings_alert", False) if catalyst else False
+    cat_news_score = catalyst.get("top_news_score", 0) if catalyst else 0
+    cat_news_title = catalyst.get("top_news_title") if catalyst else None
+    cat_found    = catalyst.get("catalysts_found", []) if catalyst else []
+    has_catalyst = cat_score >= 2
+
+    # ── REAL OPTIONS DATA (new) ───────────────────────────────
+    opt_vol_oi      = mc_data.get("opt_vol_oi", 0) if mc_data else 0
+    opt_call_vol_oi = mc_data.get("opt_call_vol_oi", 0) if mc_data else 0
+    opt_put_vol_oi  = mc_data.get("opt_put_vol_oi", 0) if mc_data else 0
+    opt_atm_call    = mc_data.get("opt_atm_call", 0) if mc_data else 0
+    opt_atm_put     = mc_data.get("opt_atm_put", 0) if mc_data else 0
+    opt_pc_ratio    = mc_data.get("opt_pc_ratio", 1.0) if mc_data else 1.0
+    opt_dominant    = mc_data.get("opt_dominant", "NEUTRAL") if mc_data else "NEUTRAL"
+    opt_is_sweep    = mc_data.get("opt_is_sweep", False) if mc_data else False
+    has_real_opts   = opt_vol_oi > 0
+
+    # Override rel_vol — priority: real options vol/OI > stock rel_vol
     fv_rv = finviz.get("rel_volume", "")
     if fv_rv and fv_rv not in ("-", "N/A"):
         try:
@@ -563,7 +1040,7 @@ def compute_score(
         except:
             pass
     if mc_data and mc_data.get("mc_rel_vol", 0) > rel_vol:
-        rel_vol = mc_data["mc_rel_vol"]
+        rel_vol = mc_data["mc_rel_vol"]  # Already mapped from real vol/OI
 
     # MA percentages from Finviz
     sma20_pct  = finviz.get("sma20_pct", "")
@@ -605,8 +1082,10 @@ def compute_score(
     mkt_sentiment = market.get("sentiment", "NEUTRAL")
     mkt_modifier  = 0.5 if mkt_sentiment == "ALCISTA" else -0.3 if mkt_sentiment == "BAJISTA" else 0.0
 
-    # Direction
-    if has_alert and "put" in alert_context.lower():
+    # Direction — real options dominant side takes priority
+    if has_real_opts and opt_dominant in ("CALL", "PUT"):
+        direction = opt_dominant
+    elif has_alert and "put" in alert_context.lower():
         direction = "PUT"
     elif has_alert and "call" in alert_context.lower():
         direction = "CALL"
@@ -616,32 +1095,65 @@ def compute_score(
         direction = "PUT"
 
     # ── V1 CATALIZADOR (max 3.0) ──────────────────────────────
+    # Priority: manual alert > sweep > catalyst detector > options flow > news
     if has_alert:
         pts_catalyst = 2.5
+    elif opt_is_sweep:
+        pts_catalyst = 2.8  # institutional sweep = strongest signal
+    elif cat_earn_alert:
+        pts_catalyst = 2.8  # earnings today/tomorrow = high volatility
+    elif cat_score >= 6:
+        pts_catalyst = 2.5  # strong catalyst (upgrade + news + proximity)
+    elif cat_score >= 4:
+        pts_catalyst = 2.2  # moderate catalyst
+    elif has_real_opts and opt_vol_oi >= 3.0:
+        pts_catalyst = 2.3  # very unusual options flow
+    elif has_real_opts and opt_vol_oi >= 1.5:
+        pts_catalyst = 2.0  # unusual options flow
+    elif cat_score >= 2:
+        pts_catalyst = 1.8  # light catalyst (upgrade or news)
     elif has_earn:
-        pts_catalyst = 2.0
-    elif has_news:
         pts_catalyst = 1.5
-    elif mc_data:
+    elif has_news:
         pts_catalyst = 1.2
+    elif mc_data:
+        pts_catalyst = 0.8
     else:
-        pts_catalyst = 0.5
+        pts_catalyst = 0.3
 
-    # ── V2 VOLUMEN INUSUAL (max 2.5) ─────────────────────────
-    if rel_vol >= 10:
-        pts_vol = 2.5   # extremo - institucional masivo
-    elif rel_vol >= 5:
-        pts_vol = 2.3   # muy inusual
-    elif rel_vol >= 3:
-        pts_vol = 2.0   # inusual claro
-    elif rel_vol >= 2:
-        pts_vol = 1.5   # moderadamente inusual
-    elif rel_vol >= 1.5:
-        pts_vol = 1.0   # algo de actividad
-    elif rel_vol >= 1.2:
-        pts_vol = 0.6   # normal alto
+    # ── V2 VOLUMEN INUSUAL (max 2.5) — real vol/OI when available ───
+    if has_real_opts:
+        if opt_vol_oi >= 10.0:
+            pts_vol = 2.5
+        elif opt_vol_oi >= 5.0:
+            pts_vol = 2.3
+        elif opt_vol_oi >= 3.0:
+            pts_vol = 2.0
+        elif opt_vol_oi >= 1.5:
+            pts_vol = 1.6
+        elif opt_vol_oi >= 0.8:
+            pts_vol = 1.0
+        else:
+            pts_vol = 0.4
+        if direction == "CALL" and opt_atm_call >= 2.0:
+            pts_vol = min(pts_vol + 0.3, 2.5)
+        elif direction == "PUT" and opt_atm_put >= 2.0:
+            pts_vol = min(pts_vol + 0.3, 2.5)
     else:
-        pts_vol = 0.2   # sin actividad inusual
+        if rel_vol >= 10:
+            pts_vol = 2.5
+        elif rel_vol >= 5:
+            pts_vol = 2.3
+        elif rel_vol >= 3:
+            pts_vol = 2.0
+        elif rel_vol >= 2:
+            pts_vol = 1.5
+        elif rel_vol >= 1.5:
+            pts_vol = 1.0
+        elif rel_vol >= 1.2:
+            pts_vol = 0.6
+        else:
+            pts_vol = 0.2
 
     # ── V3 MOMENTUM TECNICO (max 2.0) ────────────────────────
     if direction == "CALL":
@@ -741,12 +1253,22 @@ def compute_score(
     else:
         momentum = "LATERAL"
 
-    # Vol label
-    vol_label = f"{rel_vol:.1f}x promedio"
-    if rel_vol >= 3:
-        vol_label += " 🔥 MUY INUSUAL"
-    elif rel_vol >= 2:
-        vol_label += " ⚡ INUSUAL"
+    # Vol label — show real options data when available
+    if has_real_opts:
+        vol_label = f"Vol/OI {opt_vol_oi:.1f}x"
+        if opt_is_sweep:
+            vol_label += " 🚨 SWEEP INSTITUCIONAL"
+        elif opt_vol_oi >= 3.0:
+            vol_label += " 🔥 MUY INUSUAL"
+        elif opt_vol_oi >= 1.5:
+            vol_label += " ⚡ INUSUAL"
+        vol_label += f" | P/C {opt_pc_ratio:.2f} | {opt_dominant}"
+    else:
+        vol_label = f"{rel_vol:.1f}x promedio"
+        if rel_vol >= 3:
+            vol_label += " 🔥 MUY INUSUAL"
+        elif rel_vol >= 2:
+            vol_label += " ⚡ INUSUAL"
 
     # Stocktwits sentiment
     st_bulls = st.get("bullish")
@@ -760,7 +1282,13 @@ def compute_score(
     why_parts = []
     if has_alert:
         why_parts.append(f"Alerta del grupo: {alert_context}")
-    if rel_vol >= 2:
+    # Catalyst detector findings (pre-movement signals)
+    for cf in cat_found[:3]:
+        why_parts.append(cf)
+    if has_real_opts and opt_vol_oi >= 1.5:
+        sweep_txt = "SWEEP INSTITUCIONAL — " if opt_is_sweep else ""
+        why_parts.append(f"{sweep_txt}Flujo de opciones inusual: Vol/OI {opt_vol_oi:.1f}x — lado {opt_dominant} dominante (P/C {opt_pc_ratio:.2f})")
+    elif rel_vol >= 2:
         why_parts.append(f"Volumen {rel_vol:.1f}x sobre promedio — actividad inusual")
     if above_sma50 and above_sma20 and direction == "CALL":
         why_parts.append("Precio sobre MA20 y MA50 — estructura alcista")
@@ -802,6 +1330,24 @@ def compute_score(
         "pts_sector":      round(pts_sector, 1),
         "pts_short":       round(pts_short, 1),
         "score_breakdown": f"Cat {pts_catalyst:.1f}+Vol {pts_vol:.1f}+Mom {pts_mom:.1f}+Sector {pts_sector:.1f}+Short {pts_short:.1f}{move_note}={score}",
+        # Real options data
+        "opt_vol_oi":      round(opt_vol_oi, 2),
+        "opt_call_vol_oi": round(opt_call_vol_oi, 2),
+        "opt_put_vol_oi":  round(opt_put_vol_oi, 2),
+        "opt_atm_call":    round(opt_atm_call, 2),
+        "opt_atm_put":     round(opt_atm_put, 2),
+        "opt_pc_ratio":    round(opt_pc_ratio, 2),
+        "opt_dominant":    opt_dominant,
+        "opt_is_sweep":    opt_is_sweep,
+        "has_real_opts":   has_real_opts,
+        # Catalyst detection
+        "catalyst_score":  cat_score,
+        "catalyst_signal": cat_signal,
+        "catalyst_analyst": cat_analyst,
+        "catalyst_earn_days": cat_earn_days,
+        "catalyst_earn_alert": cat_earn_alert,
+        "catalyst_news_title": cat_news_title,
+        "catalysts_found": cat_found,
         "momentum":        momentum,
         "rsi":             rsi_label,
         "rsi_value":       rsi_val,
@@ -853,10 +1399,34 @@ def analyze_ticker(ticker: str, alert_context: str = "", market: Dict = None, mc
     finviz = get_finviz(ticker)
     st     = get_stocktwits_sentiment(ticker)
 
+    # If mc_data doesn't have real options data (e.g. called from /api/flow or /api/ticker),
+    # fetch it now so individual ticker lookups also get real options analysis
+    if not mc_data or not mc_data.get("opt_vol_oi"):
+        opts = get_options_flow_real(ticker)
+        if opts:
+            if mc_data is None:
+                mc_data = {}
+            mc_data.update({
+                "opt_vol_oi":      opts.get("best_vol_oi", 0),
+                "opt_call_vol_oi": opts.get("best_call_vol_oi", 0),
+                "opt_put_vol_oi":  opts.get("best_put_vol_oi", 0),
+                "opt_atm_call":    opts.get("atm_call_vol_oi", 0),
+                "opt_atm_put":     opts.get("atm_put_vol_oi", 0),
+                "opt_pc_ratio":    opts.get("pc_ratio", 1.0),
+                "opt_dominant":    opts.get("dominant_side", "NEUTRAL"),
+                "opt_is_sweep":    opts.get("is_sweep", False),
+                "opt_top_strikes": opts.get("top_strikes", []),
+                "mc_rel_vol":      opts.get("mapped_rel_vol", 1.0),
+                "is_unusual":      opts.get("is_unusual", False),
+            })
+
+    # Catalyst detection — pre-movement signal
+    catalyst = get_catalyst_data(ticker)
+
     if not yahoo and not finviz:
         return {"ticker": ticker, "error": f"Sin datos para {ticker}. Verifica el simbolo.", "score": 0, "semaforo": "ROJO"}
 
-    scoring = compute_score(ticker, yahoo, finviz, st, market, alert_context, mc_data)
+    scoring = compute_score(ticker, yahoo, finviz, st, market, alert_context, mc_data, catalyst)
     price   = yahoo.get("price", 0)
 
     return {
@@ -909,6 +1479,29 @@ def analyze_ticker(ticker: str, alert_context: str = "", market: Dict = None, mc
         "earnings_date":   scoring["earnings_date"],
         "atr":             scoring["atr"],
         "st_sentiment":    scoring["st_sentiment"],
+        # Real options flow data
+        "opt_vol_oi":      scoring.get("opt_vol_oi", 0),
+        "opt_call_vol_oi": scoring.get("opt_call_vol_oi", 0),
+        "opt_put_vol_oi":  scoring.get("opt_put_vol_oi", 0),
+        "opt_pc_ratio":    scoring.get("opt_pc_ratio", 1.0),
+        "opt_dominant":    scoring.get("opt_dominant", "N/A"),
+        "opt_is_sweep":    scoring.get("opt_is_sweep", False),
+        "has_real_opts":   scoring.get("has_real_opts", False),
+        "opt_top_strikes": mc_data.get("opt_top_strikes", []) if mc_data else [],
+        "opt_signal": (
+            "🚨 SWEEP" if scoring.get("opt_is_sweep")
+            else "🔥 MUY INUSUAL" if scoring.get("opt_vol_oi", 0) >= 3.0
+            else "⚡ INUSUAL" if scoring.get("opt_vol_oi", 0) >= 1.5
+            else "Normal" if scoring.get("has_real_opts") else "Sin datos"
+        ),
+        # Catalyst detection (pre-movement signals)
+        "catalyst_score":    scoring.get("catalyst_score", 0),
+        "catalyst_signal":   scoring.get("catalyst_signal", "NONE"),
+        "catalyst_analyst":  scoring.get("catalyst_analyst"),
+        "catalyst_earn_days": scoring.get("catalyst_earn_days"),
+        "catalyst_earn_alert": scoring.get("catalyst_earn_alert", False),
+        "catalyst_news":     scoring.get("catalyst_news_title"),
+        "catalysts_found":   scoring.get("catalysts_found", []),
         # News
         "news":            scoring["news"],
         "catalyst":        scoring["news"][0]["title"] if scoring["news"] else "Sin noticias recientes",
@@ -1135,9 +1728,148 @@ def api_ticker(ticker: str):
     return jsonify({"ticker": ticker.upper(), "market": market, "items": [result], "source": "yahoo+finviz+stocktwits"})
 
 
+@app.route('/api/options/<ticker>')
+def api_options(ticker: str):
+    """
+    Direct options chain analysis for a specific ticker.
+    Returns real vol/OI ratios, put/call ratio, dominant side, top strikes.
+    Use this to check any ticker manually: /api/options/INTC
+    """
+    ticker = ticker.upper().strip()
+    opts = get_options_flow_real(ticker)
+    if not opts:
+        return jsonify({"ticker": ticker, "error": "No options data available", "ok": False}), 404
+
+    return jsonify({
+        "ticker":          ticker,
+        "ok":              True,
+        "timestamp":       datetime.now().isoformat(timespec='seconds'),
+        "vol_oi":          opts.get("best_vol_oi"),
+        "call_vol_oi":     opts.get("best_call_vol_oi"),
+        "put_vol_oi":      opts.get("best_put_vol_oi"),
+        "atm_call_vol_oi": opts.get("atm_call_vol_oi"),
+        "atm_put_vol_oi":  opts.get("atm_put_vol_oi"),
+        "total_call_vol":  opts.get("total_call_vol"),
+        "total_put_vol":   opts.get("total_put_vol"),
+        "pc_ratio":        opts.get("pc_ratio"),
+        "dominant_side":   opts.get("dominant_side"),
+        "is_unusual":      opts.get("is_unusual"),
+        "is_sweep":        opts.get("is_sweep"),
+        "mapped_rel_vol":  opts.get("mapped_rel_vol"),
+        "top_strikes":     opts.get("top_strikes", []),
+        "signal": (
+            "🚨 SWEEP INSTITUCIONAL" if opts.get("is_sweep")
+            else "🔥 MUY INUSUAL" if opts.get("best_vol_oi", 0) >= 3.0
+            else "⚡ INUSUAL" if opts.get("is_unusual")
+            else "Normal"
+        ),
+    })
+
+
+@app.route('/api/watchlist', methods=['GET'])
+def api_watchlist_get():
+    """Get current watchlist."""
+    tickers = load_watchlist()
+    return jsonify({
+        "tickers": tickers,
+        "count":   len(tickers),
+        "file":    WATCHLIST_FILE,
+        "timestamp": datetime.now().isoformat(timespec='seconds'),
+    })
+
+
+@app.route('/api/watchlist', methods=['POST'])
+def api_watchlist_post():
+    """
+    Add or set watchlist tickers.
+    Body: {"tickers": ["INTC","QCOM","NVDA"]}   → replaces full list
+    Body: {"add": ["SOFI","MSTR"]}               → appends to current list
+    Body: {"remove": ["RIVN"]}                   → removes from list
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    current = load_watchlist()
+
+    if "tickers" in payload:
+        # Full replace
+        new_list = [t.upper().strip() for t in payload["tickers"] if t.strip()]
+        save_watchlist(new_list)
+        return jsonify({"ok": True, "action": "replaced", "tickers": new_list, "count": len(new_list)})
+
+    if "add" in payload:
+        to_add = [t.upper().strip() for t in payload["add"] if t.strip()]
+        merged = list(dict.fromkeys(current + to_add))  # preserve order, dedupe
+        save_watchlist(merged)
+        return jsonify({"ok": True, "action": "added", "added": to_add, "tickers": merged, "count": len(merged)})
+
+    if "remove" in payload:
+        to_remove = {t.upper().strip() for t in payload["remove"]}
+        filtered = [t for t in current if t not in to_remove]
+        save_watchlist(filtered)
+        return jsonify({"ok": True, "action": "removed", "removed": list(to_remove), "tickers": filtered, "count": len(filtered)})
+
+    return jsonify({"error": "Payload must have 'tickers', 'add', or 'remove' key"}), 400
+
+
+@app.route('/api/watchlist/scan')
+def api_watchlist_scan():
+    """
+    Scan ALL watchlist tickers right now — independently of screeners.
+    Useful for monitoring INTC, QCOM, etc. at any time.
+    Returns full analysis sorted by score descending.
+    """
+    tickers = load_watchlist()
+    market  = get_market_pulse()
+    items   = []
+    for tk in tickers:
+        result = analyze_ticker(tk, market=market)
+        if "error" not in result:
+            items.append(result)
+    items.sort(key=lambda x: x.get("score", 0), reverse=True)
+    verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
+    alerts = sum(1 for x in items if x.get("catalyst_earn_alert"))
+    sweeps = sum(1 for x in items if x.get("opt_is_sweep"))
+    return jsonify({
+        "source":    "watchlist_scan",
+        "market":    market,
+        "timestamp": datetime.now().isoformat(timespec='seconds'),
+        "watchlist": tickers,
+        "count":     len(items),
+        "verdes":    verdes,
+        "earn_alerts": alerts,
+        "sweeps":    sweeps,
+        "summary":   f"{verdes} verdes · {alerts} earnings alert · {sweeps} sweeps de {len(items)} analizados",
+        "items":     items,
+    })
+
+
+@app.route('/api/catalyst/<ticker>')
+def api_catalyst(ticker: str):
+    """
+    Pre-movement catalyst analysis for a single ticker.
+    Detects: analyst upgrades, earnings proximity, news impact.
+    Example: /api/catalyst/QCOM
+    """
+    ticker = ticker.upper().strip()
+    cat = get_catalyst_data(ticker)
+    return jsonify({
+        "ticker":          ticker,
+        "timestamp":       datetime.now().isoformat(timespec='seconds'),
+        "catalyst_score":  cat.get("catalyst_score", 0),
+        "catalyst_signal": cat.get("catalyst_signal", "NONE"),
+        "analyst_action":  cat.get("analyst_action"),
+        "earnings_days":   cat.get("earnings_days"),
+        "earnings_alert":  cat.get("earnings_alert", False),
+        "iv_spike":        cat.get("iv_spike", False),
+        "top_news_score":  cat.get("top_news_score", 0),
+        "top_news_title":  cat.get("top_news_title"),
+        "top_news_kws":    cat.get("top_news_kws", []),
+        "catalysts_found": cat.get("catalysts_found", []),
+    })
+
+
 @app.route('/api/debug')
 def api_debug():
-    """Test all data sources."""
+    """Test all data sources including new options chain and catalyst detector."""
     out = {}
     # Yahoo
     y = get_yahoo("NVDA")
@@ -1145,9 +1877,29 @@ def api_debug():
     # Finviz
     f = get_finviz("NVDA")
     out["finviz"] = {"ok": bool(f.get("rsi14")), "rsi": f.get("rsi14"), "news_count": len(f.get("news",[]))}
-    # Market Chameleon
-    mc = get_market_chameleon_unusual()
-    out["market_chameleon"] = {"ok": len(mc) > 0, "count": len(mc), "top3": [x["ticker"] for x in mc[:3]]}
+    # Options chain
+    opts = get_options_flow_real("NVDA")
+    out["options_chain"] = {
+        "ok": bool(opts), "vol_oi": opts.get("best_vol_oi"),
+        "pc_ratio": opts.get("pc_ratio"), "dominant": opts.get("dominant_side"),
+        "is_unusual": opts.get("is_unusual"), "top_strikes": opts.get("top_strikes", [])[:3],
+    }
+    # Options screener
+    screener = get_options_unusual_screener()
+    out["options_screener"] = {
+        "ok": len(screener) > 0, "count": len(screener),
+        "unusual_count": sum(1 for x in screener if x.get("is_unusual")),
+        "top3": [{"ticker": x["ticker"], "vol_oi": x.get("opt_vol_oi"), "side": x.get("opt_dominant")} for x in screener[:3]],
+    }
+    # Catalyst detector
+    cat = get_catalyst_data("NVDA")
+    out["catalyst"] = {
+        "ok": True, "score": cat.get("catalyst_score"),
+        "signal": cat.get("catalyst_signal"), "found": cat.get("catalysts_found", []),
+    }
+    # Watchlist
+    wl = load_watchlist()
+    out["watchlist"] = {"ok": True, "count": len(wl), "tickers": wl[:10]}
     # Stocktwits
     st = get_stocktwits_sentiment("NVDA")
     out["stocktwits"] = {"ok": bool(st), "data": st}
