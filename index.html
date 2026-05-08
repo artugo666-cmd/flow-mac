@@ -35,8 +35,8 @@ body{background:var(--bg);color:var(--txt);font-family:'Barlow',sans-serif;min-h
 
 /* TABS */
 .tabs{display:flex;margin-bottom:14px;border:1px solid var(--bdr);border-radius:10px;overflow:hidden}
-.tab{flex:1;padding:12px 8px;text-align:center;cursor:pointer;font-family:'Bebas Neue',sans-serif;font-size:.9rem;letter-spacing:.06em;color:var(--m2);background:var(--s1);border:none;transition:all .2s;line-height:1.3}
-.tab:first-child{border-right:1px solid var(--bdr)}
+.tab{flex:1;padding:12px 8px;text-align:center;cursor:pointer;font-family:'Bebas Neue',sans-serif;font-size:.85rem;letter-spacing:.06em;color:var(--m2);background:var(--s1);border:none;transition:all .2s;line-height:1.3}
+.tab:not(:last-child){border-right:1px solid var(--bdr)}
 .tab.active{background:var(--s2);color:var(--grn)}
 .tab-sub{font-family:'Barlow',sans-serif;font-size:.58rem;font-weight:400;display:block;margin-top:2px;opacity:.7}
 .panel{display:none}.panel.active{display:block}
@@ -214,6 +214,10 @@ textarea::placeholder{color:var(--m1)}
     ⚡ MIS ALERTAS
     <span class="tab-sub">Pega alertas de tu grupo</span>
   </button>
+  <button class="tab" id="tab-watch" onclick="showTab('watch',this)">
+    👁 WATCHLIST
+    <span class="tab-sub">Monitoreo fijo</span>
+  </button>
 </div>
 
 <!-- SCAN PANEL -->
@@ -266,6 +270,22 @@ ADBE 530 mil calls ene 2027 strike 300
     </div>
     <button class="btn-alert" id="btn-alert" onclick="runAlerts()">⚡ ANALIZAR MIS ALERTAS</button>
   </div>
+</div>
+
+<!-- WATCHLIST PANEL -->
+<div class="panel" id="panel-watch">
+  <div class="box">
+    <div class="pt">Watchlist — Monitoreo Fijo</div>
+    <div style="font-size:.6rem;color:var(--m2);margin-bottom:10px">Tickers que siempre se analizan independientemente del scan. INTC, QCOM y otros siempre incluidos.</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <input type="text" id="wl-input" placeholder="Agregar ticker (ej: SOFI)" style="background:var(--s2);border:1px solid var(--bdr);color:var(--txt);padding:8px 10px;border-radius:6px;font-size:.75rem;flex:1;min-width:120px">
+      <button onclick="wlAdd()" style="background:var(--grn);color:#000;border:none;padding:8px 14px;border-radius:6px;font-size:.72rem;font-weight:700;cursor:pointer">+ AGREGAR</button>
+      <button onclick="wlRemoveSelected()" style="background:var(--s2);color:var(--red);border:1px solid var(--red);padding:8px 14px;border-radius:6px;font-size:.72rem;cursor:pointer">- QUITAR</button>
+    </div>
+    <div id="wl-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;min-height:32px"></div>
+    <button onclick="runWatchlist()" style="width:100%;background:var(--grn);color:#000;border:none;padding:12px;border-radius:8px;font-family:'Bebas Neue',sans-serif;font-size:1.1rem;letter-spacing:.06em;cursor:pointer">👁 ESCANEAR WATCHLIST AHORA</button>
+  </div>
+  <div id="res-watch"></div>
 </div>
 
 <div class="er" id="er"></div>
@@ -345,10 +365,90 @@ function showTab(name, btn) {
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active');});
   document.getElementById('panel-'+name).classList.add('active');
   btn.classList.add('active');
-  document.getElementById('res').className='';
-  document.getElementById('res').innerHTML='';
-  document.getElementById('er').className='er';
+  if(name !== 'watch'){
+    document.getElementById('res').className='';
+    document.getElementById('res').innerHTML='';
+    document.getElementById('er').className='er';
+  }
+  if(name === 'watch') loadWatchlistChips();
 }
+
+// ── WATCHLIST ──────────────────────────────────────────────
+var wlSelected = new Set();
+
+function loadWatchlistChips(){
+  fetch(BASE+'/api/watchlist')
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var chips = document.getElementById('wl-chips');
+      chips.innerHTML = '';
+      wlSelected.clear();
+      (d.tickers||[]).forEach(function(tk){
+        var chip = document.createElement('span');
+        chip.textContent = tk;
+        chip.title = 'Click para seleccionar/quitar';
+        chip.style.cssText = 'background:var(--s2);border:1px solid var(--bdr);color:var(--txt);padding:4px 10px;border-radius:20px;font-size:.65rem;font-family:\'IBM Plex Mono\',monospace;cursor:pointer;transition:all .15s';
+        chip.onclick = function(){
+          if(wlSelected.has(tk)){
+            wlSelected.delete(tk);
+            chip.style.background='var(--s2)';
+            chip.style.color='var(--txt)';
+            chip.style.borderColor='var(--bdr)';
+          } else {
+            wlSelected.add(tk);
+            chip.style.background='rgba(255,61,90,.15)';
+            chip.style.color='var(--red)';
+            chip.style.borderColor='var(--red)';
+          }
+        };
+        chips.appendChild(chip);
+      });
+    })
+    .catch(function(){});
+}
+
+function wlAdd(){
+  var input = document.getElementById('wl-input');
+  var tk = (input.value||'').trim().toUpperCase().replace(/[^A-Z]/g,'');
+  if(!tk || tk.length > 6){return;}
+  fetch(BASE+'/api/watchlist',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({add:[tk]})
+  }).then(function(){input.value='';loadWatchlistChips();}).catch(function(){});
+}
+
+function wlRemoveSelected(){
+  if(wlSelected.size===0){return;}
+  fetch(BASE+'/api/watchlist',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({remove:Array.from(wlSelected)})
+  }).then(function(){wlSelected.clear();loadWatchlistChips();}).catch(function(){});
+}
+
+function runWatchlist(){
+  var res = document.getElementById('res-watch');
+  res.innerHTML = '<div style="padding:24px;text-align:center;font-family:\'IBM Plex Mono\',monospace;font-size:.7rem;color:var(--grn)">Escaneando watchlist... 30-60s</div>';
+  fetch(BASE+'/api/watchlist/scan')
+    .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+    .then(function(d){
+      var items = d.items||[];
+      if(!items.length){res.innerHTML='<div style="padding:20px;color:var(--m2);font-size:.7rem">Sin resultados.</div>';return;}
+      res.innerHTML='';
+      res.appendChild(buildSummary(items,'Watchlist — '+items.length+' analizados'));
+      var cards = document.createElement('div');
+      cards.className='cards';
+      items.forEach(function(item,i){cards.appendChild(buildCard(item,i));});
+      res.appendChild(cards);
+      addFooter(res);
+    })
+    .catch(function(e){
+      res.innerHTML='<div style="padding:20px;color:var(--red);font-size:.7rem">Error: '+e.message+'</div>';
+    });
+}
+
+
 
 function setOff(on){
   document.getElementById('btn-scan').disabled=on;
@@ -649,6 +749,55 @@ function buildCard(d,idx){
   var perfWCol=d.perf_week&&(d.perf_week+'').startsWith('+')?'g':'r';
   var perfMCol=d.perf_month&&(d.perf_month+'').startsWith('+')?'g':'r';
 
+  // ── OPCIONES REALES (new) ────────────────────────────────
+  var optFlow = '';
+  if(d.has_real_opts){
+    var volOI = parseFloat(d.opt_vol_oi||0);
+    var voiCol = volOI>=5?'var(--red)':volOI>=3?'#ff8c00':volOI>=1.5?'var(--yel)':'var(--m2)';
+    var voiLabel = d.opt_is_sweep?'SWEEP':volOI>=3?'MUY INUSUAL':volOI>=1.5?'INUSUAL':'Normal';
+    var pcRatio = parseFloat(d.opt_pc_ratio||1);
+    var pcCol = pcRatio<0.7?'var(--grn)':pcRatio>1.3?'var(--red)':'var(--yel)';
+    var pcLabel = pcRatio<0.7?'Bullish':pcRatio>1.3?'Bearish':'Neutral';
+    var topStrikes = (d.opt_top_strikes||[]).slice(0,3).map(function(s){
+      return '<span style="font-size:.55rem;background:rgba(77,159,255,.12);border:1px solid rgba(77,159,255,.25);border-radius:3px;padding:2px 5px;margin:2px;display:inline-block;color:var(--blu)">$'+s.strike+' '+s.type+' '+s.ratio+'x</span>';
+    }).join('');
+    optFlow = '<div class="sec" style="border-color:rgba(77,159,255,.3)">'
+      +'<div class="sec-title" style="color:var(--blu)">Flujo de Opciones Real (Vol/OI)</div>'
+      +'<div class="dg">'
+        +'<div class="dc"><div class="dl">Vol/OI Ratio</div><div class="dv b" style="color:'+voiCol+'">'+volOI.toFixed(2)+'x &nbsp;'+voiLabel+'</div></div>'
+        +'<div class="dc"><div class="dl">Lado Dominante</div><div class="dv b" style="color:'+(d.opt_dominant==='CALL'?'var(--grn)':d.opt_dominant==='PUT'?'var(--red)':'var(--m2)')+'">'+( d.opt_dominant||'N/A')+'</div></div>'
+        +'<div class="dc"><div class="dl">P/C Ratio</div><div class="dv" style="color:'+pcCol+'">'+pcRatio.toFixed(2)+' &nbsp;'+pcLabel+'</div></div>'
+        +'<div class="dc"><div class="dl">Call Vol/OI</div><div class="dv g">'+parseFloat(d.opt_call_vol_oi||0).toFixed(2)+'x</div></div>'
+        +'<div class="dc"><div class="dl">Put Vol/OI</div><div class="dv r">'+parseFloat(d.opt_put_vol_oi||0).toFixed(2)+'x</div></div>'
+        +'<div class="dc"><div class="dl">ATM Call / Put</div><div class="dv sm">C: '+parseFloat(d.opt_atm_call||0).toFixed(2)+'x &middot; P: '+parseFloat(d.opt_atm_put||0).toFixed(2)+'x</div></div>'
+      +'</div>'
+      +(topStrikes?'<div style="padding:4px 10px 8px;font-size:.58rem;color:var(--m2)">Strikes mas activos: '+topStrikes+'</div>':'')
+    +'</div>';
+  }
+
+  // ── CATALIZADORES PRE-MOVIMIENTO (new) ───────────────────
+  var catBox = '';
+  var catScore = parseInt(d.catalyst_score||0);
+  var catSignal = d.catalyst_signal||'NONE';
+  var catFound  = d.catalysts_found||[];
+  if(catScore !== 0 || catFound.length > 0){
+    var csCol = catScore>=4?'var(--grn)':catScore>=2?'var(--yel)':catScore<=-2?'var(--red)':'var(--m2)';
+    var catItems = catFound.map(function(c){
+      var ico = c.includes('Upgrade')||c.includes('upgrade')?'UP':c.includes('Earnings')||c.includes('EARNINGS')?'EARN':c.includes('Downgrade')?'DWN':c.includes('Noticia')?'NEWS':'CAT';
+      return '<div style="display:flex;gap:6px;align-items:flex-start;padding:3px 0;border-bottom:1px solid var(--bdr);font-size:.6rem;color:var(--txt)">'
+        +'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:.5rem;color:var(--m1);min-width:32px">'+ico+'</span><span>'+c+'</span></div>';
+    }).join('');
+    catBox = '<div class="sec" style="border-color:rgba(13,255,140,.25)">'
+      +'<div class="sec-title" style="color:var(--grn)">Catalizadores Pre-Movimiento</div>'
+      +'<div style="padding:4px 10px 2px;display:flex;flex-wrap:wrap;align-items:center;gap:6px">'
+        +'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:.65rem;font-weight:700;color:'+csCol+'">'+catSignal+'</span>'
+        +(d.catalyst_earn_alert?'<span style="background:rgba(255,61,90,.2);color:var(--red);border:1px solid var(--red);border-radius:3px;padding:2px 6px;font-size:.55rem;font-weight:700">EARNINGS: '+d.catalyst_earn_days+'d</span>':'')
+        +(d.catalyst_analyst?'<span style="background:rgba(77,159,255,.12);color:var(--blu);border:1px solid rgba(77,159,255,.3);border-radius:3px;padding:2px 6px;font-size:.55rem">'+d.catalyst_analyst+'</span>':'')
+      +'</div>'
+      +(catItems?'<div style="padding:4px 10px 8px">'+catItems+'</div>':'')
+    +'</div>';
+  }
+
   // Option suggestion
   var strike=d.strike||0;
   var optBox='';
@@ -696,7 +845,13 @@ function buildCard(d,idx){
       +'<div class="tk-right"><div class="tk-sector">'+(d.sector||'')+(d.earnings_date&&d.earnings_date!=='N/A'?' · Earn: '+d.earnings_date:'')+'</div></div>'
     +'</div>'
 
-    // 3. SCORE BARS
+    // 3. CATALIZADORES (new — appears early so user sees signal immediately)
+    +catBox
+
+    // 4. OPCIONES REALES (new)
+    +optFlow
+
+    // 5. SCORE BARS
     +'<div class="sbars">'
       +sb('Catalizador / Noticia',d.pts_catalyst,3.0)
       +sb('Volumen inusual',d.pts_flow,2.5)
