@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -870,6 +869,273 @@ def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
     return get_options_unusual_screener()
 
 
+def get_strong_movers() -> List[Dict[str, Any]]:
+    """
+    Detecta acciones con movimiento de precio fuerte (±4%+) y volumen elevado
+    INDEPENDIENTE del mercado de opciones. Cubre:
+    - Gainers fuertes de Yahoo (day gainers)
+    - Losers fuertes de Yahoo (day losers)
+    - Acciones con volumen relativo > 3x (high volume)
+    Esto complementa el screener de opciones y evita que acciones
+    que no tienen opciones líquidas queden invisibles.
+    """
+    results = []
+    seen = set()
+
+    screener_ids = [
+        ("day_gainers",   True),
+        ("day_losers",    False),
+        ("most_actives",  None),
+    ]
+
+    for scrId, bullish_override in screener_ids:
+        try:
+            r = requests.get(
+                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                params={"scrIds": scrId, "count": 30},
+                headers=HEADERS, timeout=10
+            )
+            r.raise_for_status()
+            quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            for q in quotes:
+                ticker = q.get("symbol", "")
+                if not ticker or len(ticker) > 5 or not ticker.isalpha():
+                    continue
+                if ticker in seen:
+                    continue
+                seen.add(ticker)
+
+                vol     = int(q.get("regularMarketVolume", 0) or 0)
+                avg_vol = int(q.get("averageDailyVolume3Month", 1) or 1)
+                chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
+                price   = float(q.get("regularMarketPrice", 0) or 0)
+                rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+                # Solo incluir si hay movimiento real O volumen relativo alto
+                if abs(chg_pct) < 2.0 and rel_vol < 2.0:
+                    continue
+
+                if bullish_override is not None:
+                    is_bull = bullish_override
+                else:
+                    is_bull = chg_pct >= 0
+
+                results.append({
+                    "ticker":      ticker,
+                    "mc_volume":   vol,
+                    "mc_rel_vol":  rel_vol,
+                    "mc_chg_pct":  chg_pct,
+                    "mc_bullish":  is_bull,
+                    "source":      f"yahoo_{scrId}",
+                    "price":       price,
+                    # Marcamos que viene de price action, no de opciones
+                    "is_price_mover": True,
+                    "move_strength": (
+                        "FUERTE" if abs(chg_pct) >= 7
+                        else "MODERADO" if abs(chg_pct) >= 4
+                        else "ELEVADO"
+                    ),
+                })
+
+        except Exception as e:
+            print(f"Strong movers screener error ({scrId}): {e}")
+
+    # Ordenar por movimiento absoluto × volumen relativo
+    results.sort(key=lambda x: abs(x["mc_chg_pct"]) * x["mc_rel_vol"], reverse=True)
+    print(f"Strong movers: {len(results)} candidatos detectados")
+    return results[:20]
+
+
+# ══════════════════════════════════════════════════════════════
+# GAMMA SQUEEZE DETECTOR
+# Detecta setups donde el dealer hedging puede amplificar el precio:
+#   - OI concentrado ATM (dealers muy expuestos)
+#   - Vol/OI elevado en calls ATM (nuevas posiciones abriendo)
+#   - Short float alto (combustible para squeeze)
+#   - Precio cerca de strike con mayor OI (max pain inversion)
+# ══════════════════════════════════════════════════════════════
+
+def detect_gamma_squeeze(ticker: str, current_price: float, opts_data: Dict) -> Dict[str, Any]:
+    """
+    Calcula indicadores de Gamma Squeeze a partir de los datos de opciones.
+
+    Un Gamma Squeeze ocurre cuando:
+    1. Hay mucho OI en calls ATM/OTM cercanas
+    2. Los dealers (market makers) tienen que comprar acciones para cubrirse (delta hedge)
+       cuando el precio sube, lo cual EMPUJA el precio más arriba → feedback loop
+    3. El movimiento se amplifica si hay short interest alto
+
+    Retorna señal GAMMA_SQUEEZE con score 0-10 y explicación.
+    """
+    result = {
+        "gamma_score":      0,
+        "gamma_signal":     "NONE",
+        "gamma_triggers":   [],
+        "gamma_call_wall":  None,   # Strike con mayor OI de calls (resistencia/imán)
+        "gamma_put_wall":   None,   # Strike con mayor OI de puts (soporte/imán)
+        "gamma_max_pain":   None,   # Precio donde más opciones expiran sin valor
+        "atm_oi_ratio":     None,   # OI ATM calls vs total OI calls (concentración)
+        "dealer_pressure":  "NEUTRAL",
+    }
+
+    if not opts_data or not current_price:
+        return result
+
+    try:
+        # Necesitamos la cadena completa con OI por strike
+        r = requests.get(
+            f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
+            headers=HEADERS, timeout=12
+        )
+        r.raise_for_status()
+        data = r.json()
+        chain_result = data.get("optionChain", {}).get("result", [])
+        if not chain_result:
+            return result
+
+        dates = chain_result[0].get("expirationDates", [])
+        if not dates:
+            return result
+
+        # Analizar la expiración más cercana (mayor gamma)
+        r2 = requests.get(
+            f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
+            params={"date": dates[0]},
+            headers=HEADERS, timeout=12
+        )
+        r2.raise_for_status()
+        res2 = r2.json().get("optionChain", {}).get("result", [])
+        if not res2:
+            return result
+
+        calls = res2[0].get("options", [{}])[0].get("calls", [])
+        puts  = res2[0].get("options", [{}])[0].get("puts",  [])
+
+        if not calls and not puts:
+            return result
+
+        # ── 1. CALL WALL y PUT WALL (strikes con mayor OI) ────
+        call_oi_by_strike = {}
+        for c in calls:
+            strike = float(c.get("strike", 0) or 0)
+            oi     = int(c.get("openInterest", 0) or 0)
+            vol    = int(c.get("volume", 0) or 0)
+            if strike > 0:
+                call_oi_by_strike[strike] = {"oi": oi, "vol": vol}
+
+        put_oi_by_strike = {}
+        for p in puts:
+            strike = float(p.get("strike", 0) or 0)
+            oi     = int(p.get("openInterest", 0) or 0)
+            vol    = int(p.get("volume", 0) or 0)
+            if strike > 0:
+                put_oi_by_strike[strike] = {"oi": oi, "vol": vol}
+
+        if call_oi_by_strike:
+            call_wall = max(call_oi_by_strike, key=lambda s: call_oi_by_strike[s]["oi"])
+            result["gamma_call_wall"] = call_wall
+        if put_oi_by_strike:
+            put_wall  = max(put_oi_by_strike, key=lambda s: put_oi_by_strike[s]["oi"])
+            result["gamma_put_wall"] = put_wall
+
+        # ── 2. MAX PAIN — precio donde mayor valor de opciones expira sin valor ──
+        all_strikes = sorted(set(list(call_oi_by_strike.keys()) + list(put_oi_by_strike.keys())))
+        if all_strikes:
+            min_pain = None
+            max_pain_strike = None
+            for test_price in all_strikes:
+                call_pain = sum(
+                    max(0, test_price - s) * d["oi"]
+                    for s, d in call_oi_by_strike.items()
+                )
+                put_pain = sum(
+                    max(0, s - test_price) * d["oi"]
+                    for s, d in put_oi_by_strike.items()
+                )
+                total_pain = call_pain + put_pain
+                if min_pain is None or total_pain < min_pain:
+                    min_pain = total_pain
+                    max_pain_strike = test_price
+            result["gamma_max_pain"] = max_pain_strike
+
+        # ── 3. OI CONCENTRACIÓN ATM (±5% del precio actual) ──
+        atm_lo = current_price * 0.95
+        atm_hi = current_price * 1.05
+
+        atm_call_oi  = sum(d["oi"] for s, d in call_oi_by_strike.items() if atm_lo <= s <= atm_hi)
+        atm_call_vol = sum(d["vol"] for s, d in call_oi_by_strike.items() if atm_lo <= s <= atm_hi)
+        total_call_oi = sum(d["oi"] for d in call_oi_by_strike.values())
+
+        if total_call_oi > 0:
+            atm_concentration = round(atm_call_oi / total_call_oi, 3)
+            result["atm_oi_ratio"] = atm_concentration
+        else:
+            atm_concentration = 0
+
+        # ── 4. SCORING DE GAMMA SQUEEZE ───────────────────────
+        gamma_score = 0
+        triggers = []
+
+        # A. Precio acercándose a call wall desde abajo (dealer hedging pressure)
+        cw = result["gamma_call_wall"]
+        if cw and current_price < cw <= current_price * 1.08:
+            gamma_score += 3
+            dist_pct = round((cw - current_price) / current_price * 100, 1)
+            triggers.append(f"🎯 Call Wall ${cw:.0f} a solo {dist_pct}% arriba — dealers deben comprar si precio sube")
+
+        # B. Alta concentración de OI ATM (más gamma exposure)
+        if atm_concentration >= 0.4:
+            gamma_score += 2
+            triggers.append(f"🔥 {atm_concentration*100:.0f}% del OI de calls concentrado ATM — gamma máximo")
+        elif atm_concentration >= 0.25:
+            gamma_score += 1
+            triggers.append(f"⚡ {atm_concentration*100:.0f}% OI calls ATM — gamma moderado")
+
+        # C. Vol/OI calls ATM muy elevado (flujo nuevo abriendo posiciones)
+        atm_call_vol_oi = round(atm_call_vol / atm_call_oi, 2) if atm_call_oi > 100 else 0
+        if atm_call_vol_oi >= 3.0:
+            gamma_score += 3
+            triggers.append(f"🚨 Vol/OI calls ATM {atm_call_vol_oi:.1f}x — acumulación masiva cerca del precio")
+        elif atm_call_vol_oi >= 1.5:
+            gamma_score += 2
+            triggers.append(f"⚡ Vol/OI calls ATM {atm_call_vol_oi:.1f}x — flujo inusual ATM")
+
+        # D. Precio por encima de Max Pain (dealers ya en modo hedging alcista)
+        mp = result["gamma_max_pain"]
+        if mp and current_price > mp * 1.03:
+            gamma_score += 2
+            triggers.append(f"📈 Precio ${current_price:.2f} sobre Max Pain ${mp:.0f} — dealers forzados a cubrir calls")
+
+        # E. Precio entre put wall y call wall (zona de squeeze comprimida)
+        pw = result["gamma_put_wall"]
+        if cw and pw and pw < current_price < cw:
+            if (cw - pw) / current_price <= 0.10:
+                gamma_score += 1
+                triggers.append(f"📊 Comprimido entre Put Wall ${pw:.0f} y Call Wall ${cw:.0f} — rompimiento explosivo posible")
+
+        # Señal final
+        result["gamma_score"]   = min(gamma_score, 10)
+        result["gamma_triggers"] = triggers
+
+        if gamma_score >= 7:
+            result["gamma_signal"]    = "🚨 GAMMA SQUEEZE INMINENTE"
+            result["dealer_pressure"] = "COMPRA_FORZADA"
+        elif gamma_score >= 5:
+            result["gamma_signal"]    = "⚡ GAMMA SQUEEZE POSIBLE"
+            result["dealer_pressure"] = "COMPRA_ELEVADA"
+        elif gamma_score >= 3:
+            result["gamma_signal"]    = "📌 PRESIÓN GAMMA MODERADA"
+            result["dealer_pressure"] = "NEUTRAL_ALCISTA"
+        else:
+            result["gamma_signal"]    = "NONE"
+            result["dealer_pressure"] = "NEUTRAL"
+
+    except Exception as e:
+        print(f"Gamma squeeze detector error {ticker}: {e}")
+
+    return result
+
+
 def get_yahoo_most_active() -> List[Dict[str, Any]]:
     """Get most active stocks from Yahoo Finance screener."""
     try:
@@ -1004,6 +1270,7 @@ def compute_score(
     alert_context: str = "",
     mc_data: Dict = None,
     catalyst: Dict = None,
+    gamma: Dict = None,
 ) -> Dict[str, Any]:
 
     price     = yahoo.get("price", 0)
@@ -1213,7 +1480,38 @@ def compute_score(
     elif abs_chg >= 10:
         move_penalty = -0.5  # movimiento grande - precaucion
 
-    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier + rsi_penalty + move_penalty
+    # ── GAMMA SQUEEZE BONUS ───────────────────────────────────
+    gamma_score_val  = gamma.get("gamma_score", 0) if gamma else 0
+    gamma_signal_val = gamma.get("gamma_signal", "NONE") if gamma else "NONE"
+    gamma_triggers   = gamma.get("gamma_triggers", []) if gamma else []
+
+    # Bonus por gamma squeeze (max 1.5 pts adicionales)
+    if gamma_score_val >= 7:
+        pts_gamma_bonus = 1.5
+    elif gamma_score_val >= 5:
+        pts_gamma_bonus = 1.0
+    elif gamma_score_val >= 3:
+        pts_gamma_bonus = 0.5
+    else:
+        pts_gamma_bonus = 0.0
+
+    # ── PRICE MOVER BONUS (acciones sin opciones activas) ────
+    # Si la acción viene del strong_movers screener y tiene movimiento real,
+    # damos un bonus para compensar la falta de señal de opciones
+    is_price_mover = mc_data.get("is_price_mover", False) if mc_data else False
+    abs_chg = abs(chg_pct)
+    pts_price_mover = 0.0
+    if is_price_mover and not has_real_opts:
+        if abs_chg >= 8 and rel_vol >= 3:
+            pts_price_mover = 2.0   # movimiento extremo con volumen — señal fuerte
+        elif abs_chg >= 5 and rel_vol >= 2:
+            pts_price_mover = 1.5
+        elif abs_chg >= 3 and rel_vol >= 1.8:
+            pts_price_mover = 1.0
+        elif abs_chg >= 2 and rel_vol >= 1.5:
+            pts_price_mover = 0.5
+
+    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier + rsi_penalty + move_penalty + pts_gamma_bonus + pts_price_mover
     score = round(min(max(raw, 0), 10.0), 1)
     
     # Add move penalty info to score breakdown
@@ -1221,6 +1519,9 @@ def compute_score(
         move_note = f" MovExtrem{move_penalty}"
     else:
         move_note = ""
+
+    gamma_note = f"+Gamma{pts_gamma_bonus}" if pts_gamma_bonus > 0 else ""
+    mover_note = f"+Mover{pts_price_mover}" if pts_price_mover > 0 else ""
 
     # Semaforo
     if score >= 7.0:
@@ -1286,6 +1587,12 @@ def compute_score(
     # Catalyst detector findings (pre-movement signals)
     for cf in cat_found[:3]:
         why_parts.append(cf)
+    # Gamma squeeze triggers
+    for gt in gamma_triggers[:2]:
+        why_parts.append(gt)
+    # Price mover context
+    if is_price_mover and pts_price_mover > 0:
+        why_parts.append(f"Movimiento de precio fuerte {chg_pct:+.1f}% con volumen {rel_vol:.1f}x — detectado por screener de movers")
     if has_real_opts and opt_vol_oi >= 1.5:
         sweep_txt = "SWEEP INSTITUCIONAL — " if opt_is_sweep else ""
         why_parts.append(f"{sweep_txt}Flujo de opciones inusual: Vol/OI {opt_vol_oi:.1f}x — lado {opt_dominant} dominante (P/C {opt_pc_ratio:.2f})")
@@ -1330,7 +1637,7 @@ def compute_score(
         "pts_momentum":    round(pts_mom, 1),
         "pts_sector":      round(pts_sector, 1),
         "pts_short":       round(pts_short, 1),
-        "score_breakdown": f"Cat {pts_catalyst:.1f}+Vol {pts_vol:.1f}+Mom {pts_mom:.1f}+Sector {pts_sector:.1f}+Short {pts_short:.1f}{move_note}={score}",
+        "score_breakdown": f"Cat {pts_catalyst:.1f}+Vol {pts_vol:.1f}+Mom {pts_mom:.1f}+Sector {pts_sector:.1f}+Short {pts_short:.1f}{gamma_note}{mover_note}{move_note}={score}",
         # Real options data
         "opt_vol_oi":      round(opt_vol_oi, 2),
         "opt_call_vol_oi": round(opt_call_vol_oi, 2),
@@ -1424,10 +1731,15 @@ def analyze_ticker(ticker: str, alert_context: str = "", market: Dict = None, mc
     # Catalyst detection — pre-movement signal
     catalyst = get_catalyst_data(ticker)
 
+    # Gamma Squeeze detection — requiere precio actual y datos de opciones
+    gamma = {}
+    if yahoo.get("price", 0) > 0:
+        gamma = detect_gamma_squeeze(ticker, yahoo["price"], mc_data or {})
+
     if not yahoo and not finviz:
         return {"ticker": ticker, "error": f"Sin datos para {ticker}. Verifica el simbolo.", "score": 0, "semaforo": "ROJO"}
 
-    scoring = compute_score(ticker, yahoo, finviz, st, market, alert_context, mc_data, catalyst)
+    scoring = compute_score(ticker, yahoo, finviz, st, market, alert_context, mc_data, catalyst, gamma)
     price   = yahoo.get("price", 0)
 
     return {
@@ -1528,6 +1840,18 @@ def analyze_ticker(ticker: str, alert_context: str = "", market: Dict = None, mc
         "control_detail":  f"Volumen {scoring['rel_volume']:.1f}x promedio. RSI {scoring['rsi_value']:.0f}. {'Sobre' if scoring['above_sma50'] else 'Bajo'} MA50.",
         "source":          "yahoo+finviz+stocktwits",
         "timestamp":       datetime.now().isoformat(timespec='seconds'),
+        # Gamma Squeeze detection
+        "gamma_score":     gamma.get("gamma_score", 0),
+        "gamma_signal":    gamma.get("gamma_signal", "NONE"),
+        "gamma_triggers":  gamma.get("gamma_triggers", []),
+        "gamma_call_wall": gamma.get("gamma_call_wall"),
+        "gamma_put_wall":  gamma.get("gamma_put_wall"),
+        "gamma_max_pain":  gamma.get("gamma_max_pain"),
+        "gamma_atm_ratio": gamma.get("atm_oi_ratio"),
+        "dealer_pressure": gamma.get("dealer_pressure", "NEUTRAL"),
+        # Price mover context (si viene del strong_movers screener)
+        "is_price_mover":  mc_data.get("is_price_mover", False) if mc_data else False,
+        "move_strength":   mc_data.get("move_strength", "") if mc_data else "",
     }
 
 
@@ -1558,28 +1882,41 @@ def api_scan():
     source_name = "unknown"
     ticker_list = []
 
-    # Source 1: Unusual Whales / Market Chameleon
+    # Source 1: Unusual Whales / Market Chameleon (opciones inusuales)
     ticker_list = get_market_chameleon_unusual()
     if ticker_list:
         source_name = ticker_list[0].get("source", "unusual_whales")
-    
-    # Source 2: Yahoo most active (always reliable)
+
+    # Source 2: Strong movers — acciones con movimiento fuerte de precio+volumen
+    # INDEPENDIENTE de opciones (esto soluciona que solo aparezca CTRA)
+    strong_movers = get_strong_movers()
+
+    # Source 3: Yahoo most active (always reliable)
     yahoo_active = get_yahoo_most_active()
-    
-    # Source 3: Yahoo trending
+
+    # Source 4: Yahoo trending
     yahoo_trend = get_yahoo_trending()
 
-    # Merge all sources, prioritize by rel_vol
+    # Merge all sources; strong_movers va primero junto con opciones inusuales
+    EXCLUDE_TICKERS = {"SPY","QQQ","IWM","VIX","TLT","GLD","SLV","XLF","XLE","XLK","DIA"}
     seen = set()
     merged = []
-    for t in ticker_list + yahoo_active + yahoo_trend:
+    for t in ticker_list + strong_movers + yahoo_active + yahoo_trend:
         tk = t.get("ticker", "")
-        if tk and tk not in seen and tk not in ("SPY","QQQ","IWM","VIX","TLT","GLD"):
+        if tk and tk not in seen and tk not in EXCLUDE_TICKERS:
             seen.add(tk)
             merged.append(t)
 
-    # Sort by relative volume descending
-    merged.sort(key=lambda x: x.get("mc_rel_vol", 0), reverse=True)
+    # Sort: price movers fuertes primero, luego por vol/OI de opciones
+    def sort_key(x):
+        base = x.get("mc_rel_vol", 0)
+        # Boost movers con movimiento real fuerte
+        if x.get("is_price_mover"):
+            chg = abs(x.get("mc_chg_pct", 0))
+            base += chg * 0.3  # boost proporcional al movimiento
+        return base
+
+    merged.sort(key=sort_key, reverse=True)
 
     if not merged:
         # Ultimate fallback
@@ -1587,22 +1924,30 @@ def api_scan():
                   for t in ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN","INTC","PLTR"]]
         source_name = "fallback_default"
 
-    # Analyze top 10 tickers
+    # Analyze top 15 tickers (ampliado de 10 para capturar más señales)
     items = []
-    for mc in merged[:10]:
+    for mc in merged[:15]:
         result = analyze_ticker(mc["ticker"], market=market, mc_data=mc)
         if "error" not in result:
             items.append(result)
 
     items.sort(key=lambda x: x.get("score", 0), reverse=True)
     verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
+    gammas = sum(1 for x in items if x.get("gamma_score", 0) >= 5)
+    movers = sum(1 for x in items if x.get("is_price_mover"))
     
     # Build summary message
     top = items[0] if items else None
     if verdes > 0:
-        summary = f"{verdes} setup(s) con señal verde. Mejor: {top['ticker']} {top['score']}/10 — {top['direction']}."
+        summary = f"{verdes} setup(s) VERDE. Mejor: {top['ticker']} {top['score']}/10 — {top['direction']}."
+        if gammas > 0:
+            summary += f" ⚡ {gammas} posible(s) Gamma Squeeze."
+        if movers > 0:
+            summary += f" 📈 {movers} mover(s) fuertes detectados sin opciones."
     elif items:
-        summary = f"{len(items)} tickers analizados. Ninguno reune criterios verdes hoy. Esperar mejores setups."
+        summary = f"{len(items)} tickers analizados. Ninguno con criterios verdes hoy."
+        if movers > 0:
+            summary += f" {movers} movers fuertes detectados."
     else:
         summary = "Sin datos disponibles. Verifica conexion."
 
@@ -1611,6 +1956,9 @@ def api_scan():
         "market":    market,
         "timestamp": datetime.now().isoformat(timespec='seconds'),
         "summary":   summary,
+        "verdes":    verdes,
+        "gamma_squeezes": gammas,
+        "price_movers":   movers,
         "items":     items,
     })
 
@@ -1716,6 +2064,74 @@ def api_analyze():
         "market":    market,
         "timestamp": datetime.now().isoformat(timespec='seconds'),
         "summary":   f"{verdes} setup(s) con señal verde." if verdes else "Sin señales verdes claras.",
+        "items":     items,
+    })
+
+
+@app.route('/api/gamma/<ticker>')
+def api_gamma(ticker: str):
+    """
+    Gamma Squeeze analysis for a specific ticker.
+    Detects: call wall, put wall, max pain, ATM OI concentration, dealer pressure.
+    Example: /api/gamma/NVDA
+    """
+    ticker = ticker.upper().strip()
+    yahoo  = get_yahoo(ticker)
+    price  = yahoo.get("price", 0)
+    if not price:
+        return jsonify({"ticker": ticker, "error": "No se pudo obtener el precio", "ok": False}), 404
+
+    opts = get_options_flow_real(ticker)
+    gamma = detect_gamma_squeeze(ticker, price, opts)
+
+    return jsonify({
+        "ticker":          ticker,
+        "ok":              True,
+        "timestamp":       datetime.now().isoformat(timespec='seconds'),
+        "price":           price,
+        "gamma_score":     gamma.get("gamma_score", 0),
+        "gamma_signal":    gamma.get("gamma_signal", "NONE"),
+        "gamma_triggers":  gamma.get("gamma_triggers", []),
+        "gamma_call_wall": gamma.get("gamma_call_wall"),
+        "gamma_put_wall":  gamma.get("gamma_put_wall"),
+        "gamma_max_pain":  gamma.get("gamma_max_pain"),
+        "atm_oi_ratio":    gamma.get("atm_oi_ratio"),
+        "dealer_pressure": gamma.get("dealer_pressure", "NEUTRAL"),
+        "interpretation": (
+            f"Precio ${price:.2f} está {round((gamma.get('gamma_call_wall',price or 1)-price)/price*100,1) if gamma.get('gamma_call_wall') else 'N/A'}% "
+            f"debajo de Call Wall ${gamma.get('gamma_call_wall','N/A')}. "
+            f"Max Pain: ${gamma.get('gamma_max_pain','N/A')}. "
+            f"Presión dealer: {gamma.get('dealer_pressure','NEUTRAL')}."
+        ) if gamma.get("gamma_call_wall") else "Sin datos de opciones suficientes para análisis gamma.",
+    })
+
+
+@app.route('/api/movers')
+def api_movers():
+    """
+    Detecta acciones con movimiento fuerte de precio HOY,
+    independientemente de si tienen mercado de opciones activo.
+    Incluye gainers, losers y alto volumen relativo.
+    """
+    market = get_market_pulse()
+    movers = get_strong_movers()
+    items  = []
+    for mc in movers[:12]:
+        result = analyze_ticker(mc["ticker"], market=market, mc_data=mc)
+        if "error" not in result:
+            items.append(result)
+
+    items.sort(key=lambda x: abs(float(str(x.get("change_pct","0")).replace("%","").replace("+",""))), reverse=True)
+    verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
+    gammas = sum(1 for x in items if x.get("gamma_score", 0) >= 5)
+
+    return jsonify({
+        "source":    "yahoo_movers",
+        "market":    market,
+        "timestamp": datetime.now().isoformat(timespec='seconds'),
+        "summary":   f"{len(items)} movers detectados. {verdes} VERDE(s). {gammas} posible(s) gamma squeeze.",
+        "verdes":    verdes,
+        "gamma_squeezes": gammas,
         "items":     items,
     })
 
