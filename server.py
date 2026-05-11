@@ -31,9 +31,23 @@ HEADERS = {
 WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
 
 DEFAULT_WATCHLIST = [
+    # Mega-cap tech
     "NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN",
-    "INTC","QCOM","PLTR","SMCI","MSTR","COIN","ARM","CRWD",
-    "NFLX","UBER","SHOP","SQ","SOFI","RIVN","NIO","MU","AVGO",
+    # Semiconductores
+    "INTC","QCOM","MU","AVGO","ARM","SMCI",
+    # Fintech / Crypto
+    "MSTR","COIN","SQ","SOFI","HOOD",
+    # Software / Cloud
+    "PLTR","CRWD","SHOP","SNOW","DDOG",
+    # Streaming / Media
+    "NFLX","SPOT",
+    # EV / Movilidad
+    "RIVN","NIO","LCID","UBER",
+    # Alta especulacion / momentum / IPOs recientes
+    "ASTS","CIFR","RKLB","LUNR","IONQ","BBAI","SOUN","RGTI",
+    "ACHR","JOBY","MARA","RIOT","HUT","CLSK",
+    # IPOs recientes — agregar aqui cuando haya nuevos listings relevantes
+    "CRCL","KLTO","MNTN",
 ]
 
 def load_watchlist() -> List[str]:
@@ -786,23 +800,57 @@ def get_options_unusual_screener() -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"Trending error: {e}")
 
-    # Source C: Always include high-beta watchlist (never miss these)
-    WATCHLIST = ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN",
-                 "INTC","QCOM","PLTR","SMCI","MSTR","COIN","ARM","CRWD",
-                 "NFLX","UBER","SHOP","SQ","SOFI","LCID","RIVN","NIO"]
-    for tk in WATCHLIST:
+    # Source C: Siempre incluir watchlist persistente (incluye ASTS, CIFR, etc.)
+    wl_tickers = load_watchlist()
+    for tk in wl_tickers:
         candidates.add(tk)
 
-    # Exclude ETFs and indices
+    # Exclude ETFs, indices y tickers problemáticos
     EXCLUDE = {"SPY","QQQ","IWM","VIX","TLT","GLD","SLV","XLF","XLE","XLK","DIA","EEM"}
     candidates -= EXCLUDE
 
-    print(f"Options screener: scanning {len(candidates)} candidates for real vol/OI...")
+    # Filtro de liquidez mínima: descartar antes de llamar a opciones
+    # (evita gastar requests en penny stocks o acciones sin opciones)
+    LIQUID_FILTER = {}
+    for tk in list(candidates):
+        try:
+            yf = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{tk}",
+                params={"interval": "1d", "range": "1d"},
+                headers=HEADERS, timeout=5
+            )
+            yf.raise_for_status()
+            meta = yf.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price   = float(meta.get("regularMarketPrice", 0) or 0)
+            avg_vol = int(meta.get("averageDailyVolume3Month", 0) or 0)
+            chg_pct = float(meta.get("regularMarketChangePercent", 0) or 0)
+            # Excluir: precio < $0.50, volumen promedio < 300k, o sin precio
+            if price < 0.50 or avg_vol < 300000:
+                candidates.discard(tk)
+                continue
+            LIQUID_FILTER[tk] = {"price": price, "avg_vol": avg_vol, "chg_pct": chg_pct}
+        except:
+            pass  # Si falla el check, dejarlo pasar
 
-    # Fetch options chain for each candidate and filter
+    print(f"Options screener: {len(candidates)} candidatos después de filtro de liquidez...")
+
+    # Ordenar candidatos: primero los que tienen mayor movimiento hoy
+    sorted_candidates = sorted(
+        [tk for tk in candidates if tk in LIQUID_FILTER],
+        key=lambda t: abs(LIQUID_FILTER.get(t, {}).get("chg_pct", 0)),
+        reverse=True
+    )
+    # Agregar los que no pasaron el filtro de liquidez al final (watchlist fija)
+    for tk in candidates:
+        if tk not in LIQUID_FILTER and tk not in sorted_candidates:
+            sorted_candidates.append(tk)
+
+    print(f"Options screener: scanning top {min(len(sorted_candidates),40)} candidates for real vol/OI...")
+
+    # Fetch options chain para cada candidato
     results = []
     checked = 0
-    for ticker in list(candidates)[:35]:  # Cap at 35 to avoid timeout
+    for ticker in sorted_candidates[:40]:  # Ampliado a 40 para mayor cobertura
         opts = get_options_flow_real(ticker)
         if not opts:
             continue
@@ -903,13 +951,19 @@ def get_strong_movers() -> List[Dict[str, Any]]:
                     continue
                 if ticker in seen:
                     continue
-                seen.add(ticker)
 
                 vol     = int(q.get("regularMarketVolume", 0) or 0)
                 avg_vol = int(q.get("averageDailyVolume3Month", 1) or 1)
                 chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
                 price   = float(q.get("regularMarketPrice", 0) or 0)
                 rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+                # Filtro de liquidez mínima — elimina basura y acciones sin movimiento
+                # Precio < $0.50, volumen promedio < 300k → skip
+                if price < 0.50 or avg_vol < 300_000:
+                    continue
+
+                seen.add(ticker)
 
                 # Solo incluir si hay movimiento real O volumen relativo alto
                 if abs(chg_pct) < 2.0 and rel_vol < 2.0:
@@ -1202,6 +1256,79 @@ def get_yahoo_trending() -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"Yahoo trending error: {e}")
         return []
+
+
+def get_yahoo_screener_extra() -> List[Dict[str, Any]]:
+    """
+    Fuentes adicionales de Yahoo que capturan acciones que los screeners
+    normales no detectan:
+    - small_cap_gainers: IPOs recientes y small caps en movimiento (CRCL, CIFR, etc.)
+    - aggressive_small_caps: alta volatilidad
+    - undervalued_growth: acciones con momentum de crecimiento
+    Esto soluciona que IPOs recientes como CRCL no aparezcan.
+    """
+    results = []
+    seen = set()
+
+    screener_ids = [
+        "small_cap_gainers",
+        "growth_technology_stocks",
+        "day_gainers",          # refuerzo — a veces no llega desde get_strong_movers
+        "most_actives",         # refuerzo
+    ]
+
+    for scrId in screener_ids:
+        try:
+            r = requests.get(
+                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                params={"scrIds": scrId, "count": 25},
+                headers=HEADERS, timeout=10
+            )
+            r.raise_for_status()
+            quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            for q in quotes:
+                ticker = q.get("symbol", "")
+                if not ticker or len(ticker) > 6 or ticker in seen:
+                    continue
+                # Permitir tickers con punto solo si son bien conocidos
+                if "." in ticker and ticker not in ("BRK.B","BRK.A"):
+                    continue
+
+                vol     = int(q.get("regularMarketVolume", 0) or 0)
+                avg_vol = int(q.get("averageDailyVolume3Month", 1) or 1)
+                chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
+                price   = float(q.get("regularMarketPrice", 0) or 0)
+                rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+                # Mínimo: precio >= $0.50 y algo de movimiento o volumen
+                if price < 0.50:
+                    continue
+                # Para small_cap_gainers aceptar cualquier movimiento positivo
+                if abs(chg_pct) < 1.0 and rel_vol < 1.5:
+                    continue
+
+                seen.add(ticker)
+                results.append({
+                    "ticker":         ticker,
+                    "mc_volume":      vol,
+                    "mc_rel_vol":     rel_vol,
+                    "mc_chg_pct":     chg_pct,
+                    "mc_bullish":     chg_pct >= 0,
+                    "source":         f"yahoo_{scrId}",
+                    "is_price_mover": True,
+                    "move_strength": (
+                        "FUERTE"  if abs(chg_pct) >= 7
+                        else "MODERADO" if abs(chg_pct) >= 4
+                        else "ELEVADO"
+                    ),
+                })
+        except Exception as e:
+            print(f"Yahoo screener extra ({scrId}) error: {e}")
+
+    # Ordenar por movimiento * volumen relativo
+    results.sort(key=lambda x: abs(x["mc_chg_pct"]) * x["mc_rel_vol"], reverse=True)
+    print(f"Yahoo screener extra: {len(results)} candidatos")
+    return results[:20]
 
 
 def get_market_pulse() -> Dict[str, Any]:
@@ -1887,21 +2014,23 @@ def api_scan():
     if ticker_list:
         source_name = ticker_list[0].get("source", "unusual_whales")
 
-    # Source 2: Strong movers — acciones con movimiento fuerte de precio+volumen
-    # INDEPENDIENTE de opciones (esto soluciona que solo aparezca CTRA)
+    # Source 2: Screener extra — small caps, IPOs recientes, growth (captura CRCL, CIFR, etc.)
+    extra_movers = get_yahoo_screener_extra()
+
+    # Source 3: Strong movers — acciones con movimiento fuerte de precio+volumen
     strong_movers = get_strong_movers()
 
-    # Source 3: Yahoo most active (always reliable)
+    # Source 4: Yahoo most active (always reliable)
     yahoo_active = get_yahoo_most_active()
 
-    # Source 4: Yahoo trending
+    # Source 5: Yahoo trending
     yahoo_trend = get_yahoo_trending()
 
-    # Merge all sources; strong_movers va primero junto con opciones inusuales
+    # Merge all sources; extra_movers y opciones inusuales van primero
     EXCLUDE_TICKERS = {"SPY","QQQ","IWM","VIX","TLT","GLD","SLV","XLF","XLE","XLK","DIA"}
     seen = set()
     merged = []
-    for t in ticker_list + strong_movers + yahoo_active + yahoo_trend:
+    for t in ticker_list + extra_movers + strong_movers + yahoo_active + yahoo_trend:
         tk = t.get("ticker", "")
         if tk and tk not in seen and tk not in EXCLUDE_TICKERS:
             seen.add(tk)
@@ -1935,6 +2064,10 @@ def api_scan():
     verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
     gammas = sum(1 for x in items if x.get("gamma_score", 0) >= 5)
     movers = sum(1 for x in items if x.get("is_price_mover"))
+    # Fuentes usadas para el frontend
+    sources_used = list(dict.fromkeys(
+        x.get("source","") for x in merged[:15] if x.get("source")
+    ))
     
     # Build summary message
     top = items[0] if items else None
@@ -1952,14 +2085,16 @@ def api_scan():
         summary = "Sin datos disponibles. Verifica conexion."
 
     return jsonify({
-        "source":    source_name,
-        "market":    market,
-        "timestamp": datetime.now().isoformat(timespec='seconds'),
-        "summary":   summary,
-        "verdes":    verdes,
+        "source":         source_name,
+        "sources_used":   sources_used,
+        "market":         market,
+        "timestamp":      datetime.now().isoformat(timespec='seconds'),
+        "summary":        summary,
+        "verdes":         verdes,
         "gamma_squeezes": gammas,
         "price_movers":   movers,
-        "items":     items,
+        "total_analyzed": len(items),
+        "items":          items,
     })
 
 
