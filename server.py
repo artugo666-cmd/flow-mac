@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import json
 import requests
 from datetime import datetime
@@ -22,2093 +21,1318 @@ HEADERS = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# WATCHLIST PERSISTENTE
-# Guardada en watchlist.json en el mismo directorio del server.
-# Se puede editar via /api/watchlist (GET/POST/DELETE).
-# Siempre se escanea independientemente de los screeners.
+# ETFs y tickers que nunca deben aparecer como señales
 # ══════════════════════════════════════════════════════════════
+EXCLUDE_ALWAYS = {
+    "SPY","QQQ","IWM","DIA","VIX","TLT","GLD","SLV","USO","UNG",
+    "XLF","XLE","XLK","XLY","XLU","XLB","XLP","XLI","XLV","XLC",
+    "EEM","EFA","HYG","LQD","UVXY","SVXY","SQQQ","TQQQ","VXX",
+    "JEPI","JEPQ","SCHD","VOO","VTI","BND",
+}
 
+# ══════════════════════════════════════════════════════════════
+# WATCHLIST PERSISTENTE
+# Solo se usa en /api/watchlist/scan — nunca en el scan autónomo
+# ══════════════════════════════════════════════════════════════
 WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
 
-DEFAULT_WATCHLIST = [
-    # Mega-cap tech
-    "NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN",
-    # Semiconductores
-    "INTC","QCOM","MU","AVGO","ARM","SMCI",
-    # Fintech / Crypto
-    "MSTR","COIN","SQ","SOFI","HOOD",
-    # Software / Cloud
-    "PLTR","CRWD","SHOP","SNOW","DDOG",
-    # Streaming / Media
-    "NFLX","SPOT",
-    # EV / Movilidad
-    "RIVN","NIO","LCID","UBER",
-    # Alta especulacion / momentum / IPOs recientes
-    "ASTS","CIFR","RKLB","LUNR","IONQ","BBAI","SOUN","RGTI",
-    "ACHR","JOBY","MARA","RIOT","HUT","CLSK",
-    # IPOs recientes — agregar aqui cuando haya nuevos listings relevantes
-    "CRCL","KLTO","MNTN",
-]
-
 def load_watchlist() -> List[str]:
-    """Load watchlist from JSON file. Falls back to default if missing."""
     try:
         if os.path.exists(WATCHLIST_FILE):
             with open(WATCHLIST_FILE, "r") as f:
                 data = json.load(f)
                 tickers = [t.upper().strip() for t in data.get("tickers", []) if t.strip()]
-                return tickers if tickers else DEFAULT_WATCHLIST
+                return tickers if tickers else []
     except Exception as e:
         print(f"Watchlist load error: {e}")
-    return list(DEFAULT_WATCHLIST)
+    return []
 
 def save_watchlist(tickers: List[str]) -> bool:
-    """Save watchlist to JSON file."""
     try:
         with open(WATCHLIST_FILE, "w") as f:
             json.dump({
-                "tickers":  [t.upper().strip() for t in tickers],
-                "updated":  datetime.now().isoformat(timespec='seconds'),
-                "count":    len(tickers),
+                "tickers": [t.upper().strip() for t in tickers],
+                "updated": datetime.now().isoformat(timespec="seconds"),
+                "count":   len(tickers),
             }, f, indent=2)
         return True
     except Exception as e:
         print(f"Watchlist save error: {e}")
         return False
 
-# Initialize watchlist file if missing
 if not os.path.exists(WATCHLIST_FILE):
-    save_watchlist(DEFAULT_WATCHLIST)
+    save_watchlist([])
 
 
 # ══════════════════════════════════════════════════════════════
-# CATALYST DETECTION (pre-movimiento)
-# Detecta catalizadores ANTES de que el precio se mueva:
-#   - Analyst upgrades/downgrades recientes (Yahoo quoteSummary)
-#   - Earnings próximos (< 7 días)
-#   - Implied Volatility spike vs histórico
-#   - Noticias con palabras clave de alto impacto
+# NOTICIAS — palabras clave con impacto en precio
 # ══════════════════════════════════════════════════════════════
-
-# Palabras clave de alto impacto en títulos de noticias
-HIGH_IMPACT_KEYWORDS = [
+NEWS_IMPACT: Dict[str, int] = {
+    # Corporativo — máximo impacto
+    "merger": 4, "acquisition": 4, "acquired": 4, "buyout": 4, "takeover": 4,
+    "fda approval": 4, "approved": 3, "clearance": 3,
+    "record revenue": 3, "record earnings": 3,
     # Analyst actions
-    "upgrade","upgraded","downgrade","downgraded","outperform","overweight",
-    "price target","raises target","cuts target","initiates","initiated",
-    # Corporate events
-    "merger","acquisition","acquired","buyout","takeover","deal","partnership",
-    "contract","awarded","wins","joint venture","collaboration","licensing",
-    # Earnings/guidance
-    "beats","beat","misses","miss","raises guidance","lowers guidance",
-    "revenue beat","eps beat","record revenue","record earnings",
-    # Regulatory/macro
-    "fda approval","approved","clearance","sec","investigation","lawsuit",
-    "tariff","sanction","export","ban","restriction",
-    # Tech/product
-    "launch","launches","released","announces","breakthrough","ai chip",
-    "snapdragon","foundry","fab","manufacturing",
-]
-
-IMPACT_SCORE_MAP = {
-    # Highest impact
-    "upgrade": 3, "upgraded": 3, "merger": 3, "acquisition": 3,
-    "acquired": 3, "buyout": 3, "fda approval": 3, "approved": 3,
-    "beats": 2, "beat": 2, "record revenue": 3, "record earnings": 3,
-    # High impact
-    "outperform": 2, "overweight": 2, "raises target": 2, "price target": 1,
-    "partnership": 2, "contract": 2, "awarded": 2, "wins": 2,
-    "raises guidance": 2, "revenue beat": 2, "eps beat": 2,
-    "launch": 1, "launches": 1, "announced": 1, "breakthrough": 2,
-    # Moderate
-    "downgrade": -2, "downgraded": -2, "misses": -2, "miss": -2,
-    "lowers guidance": -2, "investigation": -1, "lawsuit": -1,
-    "ban": -1, "restriction": -1,
+    "upgrade": 3, "upgraded": 3, "initiates": 2, "initiated": 2,
+    "raises target": 2, "outperform": 2, "overweight": 2,
+    # Earnings
+    "beats": 2, "beat": 2, "revenue beat": 2, "eps beat": 2,
+    "raises guidance": 2,
+    # Contratos / partnership
+    "contract": 2, "awarded": 2, "partnership": 2, "collaboration": 2,
+    "wins": 1, "launch": 1, "launches": 1, "breakthrough": 2,
+    # Negativos
+    "downgrade": -3, "downgraded": -3,
+    "misses": -2, "miss": -2, "lowers guidance": -2,
+    "investigation": -2, "lawsuit": -2, "sec": -1,
+    "ban": -2, "restriction": -1, "recall": -2,
 }
 
-def score_news_title(title: str) -> Tuple[int, List[str]]:
-    """
-    Score a news title by keyword matches.
-    Returns (score, matched_keywords).
-    Positive = bullish catalyst, Negative = bearish catalyst.
-    """
-    title_lower = title.lower()
-    total_score = 0
-    matched = []
-    for kw, pts in IMPACT_SCORE_MAP.items():
-        if kw in title_lower:
-            total_score += pts
+def score_news(title: str) -> Tuple[int, List[str]]:
+    t = title.lower()
+    total, matched = 0, []
+    for kw, pts in NEWS_IMPACT.items():
+        if kw in t:
+            total += pts
             matched.append(kw)
-    return total_score, matched
-
-
-def get_catalyst_data(ticker: str) -> Dict[str, Any]:
-    """
-    Detect pre-movement catalysts for a ticker:
-    1. Recent analyst actions (upgrades/downgrades/target changes)
-    2. Earnings proximity (< 7 days = high alert)
-    3. News impact score from keyword analysis
-    4. Implied volatility rank (IV spike = options market expecting move)
-
-    Returns a catalyst dict with signal strength 0-10.
-    """
-    result = {
-        "ticker":           ticker,
-        "catalyst_score":   0,
-        "catalyst_signal":  "NONE",
-        "analyst_action":   None,
-        "earnings_days":    None,
-        "earnings_alert":   False,
-        "iv_rank":          None,
-        "iv_spike":         False,
-        "top_news_score":   0,
-        "top_news_title":   None,
-        "top_news_kws":     [],
-        "catalysts_found":  [],
-    }
-
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
-            params={"modules": "upgradeDowngradeHistory,calendarEvents,financialData,defaultKeyStatistics"},
-            headers=HEADERS, timeout=12
-        )
-        r.raise_for_status()
-        res = r.json().get("quoteSummary", {}).get("result", [])
-        if not res:
-            return result
-
-        # ── 1. ANALYST UPGRADES / DOWNGRADES ─────────────────
-        udh = res[0].get("upgradeDowngradeHistory", {}).get("history", [])
-        if udh:
-            # Look at last 5 days of analyst actions
-            cutoff = datetime.now().timestamp() - (5 * 86400)
-            recent_actions = [a for a in udh if a.get("epochGradeDate", 0) >= cutoff]
-            if recent_actions:
-                latest = recent_actions[0]
-                action  = latest.get("action", "")
-                firm    = latest.get("firm", "")
-                to_grd  = latest.get("toGrade", "")
-                from_grd = latest.get("fromGrade", "")
-                action_str = f"{firm}: {action} → {to_grd}" if to_grd else f"{firm}: {action}"
-                result["analyst_action"] = action_str
-
-                if action.lower() in ("up", "upgrade", "init"):
-                    result["catalyst_score"] += 3
-                    result["catalysts_found"].append(f"Upgrade reciente: {action_str}")
-                elif action.lower() in ("down", "downgrade"):
-                    result["catalyst_score"] -= 2
-                    result["catalysts_found"].append(f"Downgrade reciente: {action_str}")
-                elif action.lower() in ("main", "reit", "reiterate"):
-                    result["catalyst_score"] += 1
-                    result["catalysts_found"].append(f"Reiteración: {action_str}")
-
-        # ── 2. EARNINGS PROXIMITY ─────────────────────────────
-        cal = res[0].get("calendarEvents", {})
-        earn_dates = cal.get("earnings", {}).get("earningsDate", [])
-        if earn_dates:
-            ts = earn_dates[0].get("raw", 0)
-            if ts:
-                days_until = (ts - datetime.now().timestamp()) / 86400
-                result["earnings_days"] = round(days_until, 0)
-                if 0 <= days_until <= 2:
-                    result["catalyst_score"] += 4
-                    result["earnings_alert"] = True
-                    result["catalysts_found"].append(f"⚠️ EARNINGS HOY/MAÑANA ({days_until:.0f}d)")
-                elif days_until <= 5:
-                    result["catalyst_score"] += 3
-                    result["earnings_alert"] = True
-                    result["catalysts_found"].append(f"Earnings en {days_until:.0f} días — volatilidad inminente")
-                elif days_until <= 14:
-                    result["catalyst_score"] += 1
-                    result["catalysts_found"].append(f"Earnings en {days_until:.0f} días")
-
-        # ── 3. IMPLIED VOLATILITY from options chain ──────────
-        # Use currentRatio of IV from financialData as proxy
-        fd = res[0].get("financialData", {})
-        ks = res[0].get("defaultKeyStatistics", {})
-
-        # Beta as volatility proxy when IV not available
-        beta_raw = ks.get("beta", {})
-        beta = float(beta_raw.get("raw", 0)) if isinstance(beta_raw, dict) else float(beta_raw or 0)
-        if beta >= 2.0:
-            result["iv_spike"] = True
-            result["catalyst_score"] += 1
-            result["catalysts_found"].append(f"Beta {beta:.1f} — alta volatilidad implícita")
-
-    except Exception as e:
-        print(f"Catalyst data error {ticker}: {e}")
-
-    # ── 4. NEWS IMPACT SCORE ──────────────────────────────────
-    try:
-        r2 = requests.get(
-            "https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q": ticker, "newsCount": 8, "quotesCount": 0},
-            headers=HEADERS, timeout=8
-        )
-        r2.raise_for_status()
-        news_items = r2.json().get("news", [])
-        best_score = 0
-        best_title = None
-        best_kws   = []
-
-        for item in news_items:
-            title = item.get("title", "")
-            if not title:
-                continue
-            # Only consider news from last 48 hours
-            pub_time = item.get("providerPublishTime", 0)
-            if pub_time and (datetime.now().timestamp() - pub_time) > 172800:
-                continue
-            ns, kws = score_news_title(title)
-            if abs(ns) > abs(best_score):
-                best_score = ns
-                best_title = title
-                best_kws   = kws
-
-        result["top_news_score"] = best_score
-        result["top_news_title"] = best_title
-        result["top_news_kws"]   = best_kws
-
-        if best_score >= 3:
-            result["catalyst_score"] += 3
-            result["catalysts_found"].append(f"Noticia alto impacto ({best_score}pts): {best_title[:70] if best_title else ''}")
-        elif best_score >= 2:
-            result["catalyst_score"] += 2
-            result["catalysts_found"].append(f"Noticia relevante: {best_title[:70] if best_title else ''}")
-        elif best_score >= 1:
-            result["catalyst_score"] += 1
-            result["catalysts_found"].append(f"Noticia: {best_title[:70] if best_title else ''}")
-        elif best_score <= -2:
-            result["catalyst_score"] -= 2
-            result["catalysts_found"].append(f"Noticia negativa: {best_title[:70] if best_title else ''}")
-
-    except Exception as e:
-        print(f"News catalyst error {ticker}: {e}")
-
-    # ── SIGNAL LABEL ──────────────────────────────────────────
-    cs = result["catalyst_score"]
-    if cs >= 6:
-        result["catalyst_signal"] = "🚨 CATALIZADOR FUERTE"
-    elif cs >= 4:
-        result["catalyst_signal"] = "⚡ CATALIZADOR MODERADO"
-    elif cs >= 2:
-        result["catalyst_signal"] = "📌 CATALIZADOR LEVE"
-    elif cs <= -2:
-        result["catalyst_signal"] = "⚠️ CATALIZADOR NEGATIVO"
-    else:
-        result["catalyst_signal"] = "NONE"
-
-    return result
-
-
-# ── SERVE HTML ────────────────────────────────────────────────
-@app.route('/')
-def home():
-    with open(os.path.join(BASE_DIR, 'index.html'), 'r', encoding='utf-8') as f:
-        return f.read(), 200, {'Content-Type': 'text/html; charset=utf-8'}
-
-
-@app.route('/api/health')
-def health():
-    return jsonify({
-        'ok': True,
-        'service': 'FlowScan 8',
-        'version': '4.0',
-        'sources': ['yahoo_finance', 'finviz', 'market_chameleon', 'stocktwits'],
-        'time': datetime.now().isoformat(timespec='seconds'),
-    })
+    return total, matched
 
 
 # ══════════════════════════════════════════════════════════════
-# DATA SOURCES
+# CAPA 1: DATOS CRUDOS
+# Una sola función por concepto — sin duplicaciones
 # ══════════════════════════════════════════════════════════════
 
-def get_yahoo(ticker: str) -> Dict[str, Any]:
+def get_price_data(ticker: str) -> Dict[str, Any]:
     """
-    Near real-time stock price from Yahoo Finance.
-    Uses 1-minute interval for current price (1-2 min delay max).
-    Falls back to daily for volume averages.
+    Precio, volumen, VWAP y MAs de Yahoo Finance.
+    Una sola llamada 1m + una 1d para avg_vol.
     """
+    out = {}
     try:
-        # 1-minute chart for near real-time price
+        # 1m intraday para precio en tiempo real y VWAP
         r1 = requests.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
             params={"interval": "1m", "range": "1d"},
-            headers=HEADERS,
-            timeout=10
+            headers=HEADERS, timeout=10
         )
         r1.raise_for_status()
-        d1     = r1.json()
-        res1   = d1.get("chart", {}).get("result", [])
-        meta1  = res1[0].get("meta", {}) if res1 else {}
-        quote1 = res1[0].get("indicators", {}).get("quote", [{}])[0] if res1 else {}
+        d1    = r1.json().get("chart", {}).get("result", [])
+        meta  = d1[0].get("meta", {}) if d1 else {}
+        q1    = d1[0].get("indicators", {}).get("quote", [{}])[0] if d1 else {}
 
-        # Get most recent valid price from 1m candles
-        closes_1m = [c for c in (quote1.get("close") or []) if c]
-        vols_1m   = [v for v in (quote1.get("volume") or []) if v]
-        price     = round(float(closes_1m[-1]), 2) if closes_1m else float(meta1.get("regularMarketPrice") or 0)
-        vol_today = int(sum(vols_1m)) if vols_1m else int(meta1.get("regularMarketVolume") or 0)
+        closes_1m = [c for c in (q1.get("close") or []) if c]
+        vols_1m   = [v for v in (q1.get("volume") or []) if v]
+        highs_1m  = [h for h in (q1.get("high") or []) if h]
+        lows_1m   = [l for l in (q1.get("low") or []) if l]
 
-        # VWAP from 1m data
-        highs  = [h for h in (quote1.get("high") or []) if h]
-        lows   = [l for l in (quote1.get("low") or []) if l]
-        closes = [c for c in (quote1.get("close") or []) if c]
-        if highs and lows and closes and vols_1m:
-            tp  = [(h+l+c)/3 for h,l,c in zip(highs,lows,closes)]
-            tpv = [t*v for t,v in zip(tp, vols_1m)]
-            vwap = round(sum(tpv)/sum(vols_1m), 2) if sum(vols_1m) > 0 else price
+        price   = round(float(closes_1m[-1]), 2) if closes_1m else float(meta.get("regularMarketPrice") or 0)
+        vol_hoy = int(sum(vols_1m)) if vols_1m else int(meta.get("regularMarketVolume") or 0)
+
+        # VWAP intraday
+        if closes_1m and highs_1m and lows_1m and vols_1m:
+            tp  = [(h+l+c)/3 for h,l,c in zip(highs_1m, lows_1m, closes_1m)]
+            vwap = round(sum(t*v for t,v in zip(tp, vols_1m)) / max(sum(vols_1m),1), 2)
         else:
             vwap = price
 
-        # 5-day daily for avg volume calculation
-        r2 = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-            params={"interval": "1d", "range": "30d"},
-            headers=HEADERS,
-            timeout=10
-        )
-        r2.raise_for_status()
-        d2     = r2.json()
-        res2   = d2.get("chart", {}).get("result", [])
-        meta2  = res2[0].get("meta", {}) if res2 else {}
-        quote2 = res2[0].get("indicators", {}).get("quote", [{}])[0] if res2 else {}
-        vols_d = [v for v in (quote2.get("volume") or []) if v]
-        # Use last 20 days for avg volume (excludes today)
-        avg_vol = int(sum(vols_d[-21:-1]) / 20) if len(vols_d) >= 21 else int(sum(vols_d) / max(len(vols_d), 1))
+        # Precio sobre/bajo VWAP — importante para timing de entrada
+        precio_vs_vwap = round((price - vwap) / vwap * 100, 2) if vwap else 0
 
-        prev    = float(meta1.get("chartPreviousClose") or meta2.get("chartPreviousClose") or 0)
-        day_hi  = float(meta1.get("regularMarketDayHigh") or 0)
-        day_lo  = float(meta1.get("regularMarketDayLow") or 0)
-        day_op  = float(meta1.get("regularMarketOpen") or 0)
-        # Use Yahoo's own change calculation (most accurate)
-        chg_pct = round(float(meta1.get("regularMarketChangePercent") or meta2.get("regularMarketChangePercent") or 0), 2)
-        chg_abs = round(float(meta1.get("regularMarketChange") or meta2.get("regularMarketChange") or 0), 2)
-        # If still zero, calculate from prev close
-        if chg_pct == 0.0 and prev and price:
+        prev    = float(meta.get("chartPreviousClose") or 0)
+        chg_pct = round(float(meta.get("regularMarketChangePercent") or 0), 2)
+        chg_abs = round(float(meta.get("regularMarketChange") or 0), 2)
+        if chg_pct == 0 and prev and price:
             chg_abs = round(price - prev, 2)
-            chg_pct = round(chg_abs / prev * 100, 2) if prev else 0
-        rel_vol = round(vol_today / avg_vol, 2) if avg_vol > 0 else 1.0
+            chg_pct = round(chg_abs / prev * 100, 2)
 
-        return {
-            "price":      price,
-            "prev_close": round(prev, 2),
-            "open":       round(day_op, 2),
-            "high":       round(day_hi, 2),
-            "low":        round(day_lo, 2),
-            "volume":     vol_today,
-            "avg_volume": avg_vol,
-            "rel_volume": rel_vol,
-            "vwap":       vwap,
-            "change_pct": chg_pct,
-            "change_abs": chg_abs,
-            "market_cap": meta2.get("marketCap") or meta1.get("marketCap"),
-            "currency":   meta1.get("currency", "USD"),
-            "data_delay": "~1-2 min (Yahoo 1m)",
-        }
-    except Exception as e:
-        print(f"Yahoo error {ticker}: {e}")
-        # Fallback to daily if 1m fails
-        try:
-            r = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-                params={"interval": "1d", "range": "5d"},
-                headers=HEADERS,
-                timeout=10
-            )
-            r.raise_for_status()
-            res  = r.json().get("chart", {}).get("result", [])
-            meta = res[0].get("meta", {}) if res else {}
-            q    = res[0].get("indicators", {}).get("quote", [{}])[0] if res else {}
-            vols = [v for v in (q.get("volume") or []) if v]
-            avg  = int(sum(vols[:-1]) / max(len(vols)-1, 1)) if len(vols) > 1 else 1
-            price = float(meta.get("regularMarketPrice") or 0)
-            prev  = float(meta.get("chartPreviousClose") or price)
-            vol   = int(meta.get("regularMarketVolume") or 0)
-            return {
-                "price":      round(price, 2),
-                "prev_close": round(prev, 2),
-                "open":       round(float(meta.get("regularMarketOpen") or 0), 2),
-                "high":       round(float(meta.get("regularMarketDayHigh") or 0), 2),
-                "low":        round(float(meta.get("regularMarketDayLow") or 0), 2),
-                "volume":     vol,
-                "avg_volume": avg,
-                "rel_volume": round(vol / avg, 2) if avg else 1.0,
-                "vwap":       round(price, 2),
-                "change_pct": round((price-prev)/prev*100, 2) if prev else 0,
-                "change_abs": round(price-prev, 2),
-                "data_delay": "~15 min (Yahoo 1d fallback)",
-            }
-        except:
-            return {}
+        day_hi = float(meta.get("regularMarketDayHigh") or 0)
+        day_lo = float(meta.get("regularMarketDayLow") or 0)
+        day_op = float(meta.get("regularMarketOpen") or 0)
 
+        # Posición dentro del rango del día (0=mín, 1=máx) — entrada en extremo bajo = mejor R/R
+        day_range_pos = round((price - day_lo) / (day_hi - day_lo), 2) if (day_hi - day_lo) > 0 else 0.5
 
-def get_finviz(ticker: str) -> Dict[str, Any]:
-    """Get fundamentals and technicals from Yahoo Finance."""
-    data = {}
-
-    # 1. Fundamentals from quoteSummary
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
-            params={"modules": "summaryDetail,defaultKeyStatistics,financialData,assetProfile,calendarEvents"},
-            headers=HEADERS, timeout=12
-        )
-        r.raise_for_status()
-        res = r.json().get("quoteSummary", {}).get("result", [])
-        if res:
-            sd  = res[0].get("summaryDetail", {})
-            ks  = res[0].get("defaultKeyStatistics", {})
-            fd  = res[0].get("financialData", {})
-            ap  = res[0].get("assetProfile", {})
-            cal = res[0].get("calendarEvents", {})
-
-            def v(d, k):
-                x = d.get(k, {})
-                return (x.get("fmt") or x.get("raw")) if isinstance(x, dict) else x
-
-            sf = v(ks, "shortPercentOfFloat")
-            if sf is not None:
-                try:
-                    sfv = float(sf)
-                    sfv = sfv * 100 if sfv < 1 else sfv
-                    data["short_float"] = f"{sfv:.1f}%"
-                    data["short_pct_raw"] = sfv
-                except:
-                    pass
-
-            beta = v(sd, "beta")
-            data["beta"] = f"{float(beta):.2f}" if beta else "N/A"
-
-            tp = v(fd, "targetMeanPrice")
-            data["target_price"] = f"${float(tp):.2f}" if tp else "N/A"
-
-            rec = str(v(fd, "recommendationKey") or "")
-            rec_map = {"strong_buy":"Strong Buy","buy":"Buy","hold":"Hold","sell":"Sell","strong_sell":"Strong Sell"}
-            data["recommendation"] = rec_map.get(rec.lower(), rec.title()) if rec else "N/A"
-
-            data["sector"]   = ap.get("sector", "N/A")
-            data["industry"] = ap.get("industry", "N/A")
-
-            ed = cal.get("earnings", {}).get("earningsDate", [])
-            if ed:
-                ts = ed[0].get("raw", 0)
-                data["earnings_date"] = datetime.fromtimestamp(ts).strftime("%d-%b-%Y") if ts else "N/A"
-            else:
-                data["earnings_date"] = "N/A"
-
-            h52 = v(sd, "fiftyTwoWeekHigh")
-            l52 = v(sd, "fiftyTwoWeekLow")
-            data["52w_high"] = f"${float(h52):.2f}" if h52 else "N/A"
-            data["52w_low"]  = f"${float(l52):.2f}" if l52 else "N/A"
-
-            ii = v(ks, "heldPercentInstitutions")
-            data["inst_own"] = f"{float(ii)*100:.1f}%" if ii else "N/A"
-            ins = v(ks, "heldPercentInsiders")
-            data["insider_own"] = f"{float(ins)*100:.1f}%" if ins else "N/A"
+        out.update({
+            "price": price, "prev_close": round(prev, 2),
+            "open": round(day_op, 2), "high": round(day_hi, 2), "low": round(day_lo, 2),
+            "vwap": vwap, "precio_vs_vwap": precio_vs_vwap,
+            "volume": vol_hoy,
+            "change_pct": chg_pct, "change_abs": chg_abs,
+            "day_range_pos": day_range_pos,
+        })
 
     except Exception as e:
-        print(f"quoteSummary error {ticker}: {e}")
+        print(f"Price data error {ticker}: {e}")
 
-    # 2. MAs, RSI, Performance from 1-year daily prices
     try:
+        # 1y diario para avg_vol, MAs, RSI, ATR
         r2 = requests.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
             params={"interval": "1d", "range": "1y"},
             headers=HEADERS, timeout=12
         )
         r2.raise_for_status()
-        res2 = r2.json().get("chart", {}).get("result", [])
-        if res2:
-            meta   = res2[0].get("meta", {})
-            quote2 = res2[0].get("indicators", {}).get("quote", [{}])[0]
-            closes = [c for c in (quote2.get("close") or []) if c is not None]
-            highs  = [h for h in (quote2.get("high") or [])  if h is not None]
-            lows   = [l for l in (quote2.get("low") or [])   if l is not None]
-            price  = float(meta.get("regularMarketPrice") or 0)
+        d2   = r2.json().get("chart", {}).get("result", [])
+        meta2 = d2[0].get("meta", {}) if d2 else {}
+        q2   = d2[0].get("indicators", {}).get("quote", [{}])[0] if d2 else {}
 
-            if closes and price:
-                def sma(n):
-                    return round(sum(closes[-n:]) / n, 2) if len(closes) >= n else None
+        closes = [c for c in (q2.get("close") or []) if c is not None]
+        highs  = [h for h in (q2.get("high") or []) if h is not None]
+        lows   = [l for l in (q2.get("low") or []) if l is not None]
+        vols_d = [v for v in (q2.get("volume") or []) if v]
 
-                def pct(ma):
-                    if ma and price:
-                        d = round((price - ma) / ma * 100, 2)
-                        return f"+{d:.2f}%" if d >= 0 else f"{d:.2f}%"
-                    return "N/A"
+        price = out.get("price", 0) or float(meta2.get("regularMarketPrice") or 0)
 
-                data["sma5_pct"]   = pct(sma(5))
-                data["sma20_pct"]  = pct(sma(20))
-                data["sma50_pct"]  = pct(sma(50))
-                data["sma200_pct"] = pct(sma(200))
+        # Avg volume 20 días
+        avg_vol = int(sum(vols_d[-21:-1]) / 20) if len(vols_d) >= 21 else int(sum(vols_d) / max(len(vols_d), 1))
+        vol_hoy = out.get("volume", 0)
+        rel_vol = round(vol_hoy / avg_vol, 2) if avg_vol > 0 else 1.0
 
-                if len(closes) >= 15:
-                    diffs  = [closes[i]-closes[i-1] for i in range(1, len(closes))][-14:]
-                    gains  = [max(d, 0) for d in diffs]
-                    losses = [max(-d, 0) for d in diffs]
-                    ag = sum(gains) / 14
-                    al = sum(losses) / 14
-                    rsi = round(100 - 100 / (1 + ag/al), 1) if al > 0 else 100.0
-                    data["rsi14"] = str(rsi)
+        def sma(n):
+            return round(sum(closes[-n:]) / n, 2) if len(closes) >= n else None
 
-                def perf(days):
-                    if len(closes) > days:
-                        old = closes[-days-1]
-                        p = (price - old) / old * 100
-                        return f"+{p:.2f}%" if p >= 0 else f"{p:.2f}%"
-                    return "N/A"
+        def pct_vs_ma(ma):
+            if ma and price:
+                d = round((price - ma) / ma * 100, 2)
+                return f"+{d:.2f}%" if d >= 0 else f"{d:.2f}%"
+            return "N/A"
 
-                data["perf_week"]  = perf(5)
-                data["perf_month"] = perf(21)
-                data["perf_ytd"]   = perf(min(len(closes)-1, 252))
+        sma20  = sma(20);  sma50 = sma(50);  sma200 = sma(200)
+        above_sma20  = bool(sma20  and price > sma20)
+        above_sma50  = bool(sma50  and price > sma50)
+        above_sma200 = bool(sma200 and price > sma200)
 
-                if len(highs) >= 15:
-                    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-                           for i in range(max(1,len(highs)-14), len(highs))]
-                    data["atr"] = f"${round(sum(trs)/len(trs), 2)}"
+        # RSI 14
+        rsi = 50.0
+        if len(closes) >= 15:
+            diffs  = [closes[i]-closes[i-1] for i in range(1, len(closes))][-14:]
+            gains  = [max(d, 0) for d in diffs]
+            losses = [max(-d, 0) for d in diffs]
+            ag, al = sum(gains)/14, sum(losses)/14
+            rsi = round(100 - 100/(1 + ag/al), 1) if al > 0 else 100.0
+
+        # ATR 14
+        atr = 0.0
+        if len(highs) >= 15:
+            trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+                   for i in range(max(1, len(highs)-14), len(highs))]
+            atr = round(sum(trs)/len(trs), 2)
+
+        # Performance
+        def perf(days):
+            if len(closes) > days:
+                p = (price - closes[-days-1]) / closes[-days-1] * 100
+                return f"+{p:.2f}%" if p >= 0 else f"{p:.2f}%"
+            return "N/A"
+
+        out.update({
+            "avg_volume": avg_vol, "rel_volume": rel_vol,
+            "sma20": sma20, "sma50": sma50, "sma200": sma200,
+            "above_sma20": above_sma20, "above_sma50": above_sma50, "above_sma200": above_sma200,
+            "sma20_pct": pct_vs_ma(sma20), "sma50_pct": pct_vs_ma(sma50), "sma200_pct": pct_vs_ma(sma200),
+            "rsi": rsi, "atr": atr,
+            "perf_week": perf(5), "perf_month": perf(21),
+        })
 
     except Exception as e:
-        print(f"Yahoo historical error {ticker}: {e}")
+        print(f"Historical data error {ticker}: {e}")
 
-    # 3. News
+    return out
+
+
+def get_fundamentals(ticker: str) -> Dict[str, Any]:
+    """Fundamentales, short float, earnings, sector — Yahoo quoteSummary."""
+    out = {}
     try:
-        r3 = requests.get(
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+            params={"modules": "summaryDetail,defaultKeyStatistics,financialData,assetProfile,calendarEvents,upgradeDowngradeHistory"},
+            headers=HEADERS, timeout=12
+        )
+        r.raise_for_status()
+        res = r.json().get("quoteSummary", {}).get("result", [])
+        if not res:
+            return out
+
+        def v(d, k):
+            x = d.get(k, {})
+            return (x.get("raw") if isinstance(x, dict) else x)
+
+        sd  = res[0].get("summaryDetail", {})
+        ks  = res[0].get("defaultKeyStatistics", {})
+        fd  = res[0].get("financialData", {})
+        ap  = res[0].get("assetProfile", {})
+        cal = res[0].get("calendarEvents", {})
+        udh = res[0].get("upgradeDowngradeHistory", {}).get("history", [])
+
+        # Short float
+        sf = v(ks, "shortPercentOfFloat")
+        try:
+            sfv = float(sf)
+            sfv = sfv * 100 if sfv < 1 else sfv
+            out["short_pct"] = round(sfv, 1)
+        except:
+            out["short_pct"] = 0.0
+
+        out["beta"]        = round(float(v(ks, "beta") or 0), 2)
+        out["sector"]      = ap.get("sector", "N/A")
+        out["industry"]    = ap.get("industry", "N/A")
+        out["target_price"]= round(float(v(fd, "targetMeanPrice") or 0), 2) or None
+
+        rec = str(v(fd, "recommendationKey") or "")
+        rec_map = {"strong_buy":"Strong Buy","buy":"Buy","hold":"Hold","sell":"Sell","strong_sell":"Strong Sell"}
+        out["recommendation"] = rec_map.get(rec.lower(), rec.title() or "N/A")
+
+        h52 = v(sd, "fiftyTwoWeekHigh"); l52 = v(sd, "fiftyTwoWeekLow")
+        out["high_52w"] = round(float(h52), 2) if h52 else None
+        out["low_52w"]  = round(float(l52), 2) if l52 else None
+
+        ii = v(ks, "heldPercentInstitutions")
+        out["inst_own"] = f"{float(ii)*100:.1f}%" if ii else "N/A"
+
+        # Earnings
+        ed = cal.get("earnings", {}).get("earningsDate", [])
+        out["earnings_ts"]   = ed[0].get("raw", 0) if ed else 0
+        out["earnings_date"] = datetime.fromtimestamp(ed[0].get("raw",0)).strftime("%d-%b-%Y") if ed else "N/A"
+        if out["earnings_ts"]:
+            days = (out["earnings_ts"] - datetime.now().timestamp()) / 86400
+            out["earnings_days"] = round(days, 0)
+        else:
+            out["earnings_days"] = None
+
+        # Analyst action reciente (últimos 5 días)
+        cutoff = datetime.now().timestamp() - (5 * 86400)
+        recent = [a for a in udh if a.get("epochGradeDate", 0) >= cutoff]
+        if recent:
+            lat = recent[0]
+            out["analyst_action"] = f"{lat.get('firm','')}: {lat.get('action','')} → {lat.get('toGrade','')}"
+            out["analyst_action_type"] = lat.get("action", "").lower()
+        else:
+            out["analyst_action"] = None
+            out["analyst_action_type"] = None
+
+    except Exception as e:
+        print(f"Fundamentals error {ticker}: {e}")
+    return out
+
+
+def get_news_score(ticker: str) -> Dict[str, Any]:
+    """Noticias de las últimas 48h con score de impacto."""
+    out = {"score": 0, "title": None, "keywords": [], "age_hours": None}
+    try:
+        r = requests.get(
             "https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q": ticker, "newsCount": 5, "quotesCount": 0},
+            params={"q": ticker, "newsCount": 8, "quotesCount": 0},
             headers=HEADERS, timeout=8
         )
-        r3.raise_for_status()
-        data["news"] = [{"title": n.get("title",""), "url": n.get("link","")} for n in r3.json().get("news", [])[:5]]
-    except:
-        data["news"] = []
-
-    return data
-
-
-def get_stocktwits_sentiment(ticker: str) -> Dict[str, Any]:
-    """Get bull/bear sentiment from Stocktwits."""
-    try:
-        r = requests.get(
-            f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json",
-            headers=HEADERS,
-            timeout=8
-        )
         r.raise_for_status()
-        data   = r.json()
-        symbol = data.get("symbol", {})
-        return {
-            "watchlist_count": symbol.get("watchlist_count", 0),
-            "bullish":  symbol.get("sentiment", {}).get("bullish") if symbol.get("sentiment") else None,
-            "bearish":  symbol.get("sentiment", {}).get("bearish") if symbol.get("sentiment") else None,
-        }
+        now_ts = datetime.now().timestamp()
+        best_score, best_title, best_kws, best_age = 0, None, [], None
+
+        for item in r.json().get("news", []):
+            title = item.get("title", "")
+            pub   = item.get("providerPublishTime", 0)
+            if not title or not pub:
+                continue
+            age_h = (now_ts - pub) / 3600
+            if age_h > 48:
+                continue
+            ns, kws = score_news(title)
+            if abs(ns) > abs(best_score):
+                best_score, best_title, best_kws, best_age = ns, title, kws, round(age_h, 1)
+
+        out.update({"score": best_score, "title": best_title, "keywords": best_kws, "age_hours": best_age})
     except Exception as e:
-        print(f"Stocktwits error {ticker}: {e}")
-        return {}
+        print(f"News error {ticker}: {e}")
+    return out
 
 
-def get_options_flow_real(ticker: str) -> Dict[str, Any]:
+def get_options_data(ticker: str) -> Dict[str, Any]:
     """
-    Fetch real options chain from Yahoo Finance for a specific ticker.
-    Returns the REAL vol/OI ratio (the correct metric for unusual options activity).
-    vol/OI > 1.5 = unusual, > 3.0 = very unusual, > 5.0 = institutional sweep.
+    Cadena de opciones real de Yahoo — vol/OI, P/C ratio, call wall, put wall, max pain.
+    Una sola función que calcula todo para evitar requests duplicados.
     """
+    out = {
+        "has_options": False,
+        "vol_oi": 0.0, "call_vol_oi": 0.0, "put_vol_oi": 0.0,
+        "atm_call_vol_oi": 0.0, "atm_put_vol_oi": 0.0,
+        "total_call_vol": 0, "total_put_vol": 0,
+        "total_call_oi": 0, "total_put_oi": 0,
+        "pc_ratio": 1.0, "dominant": "NEUTRAL",
+        "is_unusual": False, "is_sweep": False,
+        "call_wall": None, "put_wall": None, "max_pain": None,
+        "atm_oi_concentration": 0.0,
+        "top_strikes": [],
+        # Gamma squeeze
+        "gamma_score": 0, "gamma_signal": "NONE", "gamma_triggers": [],
+        "dealer_pressure": "NEUTRAL",
+    }
+
     try:
-        # Step 1: Get available expiration dates
         r = requests.get(
             f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
-            headers=HEADERS,
-            timeout=12
+            headers=HEADERS, timeout=12
         )
         r.raise_for_status()
-        data = r.json()
-        result = data.get("optionChain", {}).get("result", [])
-        if not result:
-            return {}
+        chain = r.json().get("optionChain", {}).get("result", [])
+        if not chain:
+            return out
 
-        dates = result[0].get("expirationDates", [])
-        current_price = result[0].get("quote", {}).get("regularMarketPrice", 0)
+        current_price = float(chain[0].get("quote", {}).get("regularMarketPrice") or 0)
+        dates = chain[0].get("expirationDates", [])
+        if not dates or not current_price:
+            return out
 
-        # Step 2: Analyze next 2 expirations (closest = most sensitive to unusual activity)
-        best_call_vol_oi = 0.0
-        best_put_vol_oi  = 0.0
-        total_call_vol   = 0
-        total_put_vol    = 0
-        total_call_oi    = 0
-        total_put_oi     = 0
-        atm_call_vol_oi  = 0.0  # ATM = most significant signal
-        atm_put_vol_oi   = 0.0
-        dominant_side    = "NEUTRAL"
-        top_strikes      = []
+        out["has_options"] = True
 
-        for exp_ts in dates[:3]:  # Check next 3 expirations
+        # Acumular datos de las 3 expiraciones más cercanas
+        best_call_voi = 0.0; best_put_voi = 0.0
+        total_cv = 0; total_pv = 0; total_coi = 0; total_poi = 0
+        atm_cv = 0.0; atm_pv = 0.0
+        call_oi_strike: Dict[float, Dict] = {}
+        put_oi_strike:  Dict[float, Dict] = {}
+        top_strikes = []
+
+        atm_lo = current_price * 0.95
+        atm_hi = current_price * 1.05
+
+        for exp_ts in dates[:3]:
             r2 = requests.get(
                 f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
-                params={"date": exp_ts},
-                headers=HEADERS,
-                timeout=12
+                params={"date": exp_ts}, headers=HEADERS, timeout=12
             )
             r2.raise_for_status()
-            d2 = r2.json()
-            res2 = d2.get("optionChain", {}).get("result", [])
+            res2 = r2.json().get("optionChain", {}).get("result", [])
             if not res2:
                 continue
-
             calls = res2[0].get("options", [{}])[0].get("calls", [])
-            puts  = res2[0].get("options", [{}])[0].get("puts", [])
+            puts  = res2[0].get("options", [{}])[0].get("puts",  [])
 
             for c in calls:
                 vol = int(c.get("volume", 0) or 0)
                 oi  = int(c.get("openInterest", 0) or 0)
-                strike = float(c.get("strike", 0) or 0)
-                total_call_vol += vol
-                total_call_oi  += oi
-                if oi > 50 and vol > 0:  # Minimum threshold to avoid noise
+                sk  = float(c.get("strike", 0) or 0)
+                total_cv  += vol; total_coi += oi
+                if sk > 0:
+                    prev = call_oi_strike.get(sk, {"oi": 0, "vol": 0})
+                    call_oi_strike[sk] = {"oi": prev["oi"]+oi, "vol": prev["vol"]+vol}
+                if oi >= 50 and vol > 0:
                     ratio = vol / oi
-                    if ratio > best_call_vol_oi:
-                        best_call_vol_oi = round(ratio, 2)
-                    # ATM = within 5% of current price
-                    if current_price and abs(strike - current_price) / current_price <= 0.05:
-                        if ratio > atm_call_vol_oi:
-                            atm_call_vol_oi = round(ratio, 2)
+                    if ratio > best_call_voi:
+                        best_call_voi = round(ratio, 2)
+                    if atm_lo <= sk <= atm_hi and ratio > atm_cv:
+                        atm_cv = round(ratio, 2)
                     if ratio >= 1.5:
-                        top_strikes.append({
-                            "type": "CALL", "strike": strike,
-                            "vol": vol, "oi": oi, "ratio": round(ratio, 2)
-                        })
+                        top_strikes.append({"type":"CALL","strike":sk,"vol":vol,"oi":oi,"ratio":round(ratio,2)})
 
             for p in puts:
                 vol = int(p.get("volume", 0) or 0)
                 oi  = int(p.get("openInterest", 0) or 0)
-                strike = float(p.get("strike", 0) or 0)
-                total_put_vol += vol
-                total_put_oi  += oi
-                if oi > 50 and vol > 0:
+                sk  = float(p.get("strike", 0) or 0)
+                total_pv  += vol; total_poi += oi
+                if sk > 0:
+                    prev = put_oi_strike.get(sk, {"oi": 0, "vol": 0})
+                    put_oi_strike[sk] = {"oi": prev["oi"]+oi, "vol": prev["vol"]+vol}
+                if oi >= 50 and vol > 0:
                     ratio = vol / oi
-                    if ratio > best_put_vol_oi:
-                        best_put_vol_oi = round(ratio, 2)
-                    if current_price and abs(strike - current_price) / current_price <= 0.05:
-                        if ratio > atm_put_vol_oi:
-                            atm_put_vol_oi = round(ratio, 2)
+                    if ratio > best_put_voi:
+                        best_put_voi = round(ratio, 2)
+                    if atm_lo <= sk <= atm_hi and ratio > atm_pv:
+                        atm_pv = round(ratio, 2)
                     if ratio >= 1.5:
-                        top_strikes.append({
-                            "type": "PUT", "strike": strike,
-                            "vol": vol, "oi": oi, "ratio": round(ratio, 2)
-                        })
+                        top_strikes.append({"type":"PUT","strike":sk,"vol":vol,"oi":oi,"ratio":round(ratio,2)})
 
-        # Put/Call ratio (< 0.7 = bullish, > 1.3 = bearish)
-        pc_ratio = round(total_put_vol / total_call_vol, 2) if total_call_vol > 0 else 1.0
-
-        # Dominant side by volume
-        if total_call_vol > total_put_vol * 1.3:
-            dominant_side = "CALL"
-        elif total_put_vol > total_call_vol * 1.3:
-            dominant_side = "PUT"
-        else:
-            dominant_side = "NEUTRAL"
-
-        # Best vol/OI ratio overall (max of calls/puts, weighted toward dominant)
-        best_vol_oi = max(best_call_vol_oi, best_put_vol_oi)
-
-        # Sort top strikes by ratio
+        best_voi = max(best_call_voi, best_put_voi)
+        pc_ratio = round(total_pv / total_cv, 2) if total_cv > 0 else 1.0
+        dominant = "CALL" if total_cv > total_pv * 1.3 else "PUT" if total_pv > total_cv * 1.3 else "NEUTRAL"
         top_strikes.sort(key=lambda x: x["ratio"], reverse=True)
 
-        # Map vol/OI to rel_vol scale used by scoring engine
-        # vol/OI >= 5.0 → institutional sweep → rel_vol 10
-        # vol/OI >= 3.0 → very unusual       → rel_vol 5-7
-        # vol/OI >= 1.5 → unusual             → rel_vol 3-4
-        # vol/OI >= 0.8 → elevated            → rel_vol 1.5-2
-        # vol/OI <  0.5 → normal              → rel_vol 1.0
-        if best_vol_oi >= 5.0:
-            mapped_rel_vol = 10.0
-        elif best_vol_oi >= 3.0:
-            mapped_rel_vol = round(5.0 + (best_vol_oi - 3.0) / 2.0 * 2, 1)
-        elif best_vol_oi >= 1.5:
-            mapped_rel_vol = round(3.0 + (best_vol_oi - 1.5) / 1.5 * 1, 1)
-        elif best_vol_oi >= 0.8:
-            mapped_rel_vol = round(1.5 + (best_vol_oi - 0.8) / 0.7 * 0.5, 1)
-        else:
-            mapped_rel_vol = 1.0
+        # Call wall / Put wall (strike con mayor OI acumulado)
+        call_wall = max(call_oi_strike, key=lambda s: call_oi_strike[s]["oi"]) if call_oi_strike else None
+        put_wall  = max(put_oi_strike,  key=lambda s: put_oi_strike[s]["oi"])  if put_oi_strike  else None
 
-        return {
-            "best_vol_oi":      best_vol_oi,
-            "best_call_vol_oi": best_call_vol_oi,
-            "best_put_vol_oi":  best_put_vol_oi,
-            "atm_call_vol_oi":  atm_call_vol_oi,
-            "atm_put_vol_oi":   atm_put_vol_oi,
-            "total_call_vol":   total_call_vol,
-            "total_put_vol":    total_put_vol,
-            "total_call_oi":    total_call_oi,
-            "total_put_oi":     total_put_oi,
-            "pc_ratio":         pc_ratio,
-            "dominant_side":    dominant_side,
-            "mapped_rel_vol":   mapped_rel_vol,
-            "top_strikes":      top_strikes[:5],
-            "is_unusual":       best_vol_oi >= 1.5,
-            "is_sweep":         best_vol_oi >= 5.0,
-        }
+        # Max pain
+        all_strikes = sorted(set(list(call_oi_strike.keys()) + list(put_oi_strike.keys())))
+        max_pain = None
+        if all_strikes:
+            min_pain = None
+            for tp in all_strikes:
+                pain = (sum(max(0, tp-s)*d["oi"] for s,d in call_oi_strike.items()) +
+                        sum(max(0, s-tp)*d["oi"] for s,d in put_oi_strike.items()))
+                if min_pain is None or pain < min_pain:
+                    min_pain = pain; max_pain = tp
+
+        # Concentración OI ATM
+        atm_call_oi  = sum(d["oi"] for s,d in call_oi_strike.items() if atm_lo <= s <= atm_hi)
+        atm_oi_conc  = round(atm_call_oi / total_coi, 3) if total_coi > 0 else 0.0
+
+        out.update({
+            "vol_oi": best_voi, "call_vol_oi": best_call_voi, "put_vol_oi": best_put_voi,
+            "atm_call_vol_oi": atm_cv, "atm_put_vol_oi": atm_pv,
+            "total_call_vol": total_cv, "total_put_vol": total_pv,
+            "total_call_oi": total_coi, "total_put_oi": total_poi,
+            "pc_ratio": pc_ratio, "dominant": dominant,
+            "is_unusual": best_voi >= 1.5, "is_sweep": best_voi >= 5.0,
+            "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
+            "atm_oi_concentration": atm_oi_conc,
+            "top_strikes": top_strikes[:5],
+        })
+
+        # ── GAMMA SQUEEZE con los datos ya calculados ─────────
+        gamma_score = 0
+        gamma_triggers = []
+
+        # 1. Precio acercándose a call wall desde abajo
+        if call_wall and current_price < call_wall <= current_price * 1.08:
+            dist = round((call_wall - current_price) / current_price * 100, 1)
+            gamma_score += 3
+            gamma_triggers.append(f"🎯 Call Wall ${call_wall:.0f} a {dist}% — dealers deben comprar si sube")
+
+        # 2. Alta concentración OI ATM
+        if atm_oi_conc >= 0.40:
+            gamma_score += 2
+            gamma_triggers.append(f"🔥 {atm_oi_conc*100:.0f}% OI concentrado ATM — máxima exposición gamma")
+        elif atm_oi_conc >= 0.25:
+            gamma_score += 1
+            gamma_triggers.append(f"⚡ {atm_oi_conc*100:.0f}% OI ATM — gamma moderado")
+
+        # 3. Vol/OI calls ATM muy elevado (nuevas posiciones)
+        if atm_cv >= 3.0:
+            gamma_score += 3
+            gamma_triggers.append(f"🚨 Vol/OI calls ATM {atm_cv:.1f}x — acumulación masiva cerca del precio")
+        elif atm_cv >= 1.5:
+            gamma_score += 2
+            gamma_triggers.append(f"⚡ Vol/OI calls ATM {atm_cv:.1f}x — flujo inusual ATM")
+
+        # 4. Precio sobre max pain (dealers en modo hedging alcista)
+        if max_pain and current_price > max_pain * 1.03:
+            gamma_score += 2
+            gamma_triggers.append(f"📈 Precio ${current_price:.2f} sobre Max Pain ${max_pain:.0f}")
+
+        # 5. Precio en zona comprimida entre put wall y call wall
+        if call_wall and put_wall and put_wall < current_price < call_wall:
+            if (call_wall - put_wall) / current_price <= 0.10:
+                gamma_score += 1
+                gamma_triggers.append(f"📊 Comprimido entre Put Wall ${put_wall:.0f} y Call Wall ${call_wall:.0f}")
+
+        gamma_score = min(gamma_score, 10)
+        if gamma_score >= 7:
+            gs = "🚨 GAMMA SQUEEZE INMINENTE"; dp = "COMPRA_FORZADA"
+        elif gamma_score >= 5:
+            gs = "⚡ GAMMA SQUEEZE POSIBLE";   dp = "COMPRA_ELEVADA"
+        elif gamma_score >= 3:
+            gs = "📌 PRESIÓN GAMMA";           dp = "NEUTRAL_ALCISTA"
+        else:
+            gs = "NONE";                        dp = "NEUTRAL"
+
+        out.update({
+            "gamma_score": gamma_score, "gamma_signal": gs,
+            "gamma_triggers": gamma_triggers, "dealer_pressure": dp,
+        })
 
     except Exception as e:
-        print(f"Options chain error {ticker}: {e}")
+        print(f"Options data error {ticker}: {e}")
+    return out
+
+
+def get_sentiment(ticker: str) -> Dict[str, Any]:
+    """Sentimiento de Stocktwits."""
+    try:
+        r = requests.get(
+            f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json",
+            headers=HEADERS, timeout=8
+        )
+        r.raise_for_status()
+        sym = r.json().get("symbol", {})
+        sent = sym.get("sentiment", {}) or {}
+        return {
+            "watchlist_count": sym.get("watchlist_count", 0),
+            "bullish":  sent.get("bullish"),
+            "bearish":  sent.get("bearish"),
+        }
+    except:
         return {}
 
 
-def get_options_unusual_screener() -> List[Dict[str, Any]]:
-    """
-    Detect tickers with unusual options activity by scanning Yahoo most-active
-    and calculating REAL vol/OI ratios from the options chain.
-    This replaces the broken UW scraper.
-
-    Strategy:
-    1. Get ~25 most active stocks from Yahoo screener
-    2. Get Yahoo trending tickers
-    3. For each candidate, fetch real options chain
-    4. Filter by vol/OI >= 1.5 (unusual threshold)
-    5. Return sorted by vol/OI descending (highest = most institutional)
-    """
-    candidates = set()
-
-    # Source A: Yahoo most active (highest stock volume today)
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
-            params={"scrIds": "most_actives", "count": 30},
-            headers=HEADERS, timeout=10
-        )
-        r.raise_for_status()
-        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        for q in quotes:
-            tk = q.get("symbol", "")
-            if tk and len(tk) <= 5 and tk.isalpha():
-                candidates.add(tk)
-        print(f"Options screener: {len(candidates)} candidates from most_actives")
-    except Exception as e:
-        print(f"Most active error: {e}")
-
-    # Source B: Yahoo trending
-    try:
-        r2 = requests.get(
-            "https://query1.finance.yahoo.com/v1/finance/trending/US",
-            params={"count": 20},
-            headers=HEADERS, timeout=10
-        )
-        r2.raise_for_status()
-        quotes2 = r2.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        for q in quotes2:
-            tk = q.get("symbol", "")
-            if tk and len(tk) <= 5 and tk.isalpha():
-                candidates.add(tk)
-        print(f"Options screener: {len(candidates)} total candidates after trending")
-    except Exception as e:
-        print(f"Trending error: {e}")
-
-    # Source C: Siempre incluir watchlist persistente (incluye ASTS, CIFR, etc.)
-    wl_tickers = load_watchlist()
-    for tk in wl_tickers:
-        candidates.add(tk)
-
-    # Exclude ETFs, indices y tickers problemáticos
-    EXCLUDE = {"SPY","QQQ","IWM","VIX","TLT","GLD","SLV","XLF","XLE","XLK","DIA","EEM"}
-    candidates -= EXCLUDE
-
-    # Filtro de liquidez mínima: descartar antes de llamar a opciones
-    # (evita gastar requests en penny stocks o acciones sin opciones)
-    LIQUID_FILTER = {}
-    for tk in list(candidates):
-        try:
-            yf = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{tk}",
-                params={"interval": "1d", "range": "1d"},
-                headers=HEADERS, timeout=5
-            )
-            yf.raise_for_status()
-            meta = yf.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            price   = float(meta.get("regularMarketPrice", 0) or 0)
-            avg_vol = int(meta.get("averageDailyVolume3Month", 0) or 0)
-            chg_pct = float(meta.get("regularMarketChangePercent", 0) or 0)
-            # Excluir: precio < $0.50, volumen promedio < 300k, o sin precio
-            if price < 0.50 or avg_vol < 300000:
-                candidates.discard(tk)
-                continue
-            LIQUID_FILTER[tk] = {"price": price, "avg_vol": avg_vol, "chg_pct": chg_pct}
-        except:
-            pass  # Si falla el check, dejarlo pasar
-
-    print(f"Options screener: {len(candidates)} candidatos después de filtro de liquidez...")
-
-    # Ordenar candidatos: primero los que tienen mayor movimiento hoy
-    sorted_candidates = sorted(
-        [tk for tk in candidates if tk in LIQUID_FILTER],
-        key=lambda t: abs(LIQUID_FILTER.get(t, {}).get("chg_pct", 0)),
-        reverse=True
-    )
-    # Agregar los que no pasaron el filtro de liquidez al final (watchlist fija)
-    for tk in candidates:
-        if tk not in LIQUID_FILTER and tk not in sorted_candidates:
-            sorted_candidates.append(tk)
-
-    print(f"Options screener: scanning top {min(len(sorted_candidates),40)} candidates for real vol/OI...")
-
-    # Fetch options chain para cada candidato
-    results = []
-    checked = 0
-    for ticker in sorted_candidates[:40]:  # Ampliado a 40 para mayor cobertura
-        opts = get_options_flow_real(ticker)
-        if not opts:
-            continue
-        checked += 1
-
-        best_vol_oi   = opts.get("best_vol_oi", 0)
-        mapped_rel_vol = opts.get("mapped_rel_vol", 1.0)
-        dominant_side  = opts.get("dominant_side", "NEUTRAL")
-        pc_ratio       = opts.get("pc_ratio", 1.0)
-        is_unusual     = opts.get("is_unusual", False)
-
-        # Get stock change % for context
-        try:
-            yq = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-                params={"interval": "1d", "range": "1d"},
-                headers=HEADERS, timeout=6
-            )
-            yq.raise_for_status()
-            meta = yq.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            chg_pct = float(meta.get("regularMarketChangePercent", 0))
-            vol_today = int(meta.get("regularMarketVolume", 0))
-            avg_vol = int(meta.get("averageDailyVolume3Month", 1) or 1)
-            stock_rel_vol = round(vol_today / avg_vol, 2) if avg_vol else 1.0
-        except:
-            chg_pct = 0.0
-            stock_rel_vol = 1.0
-
-        results.append({
-            "ticker":          ticker,
-            "mc_volume":       opts.get("total_call_vol", 0) + opts.get("total_put_vol", 0),
-            "mc_rel_vol":      mapped_rel_vol,      # ← NOW based on REAL vol/OI
-            "mc_chg_pct":      chg_pct,
-            "mc_bullish":      dominant_side == "CALL" or chg_pct >= 0,
-            "source":          "yahoo_options_chain",
-            # Extra options data passed through to scoring
-            "opt_vol_oi":      best_vol_oi,
-            "opt_call_vol_oi": opts.get("best_call_vol_oi", 0),
-            "opt_put_vol_oi":  opts.get("best_put_vol_oi", 0),
-            "opt_atm_call":    opts.get("atm_call_vol_oi", 0),
-            "opt_atm_put":     opts.get("atm_put_vol_oi", 0),
-            "opt_pc_ratio":    pc_ratio,
-            "opt_dominant":    dominant_side,
-            "opt_is_sweep":    opts.get("is_sweep", False),
-            "opt_top_strikes": opts.get("top_strikes", []),
-            "stock_rel_vol":   stock_rel_vol,
-            "is_unusual":      is_unusual,
-        })
-
-    print(f"Options screener: checked {checked}, found {sum(1 for r in results if r['is_unusual'])} unusual")
-
-    # Sort by vol/OI ratio descending — highest = most institutional interest
-    results.sort(key=lambda x: x.get("opt_vol_oi", 0), reverse=True)
-
-    # If nothing unusual found, return all sorted (so at least we have data)
-    return results[:15]
-
-
-def get_market_chameleon_unusual() -> List[Dict[str, Any]]:
-    """
-    Primary: Real options vol/OI from Yahoo Finance options chain.
-    This replaces the broken Unusual Whales + Market Chameleon scrapers.
-    """
-    return get_options_unusual_screener()
-
-
-def get_strong_movers() -> List[Dict[str, Any]]:
-    """
-    Detecta acciones con movimiento de precio fuerte (±4%+) y volumen elevado
-    INDEPENDIENTE del mercado de opciones. Cubre:
-    - Gainers fuertes de Yahoo (day gainers)
-    - Losers fuertes de Yahoo (day losers)
-    - Acciones con volumen relativo > 3x (high volume)
-    Esto complementa el screener de opciones y evita que acciones
-    que no tienen opciones líquidas queden invisibles.
-    """
-    results = []
-    seen = set()
-
-    screener_ids = [
-        ("day_gainers",   True),
-        ("day_losers",    False),
-        ("most_actives",  None),
-    ]
-
-    for scrId, bullish_override in screener_ids:
-        try:
-            r = requests.get(
-                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
-                params={"scrIds": scrId, "count": 30},
-                headers=HEADERS, timeout=10
-            )
-            r.raise_for_status()
-            quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-            for q in quotes:
-                ticker = q.get("symbol", "")
-                if not ticker or len(ticker) > 5 or not ticker.isalpha():
-                    continue
-                if ticker in seen:
-                    continue
-
-                vol     = int(q.get("regularMarketVolume", 0) or 0)
-                avg_vol = int(q.get("averageDailyVolume3Month", 1) or 1)
-                chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
-                price   = float(q.get("regularMarketPrice", 0) or 0)
-                rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
-
-                # Filtro de liquidez mínima — elimina basura y acciones sin movimiento
-                # Precio < $0.50, volumen promedio < 300k → skip
-                if price < 0.50 or avg_vol < 300_000:
-                    continue
-
-                seen.add(ticker)
-
-                # Solo incluir si hay movimiento real O volumen relativo alto
-                if abs(chg_pct) < 2.0 and rel_vol < 2.0:
-                    continue
-
-                if bullish_override is not None:
-                    is_bull = bullish_override
-                else:
-                    is_bull = chg_pct >= 0
-
-                results.append({
-                    "ticker":      ticker,
-                    "mc_volume":   vol,
-                    "mc_rel_vol":  rel_vol,
-                    "mc_chg_pct":  chg_pct,
-                    "mc_bullish":  is_bull,
-                    "source":      f"yahoo_{scrId}",
-                    "price":       price,
-                    # Marcamos que viene de price action, no de opciones
-                    "is_price_mover": True,
-                    "move_strength": (
-                        "FUERTE" if abs(chg_pct) >= 7
-                        else "MODERADO" if abs(chg_pct) >= 4
-                        else "ELEVADO"
-                    ),
-                })
-
-        except Exception as e:
-            print(f"Strong movers screener error ({scrId}): {e}")
-
-    # Ordenar por movimiento absoluto × volumen relativo
-    results.sort(key=lambda x: abs(x["mc_chg_pct"]) * x["mc_rel_vol"], reverse=True)
-    print(f"Strong movers: {len(results)} candidatos detectados")
-    return results[:20]
-
-
-# ══════════════════════════════════════════════════════════════
-# GAMMA SQUEEZE DETECTOR
-# Detecta setups donde el dealer hedging puede amplificar el precio:
-#   - OI concentrado ATM (dealers muy expuestos)
-#   - Vol/OI elevado en calls ATM (nuevas posiciones abriendo)
-#   - Short float alto (combustible para squeeze)
-#   - Precio cerca de strike con mayor OI (max pain inversion)
-# ══════════════════════════════════════════════════════════════
-
-def detect_gamma_squeeze(ticker: str, current_price: float, opts_data: Dict) -> Dict[str, Any]:
-    """
-    Calcula indicadores de Gamma Squeeze a partir de los datos de opciones.
-
-    Un Gamma Squeeze ocurre cuando:
-    1. Hay mucho OI en calls ATM/OTM cercanas
-    2. Los dealers (market makers) tienen que comprar acciones para cubrirse (delta hedge)
-       cuando el precio sube, lo cual EMPUJA el precio más arriba → feedback loop
-    3. El movimiento se amplifica si hay short interest alto
-
-    Retorna señal GAMMA_SQUEEZE con score 0-10 y explicación.
-    """
-    result = {
-        "gamma_score":      0,
-        "gamma_signal":     "NONE",
-        "gamma_triggers":   [],
-        "gamma_call_wall":  None,   # Strike con mayor OI de calls (resistencia/imán)
-        "gamma_put_wall":   None,   # Strike con mayor OI de puts (soporte/imán)
-        "gamma_max_pain":   None,   # Precio donde más opciones expiran sin valor
-        "atm_oi_ratio":     None,   # OI ATM calls vs total OI calls (concentración)
-        "dealer_pressure":  "NEUTRAL",
-    }
-
-    if not opts_data or not current_price:
-        return result
-
-    try:
-        # Necesitamos la cadena completa con OI por strike
-        r = requests.get(
-            f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
-            headers=HEADERS, timeout=12
-        )
-        r.raise_for_status()
-        data = r.json()
-        chain_result = data.get("optionChain", {}).get("result", [])
-        if not chain_result:
-            return result
-
-        dates = chain_result[0].get("expirationDates", [])
-        if not dates:
-            return result
-
-        # Analizar la expiración más cercana (mayor gamma)
-        r2 = requests.get(
-            f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
-            params={"date": dates[0]},
-            headers=HEADERS, timeout=12
-        )
-        r2.raise_for_status()
-        res2 = r2.json().get("optionChain", {}).get("result", [])
-        if not res2:
-            return result
-
-        calls = res2[0].get("options", [{}])[0].get("calls", [])
-        puts  = res2[0].get("options", [{}])[0].get("puts",  [])
-
-        if not calls and not puts:
-            return result
-
-        # ── 1. CALL WALL y PUT WALL (strikes con mayor OI) ────
-        call_oi_by_strike = {}
-        for c in calls:
-            strike = float(c.get("strike", 0) or 0)
-            oi     = int(c.get("openInterest", 0) or 0)
-            vol    = int(c.get("volume", 0) or 0)
-            if strike > 0:
-                call_oi_by_strike[strike] = {"oi": oi, "vol": vol}
-
-        put_oi_by_strike = {}
-        for p in puts:
-            strike = float(p.get("strike", 0) or 0)
-            oi     = int(p.get("openInterest", 0) or 0)
-            vol    = int(p.get("volume", 0) or 0)
-            if strike > 0:
-                put_oi_by_strike[strike] = {"oi": oi, "vol": vol}
-
-        if call_oi_by_strike:
-            call_wall = max(call_oi_by_strike, key=lambda s: call_oi_by_strike[s]["oi"])
-            result["gamma_call_wall"] = call_wall
-        if put_oi_by_strike:
-            put_wall  = max(put_oi_by_strike, key=lambda s: put_oi_by_strike[s]["oi"])
-            result["gamma_put_wall"] = put_wall
-
-        # ── 2. MAX PAIN — precio donde mayor valor de opciones expira sin valor ──
-        all_strikes = sorted(set(list(call_oi_by_strike.keys()) + list(put_oi_by_strike.keys())))
-        if all_strikes:
-            min_pain = None
-            max_pain_strike = None
-            for test_price in all_strikes:
-                call_pain = sum(
-                    max(0, test_price - s) * d["oi"]
-                    for s, d in call_oi_by_strike.items()
-                )
-                put_pain = sum(
-                    max(0, s - test_price) * d["oi"]
-                    for s, d in put_oi_by_strike.items()
-                )
-                total_pain = call_pain + put_pain
-                if min_pain is None or total_pain < min_pain:
-                    min_pain = total_pain
-                    max_pain_strike = test_price
-            result["gamma_max_pain"] = max_pain_strike
-
-        # ── 3. OI CONCENTRACIÓN ATM (±5% del precio actual) ──
-        atm_lo = current_price * 0.95
-        atm_hi = current_price * 1.05
-
-        atm_call_oi  = sum(d["oi"] for s, d in call_oi_by_strike.items() if atm_lo <= s <= atm_hi)
-        atm_call_vol = sum(d["vol"] for s, d in call_oi_by_strike.items() if atm_lo <= s <= atm_hi)
-        total_call_oi = sum(d["oi"] for d in call_oi_by_strike.values())
-
-        if total_call_oi > 0:
-            atm_concentration = round(atm_call_oi / total_call_oi, 3)
-            result["atm_oi_ratio"] = atm_concentration
-        else:
-            atm_concentration = 0
-
-        # ── 4. SCORING DE GAMMA SQUEEZE ───────────────────────
-        gamma_score = 0
-        triggers = []
-
-        # A. Precio acercándose a call wall desde abajo (dealer hedging pressure)
-        cw = result["gamma_call_wall"]
-        if cw and current_price < cw <= current_price * 1.08:
-            gamma_score += 3
-            dist_pct = round((cw - current_price) / current_price * 100, 1)
-            triggers.append(f"🎯 Call Wall ${cw:.0f} a solo {dist_pct}% arriba — dealers deben comprar si precio sube")
-
-        # B. Alta concentración de OI ATM (más gamma exposure)
-        if atm_concentration >= 0.4:
-            gamma_score += 2
-            triggers.append(f"🔥 {atm_concentration*100:.0f}% del OI de calls concentrado ATM — gamma máximo")
-        elif atm_concentration >= 0.25:
-            gamma_score += 1
-            triggers.append(f"⚡ {atm_concentration*100:.0f}% OI calls ATM — gamma moderado")
-
-        # C. Vol/OI calls ATM muy elevado (flujo nuevo abriendo posiciones)
-        atm_call_vol_oi = round(atm_call_vol / atm_call_oi, 2) if atm_call_oi > 100 else 0
-        if atm_call_vol_oi >= 3.0:
-            gamma_score += 3
-            triggers.append(f"🚨 Vol/OI calls ATM {atm_call_vol_oi:.1f}x — acumulación masiva cerca del precio")
-        elif atm_call_vol_oi >= 1.5:
-            gamma_score += 2
-            triggers.append(f"⚡ Vol/OI calls ATM {atm_call_vol_oi:.1f}x — flujo inusual ATM")
-
-        # D. Precio por encima de Max Pain (dealers ya en modo hedging alcista)
-        mp = result["gamma_max_pain"]
-        if mp and current_price > mp * 1.03:
-            gamma_score += 2
-            triggers.append(f"📈 Precio ${current_price:.2f} sobre Max Pain ${mp:.0f} — dealers forzados a cubrir calls")
-
-        # E. Precio entre put wall y call wall (zona de squeeze comprimida)
-        pw = result["gamma_put_wall"]
-        if cw and pw and pw < current_price < cw:
-            if (cw - pw) / current_price <= 0.10:
-                gamma_score += 1
-                triggers.append(f"📊 Comprimido entre Put Wall ${pw:.0f} y Call Wall ${cw:.0f} — rompimiento explosivo posible")
-
-        # Señal final
-        result["gamma_score"]   = min(gamma_score, 10)
-        result["gamma_triggers"] = triggers
-
-        if gamma_score >= 7:
-            result["gamma_signal"]    = "🚨 GAMMA SQUEEZE INMINENTE"
-            result["dealer_pressure"] = "COMPRA_FORZADA"
-        elif gamma_score >= 5:
-            result["gamma_signal"]    = "⚡ GAMMA SQUEEZE POSIBLE"
-            result["dealer_pressure"] = "COMPRA_ELEVADA"
-        elif gamma_score >= 3:
-            result["gamma_signal"]    = "📌 PRESIÓN GAMMA MODERADA"
-            result["dealer_pressure"] = "NEUTRAL_ALCISTA"
-        else:
-            result["gamma_signal"]    = "NONE"
-            result["dealer_pressure"] = "NEUTRAL"
-
-    except Exception as e:
-        print(f"Gamma squeeze detector error {ticker}: {e}")
-
-    return result
-
-
-def get_yahoo_most_active() -> List[Dict[str, Any]]:
-    """Get most active stocks from Yahoo Finance screener."""
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
-            params={"scrIds": "most_actives", "count": 25},
-            headers=HEADERS,
-            timeout=10
-        )
-        r.raise_for_status()
-        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        results = []
-        for q in quotes:
-            ticker = q.get("symbol", "")
-            if not ticker or len(ticker) > 6:
-                continue
-            vol = int(q.get("regularMarketVolume", 0))
-            avg = int(q.get("averageDailyVolume3Month", 1))
-            rel = round(vol / avg, 2) if avg > 0 else 1.0
-            chg = float(q.get("regularMarketChangePercent", 0))
-            results.append({
-                "ticker":     ticker,
-                "mc_volume":  vol,
-                "mc_rel_vol": rel,
-                "mc_chg_pct": chg,
-                "mc_bullish": chg >= 0,
-                "source":     "yahoo_most_active",
-            })
-        results.sort(key=lambda x: x.get("mc_rel_vol", 0), reverse=True)
-        print(f"Yahoo most active: {len(results)} tickers")
-        return results[:15]
-    except Exception as e:
-        print(f"Yahoo most active error: {e}")
-        return []
-
-def get_yahoo_trending() -> List[Dict[str, Any]]:
-    """Get trending tickers from Yahoo Finance."""
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v1/finance/trending/US",
-            params={"count": 20},
-            headers=HEADERS,
-            timeout=10
-        )
-        r.raise_for_status()
-        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        results = []
-        seen = set()
-        for q in quotes:
-            ticker = q.get("symbol", "")
-            if not ticker or len(ticker) > 6 or ticker in seen:
-                continue
-            seen.add(ticker)
-            results.append({
-                "ticker":     ticker,
-                "mc_volume":  0,
-                "mc_rel_vol": 2.0,
-                "mc_chg_pct": 0,
-                "mc_bullish": True,
-                "source":     "yahoo_trending",
-            })
-        print(f"Yahoo trending: {len(results)} tickers")
-        return results[:15]
-    except Exception as e:
-        print(f"Yahoo trending error: {e}")
-        return []
-
-
-def get_yahoo_screener_extra() -> List[Dict[str, Any]]:
-    """
-    Fuentes adicionales de Yahoo que capturan acciones que los screeners
-    normales no detectan:
-    - small_cap_gainers: IPOs recientes y small caps en movimiento (CRCL, CIFR, etc.)
-    - aggressive_small_caps: alta volatilidad
-    - undervalued_growth: acciones con momentum de crecimiento
-    Esto soluciona que IPOs recientes como CRCL no aparezcan.
-    """
-    results = []
-    seen = set()
-
-    screener_ids = [
-        "small_cap_gainers",
-        "growth_technology_stocks",
-        "day_gainers",          # refuerzo — a veces no llega desde get_strong_movers
-        "most_actives",         # refuerzo
-    ]
-
-    for scrId in screener_ids:
-        try:
-            r = requests.get(
-                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
-                params={"scrIds": scrId, "count": 25},
-                headers=HEADERS, timeout=10
-            )
-            r.raise_for_status()
-            quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-            for q in quotes:
-                ticker = q.get("symbol", "")
-                if not ticker or len(ticker) > 6 or ticker in seen:
-                    continue
-                # Permitir tickers con punto solo si son bien conocidos
-                if "." in ticker and ticker not in ("BRK.B","BRK.A"):
-                    continue
-
-                vol     = int(q.get("regularMarketVolume", 0) or 0)
-                avg_vol = int(q.get("averageDailyVolume3Month", 1) or 1)
-                chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
-                price   = float(q.get("regularMarketPrice", 0) or 0)
-                rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
-
-                # Mínimo: precio >= $0.50 y algo de movimiento o volumen
-                if price < 0.50:
-                    continue
-                # Para small_cap_gainers aceptar cualquier movimiento positivo
-                if abs(chg_pct) < 1.0 and rel_vol < 1.5:
-                    continue
-
-                seen.add(ticker)
-                results.append({
-                    "ticker":         ticker,
-                    "mc_volume":      vol,
-                    "mc_rel_vol":     rel_vol,
-                    "mc_chg_pct":     chg_pct,
-                    "mc_bullish":     chg_pct >= 0,
-                    "source":         f"yahoo_{scrId}",
-                    "is_price_mover": True,
-                    "move_strength": (
-                        "FUERTE"  if abs(chg_pct) >= 7
-                        else "MODERADO" if abs(chg_pct) >= 4
-                        else "ELEVADO"
-                    ),
-                })
-        except Exception as e:
-            print(f"Yahoo screener extra ({scrId}) error: {e}")
-
-    # Ordenar por movimiento * volumen relativo
-    results.sort(key=lambda x: abs(x["mc_chg_pct"]) * x["mc_rel_vol"], reverse=True)
-    print(f"Yahoo screener extra: {len(results)} candidatos")
-    return results[:20]
-
-
 def get_market_pulse() -> Dict[str, Any]:
-    """Get SPY, QQQ, IWM, VIX to determine market sentiment."""
+    """SPY, QQQ, IWM, VIX — sentimiento general del mercado."""
     pulse = {}
-    for sym in ['SPY', 'QQQ', 'IWM', '^VIX']:
-        data = get_yahoo(sym)
-        if data:
-            key = 'VIX' if sym == '^VIX' else sym
+    for sym in ["SPY", "QQQ", "IWM", "^VIX"]:
+        try:
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                params={"interval": "1d", "range": "1d"},
+                headers=HEADERS, timeout=8
+            )
+            r.raise_for_status()
+            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            key  = "VIX" if sym == "^VIX" else sym
             pulse[key] = {
-                "price":      data.get("price", 0),
-                "change_pct": data.get("change_pct", 0),
-                "volume":     data.get("volume", 0),
-                "rel_volume": data.get("rel_volume", 1.0),
+                "price":      round(float(meta.get("regularMarketPrice") or 0), 2),
+                "change_pct": round(float(meta.get("regularMarketChangePercent") or 0), 2),
             }
+        except:
+            pass
 
-    # Determine overall sentiment
-    spy_chg  = pulse.get("SPY", {}).get("change_pct", 0)
-    qqq_chg  = pulse.get("QQQ", {}).get("change_pct", 0)
-    iwm_chg  = pulse.get("IWM", {}).get("change_pct", 0)
-    vix_chg  = pulse.get("VIX", {}).get("change_pct", 0)
-    vix_price= pulse.get("VIX", {}).get("price", 0)
-    if not vix_price:
-        vix_data = get_yahoo("^VIX")
-        vix_price = vix_data.get("price", 20)
-        pulse["VIX"] = vix_data
+    spy = pulse.get("SPY", {}).get("change_pct", 0)
+    qqq = pulse.get("QQQ", {}).get("change_pct", 0)
+    iwm = pulse.get("IWM", {}).get("change_pct", 0)
+    vix = pulse.get("VIX", {}).get("price", 20)
+    avg = (spy + qqq + iwm) / 3
 
-    avg_market = (spy_chg + qqq_chg + iwm_chg) / 3
-    if vix_price >= 30:
-        sentiment = "MUY_VOLATIL"
-        emoji     = "⚡"
-        color     = "red"
-    elif avg_market >= 0.5:
-        sentiment = "ALCISTA"
-        emoji     = "📈"
-        color     = "green"
-    elif avg_market <= -0.5:
-        sentiment = "BAJISTA"
-        emoji     = "📉"
-        color     = "red"
+    if vix >= 30:
+        sentiment, emoji = "MUY_VOLATIL", "⚡"
+    elif avg >= 0.5:
+        sentiment, emoji = "ALCISTA", "📈"
+    elif avg <= -0.5:
+        sentiment, emoji = "BAJISTA", "📉"
     else:
-        sentiment = "NEUTRAL"
-        emoji     = "➡️"
-        color     = "yellow"
+        sentiment, emoji = "NEUTRAL", "➡️"
 
-    pulse["sentiment"]  = sentiment
-    pulse["emoji"]      = emoji
-    pulse["color"]      = color
-    pulse["avg_change"] = round(avg_market, 2)
-    pulse["vix_price"]  = vix_price
-    pulse["vix_risk"]   = "ALTO" if vix_price >= 25 else "MODERADO" if vix_price >= 18 else "BAJO"
-
+    pulse.update({
+        "sentiment": sentiment, "emoji": emoji,
+        "avg_change": round(avg, 2), "vix_price": vix,
+        "vix_risk": "ALTO" if vix >= 25 else "MODERADO" if vix >= 18 else "BAJO",
+    })
     return pulse
 
 
 # ══════════════════════════════════════════════════════════════
-# SCORING
+# CAPA 2: DESCUBRIMIENTO DE CANDIDATOS
+# Una sola función — múltiples screeners de Yahoo, sin watchlist
+# ══════════════════════════════════════════════════════════════
+
+def discover_candidates() -> List[Dict[str, Any]]:
+    """
+    Descubre candidatos SOLO desde screeners de mercado en vivo.
+    Sin watchlists, sin listas hardcodeadas.
+    Screeners usados:
+      - most_actives       → mayor volumen absoluto
+      - day_gainers        → mayores subidas del día
+      - day_losers         → mayores caídas del día
+      - small_cap_gainers  → small caps e IPOs recientes en movimiento
+      + Yahoo trending     → lo que la gente está buscando
+    """
+    candidates: Dict[str, Dict] = {}  # ticker → datos
+
+    SCREENERS = [
+        ("most_actives",      40),
+        ("day_gainers",       30),
+        ("day_losers",        30),
+        ("small_cap_gainers", 25),
+    ]
+
+    for scrId, count in SCREENERS:
+        try:
+            r = requests.get(
+                "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                params={"scrIds": scrId, "count": count},
+                headers=HEADERS, timeout=10
+            )
+            r.raise_for_status()
+            quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+
+            for q in quotes:
+                tk = q.get("symbol", "")
+                if not tk or tk in EXCLUDE_ALWAYS:
+                    continue
+                if len(tk) > 6 or "." in tk:
+                    continue
+                if tk in candidates:
+                    continue  # ya lo tenemos
+
+                price   = float(q.get("regularMarketPrice", 0) or 0)
+                avg_vol = int(q.get("averageDailyVolume3Month", 1) or 1)
+                vol     = int(q.get("regularMarketVolume", 0) or 0)
+                chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
+                rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+                # Filtro mínimo de liquidez: evita penny stocks sin volumen
+                if price < 0.50 or avg_vol < 200_000:
+                    continue
+
+                candidates[tk] = {
+                    "ticker":     tk,
+                    "price":      price,
+                    "chg_pct":    chg_pct,
+                    "rel_vol":    rel_vol,
+                    "avg_vol":    avg_vol,
+                    "source":     scrId,
+                }
+
+            print(f"discover [{scrId}]: {len(candidates)} candidatos acumulados")
+        except Exception as e:
+            print(f"discover [{scrId}] error: {e}")
+
+    # Trending Yahoo (no trae precio — solo añadir si no está ya)
+    try:
+        r2 = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/trending/US",
+            params={"count": 20}, headers=HEADERS, timeout=10
+        )
+        r2.raise_for_status()
+        for q in r2.json().get("finance", {}).get("result", [{}])[0].get("quotes", []):
+            tk = q.get("symbol", "")
+            if tk and tk not in EXCLUDE_ALWAYS and tk not in candidates and len(tk) <= 6 and "." not in tk:
+                candidates[tk] = {"ticker": tk, "price": 0, "chg_pct": 0, "rel_vol": 1.0, "source": "trending"}
+        print(f"discover [trending]: {len(candidates)} candidatos total")
+    except Exception as e:
+        print(f"discover [trending] error: {e}")
+
+    # Ordenar: mayor (|cambio%| × rel_vol) primero — los que más se mueven hoy
+    ranked = sorted(
+        candidates.values(),
+        key=lambda x: abs(x.get("chg_pct", 0)) * max(x.get("rel_vol", 1.0), 1.0),
+        reverse=True
+    )
+
+    return ranked
+
+
+# ══════════════════════════════════════════════════════════════
+# CAPA 3: SCORING — DETECCIÓN DE ENTRADAS
+#
+# Filosofía: detectar setups donde la probabilidad de movimiento
+# direccional está por encima del azar, con R/R favorable.
+#
+# Las señales se agrupan en 4 categorías:
+#   A. FLUJO INSTITUCIONAL  — el dinero grande ya está posicionado
+#   B. CATALIZADOR          — razón fundamental para el movimiento
+#   C. MOMENTUM TÉCNICO     — el precio confirma la dirección
+#   D. TIMING DE ENTRADA    — ¿es buen momento para entrar AHORA?
+#
+# Cada categoría aporta hasta 2.5 pts → máximo teórico 10.0
+# VERDE ≥ 7.0 | AMARILLO ≥ 4.5 | ROJO < 4.5
 # ══════════════════════════════════════════════════════════════
 
 def compute_score(
-    ticker: str,
-    yahoo: Dict,
-    finviz: Dict,
-    st: Dict,
-    market: Dict,
+    ticker:  str,
+    price:   Dict,   # get_price_data
+    fund:    Dict,   # get_fundamentals
+    opts:    Dict,   # get_options_data
+    news:    Dict,   # get_news_score
+    sent:    Dict,   # get_sentiment
+    market:  Dict,   # get_market_pulse
     alert_context: str = "",
-    mc_data: Dict = None,
-    catalyst: Dict = None,
-    gamma: Dict = None,
 ) -> Dict[str, Any]:
 
-    price     = yahoo.get("price", 0)
-    chg_pct   = yahoo.get("change_pct", 0)
-    rel_vol   = yahoo.get("rel_volume", 1.0)
-    volume    = yahoo.get("volume", 0)
+    # ── Datos base ────────────────────────────────────────────
+    current_price = price.get("price", 0)
+    chg_pct       = price.get("change_pct", 0)
+    rel_vol       = price.get("rel_volume", 1.0)
+    rsi           = price.get("rsi", 50.0)
+    above_sma20   = price.get("above_sma20", False)
+    above_sma50   = price.get("above_sma50", False)
+    above_sma200  = price.get("above_sma200", False)
+    vwap          = price.get("vwap", current_price)
+    precio_vs_vwap= price.get("precio_vs_vwap", 0)
+    day_range_pos = price.get("day_range_pos", 0.5)
+    atr           = price.get("atr", 0)
 
-    # ── CATALYST DATA ─────────────────────────────────────────
-    cat_score    = catalyst.get("catalyst_score", 0) if catalyst else 0
-    cat_signal   = catalyst.get("catalyst_signal", "NONE") if catalyst else "NONE"
-    cat_analyst  = catalyst.get("analyst_action") if catalyst else None
-    cat_earn_days = catalyst.get("earnings_days") if catalyst else None
-    cat_earn_alert = catalyst.get("earnings_alert", False) if catalyst else False
-    cat_news_score = catalyst.get("top_news_score", 0) if catalyst else 0
-    cat_news_title = catalyst.get("top_news_title") if catalyst else None
-    cat_found    = catalyst.get("catalysts_found", []) if catalyst else []
-    has_catalyst = cat_score >= 2
+    short_pct     = fund.get("short_pct", 0.0)
+    beta          = fund.get("beta", 1.0)
+    earn_days     = fund.get("earnings_days")
+    analyst_type  = fund.get("analyst_action_type")
 
-    # ── REAL OPTIONS DATA (new) ───────────────────────────────
-    opt_vol_oi      = mc_data.get("opt_vol_oi", 0) if mc_data else 0
-    opt_call_vol_oi = mc_data.get("opt_call_vol_oi", 0) if mc_data else 0
-    opt_put_vol_oi  = mc_data.get("opt_put_vol_oi", 0) if mc_data else 0
-    opt_atm_call    = mc_data.get("opt_atm_call", 0) if mc_data else 0
-    opt_atm_put     = mc_data.get("opt_atm_put", 0) if mc_data else 0
-    opt_pc_ratio    = mc_data.get("opt_pc_ratio", 1.0) if mc_data else 1.0
-    opt_dominant    = mc_data.get("opt_dominant", "NEUTRAL") if mc_data else "NEUTRAL"
-    opt_is_sweep    = mc_data.get("opt_is_sweep", False) if mc_data else False
-    has_real_opts   = opt_vol_oi > 0
+    has_opts      = opts.get("has_options", False)
+    vol_oi        = opts.get("vol_oi", 0.0)
+    atm_cv        = opts.get("atm_call_vol_oi", 0.0)
+    atm_pv        = opts.get("atm_put_vol_oi", 0.0)
+    pc_ratio      = opts.get("pc_ratio", 1.0)
+    dominant      = opts.get("dominant", "NEUTRAL")
+    is_sweep      = opts.get("is_sweep", False)
+    gamma_score   = opts.get("gamma_score", 0)
 
-    # Override rel_vol — priority: real options vol/OI > stock rel_vol
-    fv_rv = finviz.get("rel_volume", "")
-    if fv_rv and fv_rv not in ("-", "N/A"):
-        try:
-            rel_vol = float(fv_rv)
-        except:
-            pass
-    if mc_data and mc_data.get("mc_rel_vol", 0) > rel_vol:
-        rel_vol = mc_data["mc_rel_vol"]  # Already mapped from real vol/OI
+    news_score    = news.get("score", 0)
+    news_age      = news.get("age_hours")
 
-    # MA percentages from Finviz
-    sma20_pct  = finviz.get("sma20_pct", "")
-    sma50_pct  = finviz.get("sma50_pct", "")
-    sma200_pct = finviz.get("sma200_pct", "")
+    mkt_sent      = market.get("sentiment", "NEUTRAL")
+    has_alert     = bool(alert_context and len(alert_context.strip()) > 5)
+    abs_chg       = abs(chg_pct)
 
-    def pct_val(s):
-        try:
-            return float(str(s).replace('%','').strip())
-        except:
-            return None
-
-    sma20v  = pct_val(sma20_pct)
-    sma50v  = pct_val(sma50_pct)
-    sma200v = pct_val(sma200_pct)
-
-    above_sma20  = sma20v  is not None and not str(sma20_pct).startswith('-')
-    above_sma50  = sma50v  is not None and not str(sma50_pct).startswith('-')
-    above_sma200 = sma200v is not None and not str(sma200_pct).startswith('-')
-
-    # RSI
-    try:
-        rsi_val = float(finviz.get("rsi14") or 50)
-    except:
-        rsi_val = 50.0
-
-    # Short float
-    try:
-        short_pct = float(str(finviz.get("short_float","0")).replace("%","").strip())
-    except:
-        short_pct = 0.0
-
-    # Has news
-    has_news  = len(finviz.get("news", [])) > 0
-    has_alert = bool(alert_context and len(alert_context.strip()) > 5)
-    has_earn  = bool(finviz.get("earnings_date","") not in ("","N/A","-"))
-
-    # Market sentiment modifier
-    mkt_sentiment = market.get("sentiment", "NEUTRAL")
-    mkt_modifier  = 0.5 if mkt_sentiment == "ALCISTA" else -0.3 if mkt_sentiment == "BAJISTA" else 0.0
-
-    # Direction — real options dominant side takes priority
-    if has_real_opts and opt_dominant in ("CALL", "PUT"):
-        direction = opt_dominant
-    elif has_alert and "put" in alert_context.lower():
-        direction = "PUT"
-    elif has_alert and "call" in alert_context.lower():
-        direction = "CALL"
+    # ── DIRECCIÓN — cuál lado tiene más evidencia ─────────────
+    # Prioridad: alert > opciones institucionales > precio
+    if has_alert:
+        if "put" in alert_context.lower():
+            direction = "PUT"
+        elif "call" in alert_context.lower():
+            direction = "CALL"
+        else:
+            direction = "CALL" if chg_pct >= 0 else "PUT"
+    elif has_opts and dominant != "NEUTRAL":
+        direction = dominant
     elif chg_pct >= 0:
         direction = "CALL"
     else:
         direction = "PUT"
 
-    # ── V1 CATALIZADOR (max 3.0) ──────────────────────────────
-    # Priority: manual alert > sweep > catalyst detector > options flow > news
-    if has_alert:
-        pts_catalyst = 2.5
-    elif opt_is_sweep:
-        pts_catalyst = 2.8  # institutional sweep = strongest signal
-    elif cat_earn_alert:
-        pts_catalyst = 2.8  # earnings today/tomorrow = high volatility
-    elif cat_score >= 6:
-        pts_catalyst = 2.5  # strong catalyst (upgrade + news + proximity)
-    elif cat_score >= 4:
-        pts_catalyst = 2.2  # moderate catalyst
-    elif has_real_opts and opt_vol_oi >= 3.0:
-        pts_catalyst = 2.3  # very unusual options flow
-    elif has_real_opts and opt_vol_oi >= 1.5:
-        pts_catalyst = 2.0  # unusual options flow
-    elif cat_score >= 2:
-        pts_catalyst = 1.8  # light catalyst (upgrade or news)
-    elif has_earn:
-        pts_catalyst = 1.5
-    elif has_news:
-        pts_catalyst = 1.2
-    elif mc_data:
-        pts_catalyst = 0.8
-    else:
-        pts_catalyst = 0.3
+    is_bull = direction == "CALL"
 
-    # ── V2 VOLUMEN INUSUAL (max 2.5) — real vol/OI when available ───
-    if has_real_opts:
-        if opt_vol_oi >= 10.0:
-            pts_vol = 2.5
-        elif opt_vol_oi >= 5.0:
-            pts_vol = 2.3
-        elif opt_vol_oi >= 3.0:
-            pts_vol = 2.0
-        elif opt_vol_oi >= 1.5:
-            pts_vol = 1.6
-        elif opt_vol_oi >= 0.8:
-            pts_vol = 1.0
-        else:
-            pts_vol = 0.4
-        if direction == "CALL" and opt_atm_call >= 2.0:
-            pts_vol = min(pts_vol + 0.3, 2.5)
-        elif direction == "PUT" and opt_atm_put >= 2.0:
-            pts_vol = min(pts_vol + 0.3, 2.5)
+    # ════════════════════════════════════════════════════════
+    # A. FLUJO INSTITUCIONAL (max 2.5)
+    # El dinero inteligente deja huella en opciones antes de moverse
+    # ════════════════════════════════════════════════════════
+    if has_alert and is_sweep:
+        pts_A = 2.5  # alerta confirmada por sweep = máxima confianza
+    elif is_sweep:
+        pts_A = 2.4  # sweep institucional sin alerta
+    elif has_alert:
+        pts_A = 2.0  # alerta manual (Discord/Telegram)
+    elif has_opts and vol_oi >= 5.0:
+        pts_A = 2.2  # flujo muy inusual
+    elif has_opts and vol_oi >= 3.0:
+        pts_A = 2.0
+    elif has_opts and vol_oi >= 1.5:
+        pts_A = 1.6
+    elif has_opts and vol_oi >= 0.8:
+        pts_A = 1.0
+    elif has_opts:
+        pts_A = 0.6  # tiene opciones pero flujo normal
     else:
-        if rel_vol >= 10:
-            pts_vol = 2.5
-        elif rel_vol >= 5:
-            pts_vol = 2.3
+        pts_A = 0.2  # sin datos de opciones
+
+    # Bonus: flujo ATM confirma dirección (más específico que flujo general)
+    atm_bonus = 0.0
+    if is_bull and atm_cv >= 2.0:
+        atm_bonus = 0.3
+    elif not is_bull and atm_pv >= 2.0:
+        atm_bonus = 0.3
+    pts_A = min(pts_A + atm_bonus, 2.5)
+
+    # Bonus: gamma squeeze potencia el movimiento
+    if gamma_score >= 7:
+        pts_A = min(pts_A + 0.4, 2.5)
+    elif gamma_score >= 5:
+        pts_A = min(pts_A + 0.2, 2.5)
+
+    # ════════════════════════════════════════════════════════
+    # B. CATALIZADOR (max 2.5)
+    # ¿Por qué se va a mover? Sin razón, el movimiento no dura
+    # ════════════════════════════════════════════════════════
+    pts_B = 0.0
+
+    # Earnings próximos — máxima volatilidad garantizada
+    if earn_days is not None:
+        if 0 <= earn_days <= 1:
+            pts_B = 2.5   # earnings HOY o MAÑANA
+        elif earn_days <= 3:
+            pts_B = 2.2
+        elif earn_days <= 7:
+            pts_B = 1.8
+        elif earn_days <= 14:
+            pts_B = 1.2
+
+    # Noticia de alto impacto reciente
+    if news_score >= 4 and (news_age or 999) <= 6:
+        pts_B = max(pts_B, 2.3)   # noticia muy fuerte y fresca
+    elif news_score >= 3 and (news_age or 999) <= 12:
+        pts_B = max(pts_B, 2.0)
+    elif news_score >= 2 and (news_age or 999) <= 24:
+        pts_B = max(pts_B, 1.6)
+    elif news_score >= 1:
+        pts_B = max(pts_B, 1.2)
+    elif news_score <= -3:
+        pts_B = max(pts_B, 1.8)   # noticia negativa fuerte también es catalizador (PUT)
+
+    # Analyst upgrade/downgrade reciente
+    if analyst_type in ("up", "upgrade", "init", "initiated"):
+        pts_B = max(pts_B, 1.8)
+    elif analyst_type in ("down", "downgrade"):
+        pts_B = max(pts_B, 1.5)
+    elif analyst_type in ("main", "reit", "reiterate"):
+        pts_B = max(pts_B, 1.2)
+
+    # Volumen inusual sin opciones = algo está pasando aunque no sepamos qué
+    if pts_B == 0:
+        if rel_vol >= 5:
+            pts_B = 1.5   # volumen 5x sin noticia obvia = acumulación silenciosa
         elif rel_vol >= 3:
-            pts_vol = 2.0
+            pts_B = 1.0
         elif rel_vol >= 2:
-            pts_vol = 1.5
-        elif rel_vol >= 1.5:
-            pts_vol = 1.0
-        elif rel_vol >= 1.2:
-            pts_vol = 0.6
+            pts_B = 0.6
         else:
-            pts_vol = 0.2
+            pts_B = 0.2
 
-    # ── V3 MOMENTUM TECNICO (max 2.0) ────────────────────────
-    if direction == "CALL":
-        if above_sma20 and above_sma50 and rel_vol >= 1.5:
-            pts_mom = 2.0
-        elif above_sma50 and rel_vol >= 1.2:
-            pts_mom = 1.4
+    pts_B = min(pts_B, 2.5)
+
+    # ════════════════════════════════════════════════════════
+    # C. MOMENTUM TÉCNICO (max 2.5)
+    # El precio debe confirmar la dirección — no entrar contra tendencia
+    # ════════════════════════════════════════════════════════
+    pts_C = 0.0
+
+    if is_bull:
+        # Estructura alcista progresiva
+        if above_sma20 and above_sma50 and above_sma200:
+            pts_C = 2.0   # tendencia alcista en todos los marcos
+        elif above_sma20 and above_sma50:
+            pts_C = 1.6
         elif above_sma50:
-            pts_mom = 1.0
-        elif chg_pct > 1:
-            pts_mom = 0.6
+            pts_C = 1.2
+        elif above_sma20:
+            pts_C = 0.8
+        elif chg_pct > 2:
+            pts_C = 0.6   # subiendo con fuerza aunque esté bajo MAs
         else:
-            pts_mom = 0.0
-    else:  # PUT
-        if not above_sma20 and not above_sma50 and rel_vol >= 1.5:
-            pts_mom = 2.0
+            pts_C = 0.2
+
+        # Bonus: volumen confirma el movimiento alcista
+        if rel_vol >= 3 and chg_pct > 1:
+            pts_C = min(pts_C + 0.4, 2.5)
+        elif rel_vol >= 2 and chg_pct > 0.5:
+            pts_C = min(pts_C + 0.2, 2.5)
+
+        # Bonus: short squeeze fuel
+        if short_pct >= 20:
+            pts_C = min(pts_C + 0.3, 2.5)
+        elif short_pct >= 15:
+            pts_C = min(pts_C + 0.2, 2.5)
+
+    else:  # PUT / bajista
+        if not above_sma20 and not above_sma50 and not above_sma200:
+            pts_C = 2.0
+        elif not above_sma20 and not above_sma50:
+            pts_C = 1.6
         elif not above_sma50:
-            pts_mom = 1.2
-        elif chg_pct < -1:
-            pts_mom = 0.8
+            pts_C = 1.2
+        elif not above_sma20:
+            pts_C = 0.8
+        elif chg_pct < -2:
+            pts_C = 0.6
         else:
-            pts_mom = 0.3
+            pts_C = 0.2
 
-    # ── V4 SECTOR/MACRO (max 1.5) ────────────────────────────
-    if above_sma200:
-        pts_sector = 1.5 if mkt_sentiment == "ALCISTA" else 1.0
-    elif mkt_sentiment == "BAJISTA":
-        pts_sector = 0.2
-    else:
-        pts_sector = 0.6
+        if rel_vol >= 3 and chg_pct < -1:
+            pts_C = min(pts_C + 0.4, 2.5)
+        elif rel_vol >= 2 and chg_pct < -0.5:
+            pts_C = min(pts_C + 0.2, 2.5)
 
-    # ── V5 SHORT/SQUEEZE (max 1.0) ───────────────────────────
-    if short_pct >= 20:
-        pts_short = 1.0
-    elif short_pct >= 10:
-        pts_short = 0.6
-    elif short_pct >= 5:
-        pts_short = 0.3
-    else:
-        pts_short = 0.1
+    # Mercado general — viento a favor o en contra
+    mkt_mod = 0.3 if mkt_sent == "ALCISTA" and is_bull else \
+              0.3 if mkt_sent == "BAJISTA" and not is_bull else \
+             -0.3 if mkt_sent == "BAJISTA" and is_bull else \
+             -0.3 if mkt_sent == "ALCISTA" and not is_bull else 0.0
+    pts_C = min(max(pts_C + mkt_mod, 0), 2.5)
 
-    # RSI moderate penalty
-    rsi_penalty = 0.0
-    if rsi_val >= 78:
-        rsi_penalty = -0.5
-    elif rsi_val <= 22:
-        rsi_penalty = -0.3
+    # ════════════════════════════════════════════════════════
+    # D. TIMING DE ENTRADA (max 2.5)
+    # ¿Es buen momento para entrar AHORA? R/R y setup limpio
+    # ════════════════════════════════════════════════════════
+    pts_D = 1.0  # base neutral
 
-    # Penalty for extreme same-day move - risk/reward already changed
-    move_penalty = 0.0
-    abs_chg = abs(chg_pct)
+    # RSI — sobrecomprado/sobrevendido penaliza el timing
+    if rsi >= 80 and is_bull:
+        pts_D -= 0.8   # muy sobrecomprado, prima de opciones inflada
+    elif rsi >= 70 and is_bull:
+        pts_D -= 0.4
+    elif rsi <= 20 and not is_bull:
+        pts_D -= 0.8
+    elif rsi <= 30 and not is_bull:
+        pts_D -= 0.4
+    elif rsi <= 40 and is_bull:
+        pts_D += 0.3   # RSI moderado en tendencia alcista = mejor entrada
+    elif rsi >= 60 and not is_bull:
+        pts_D += 0.3
+
+    # Movimiento del día — si ya se movió mucho, el tren pasó
     if abs_chg >= 20:
-        move_penalty = -1.5  # movimiento extremo - prima inflada
+        pts_D -= 1.5   # movimiento extremo, prima de opciones inflada
     elif abs_chg >= 15:
-        move_penalty = -1.0  # movimiento muy grande
+        pts_D -= 1.0
     elif abs_chg >= 10:
-        move_penalty = -0.5  # movimiento grande - precaucion
+        pts_D -= 0.6
+    elif abs_chg >= 7:
+        pts_D -= 0.3
+    elif 2 <= abs_chg <= 5 and rel_vol >= 2:
+        pts_D += 0.4   # movimiento saludable con volumen = setup ideal
 
-    # ── GAMMA SQUEEZE BONUS ───────────────────────────────────
-    gamma_score_val  = gamma.get("gamma_score", 0) if gamma else 0
-    gamma_signal_val = gamma.get("gamma_signal", "NONE") if gamma else "NONE"
-    gamma_triggers   = gamma.get("gamma_triggers", []) if gamma else []
-
-    # Bonus por gamma squeeze (max 1.5 pts adicionales)
-    if gamma_score_val >= 7:
-        pts_gamma_bonus = 1.5
-    elif gamma_score_val >= 5:
-        pts_gamma_bonus = 1.0
-    elif gamma_score_val >= 3:
-        pts_gamma_bonus = 0.5
+    # Posición vs VWAP — entrada cerca del VWAP = mejor R/R
+    if is_bull:
+        if -1 <= precio_vs_vwap <= 1:
+            pts_D += 0.5   # tocando VWAP = entrada limpia
+        elif precio_vs_vwap > 5:
+            pts_D -= 0.3   # muy extendido sobre VWAP
     else:
-        pts_gamma_bonus = 0.0
+        if -1 <= precio_vs_vwap <= 1:
+            pts_D += 0.5
+        elif precio_vs_vwap < -5:
+            pts_D -= 0.3
 
-    # ── PRICE MOVER BONUS (acciones sin opciones activas) ────
-    # Si la acción viene del strong_movers screener y tiene movimiento real,
-    # damos un bonus para compensar la falta de señal de opciones
-    is_price_mover = mc_data.get("is_price_mover", False) if mc_data else False
-    abs_chg = abs(chg_pct)
-    pts_price_mover = 0.0
-    if is_price_mover and not has_real_opts:
-        if abs_chg >= 8 and rel_vol >= 3:
-            pts_price_mover = 2.0   # movimiento extremo con volumen — señal fuerte
-        elif abs_chg >= 5 and rel_vol >= 2:
-            pts_price_mover = 1.5
-        elif abs_chg >= 3 and rel_vol >= 1.8:
-            pts_price_mover = 1.0
-        elif abs_chg >= 2 and rel_vol >= 1.5:
-            pts_price_mover = 0.5
+    # Posición en el rango del día
+    if is_bull and day_range_pos <= 0.3:
+        pts_D += 0.3   # comprando cerca del mínimo del día = mejor R/R
+    elif not is_bull and day_range_pos >= 0.7:
+        pts_D += 0.3   # vendiendo cerca del máximo del día
 
-    raw   = pts_catalyst + pts_vol + pts_mom + pts_sector + pts_short + mkt_modifier + rsi_penalty + move_penalty + pts_gamma_bonus + pts_price_mover
+    pts_D = min(max(pts_D, 0), 2.5)
+
+    # ── SCORE FINAL ───────────────────────────────────────────
+    raw   = pts_A + pts_B + pts_C + pts_D
     score = round(min(max(raw, 0), 10.0), 1)
-    
-    # Add move penalty info to score breakdown
-    if move_penalty < 0:
-        move_note = f" MovExtrem{move_penalty}"
-    else:
-        move_note = ""
 
-    gamma_note = f"+Gamma{pts_gamma_bonus}" if pts_gamma_bonus > 0 else ""
-    mover_note = f"+Mover{pts_price_mover}" if pts_price_mover > 0 else ""
-
-    # Semaforo
     if score >= 7.0:
         semaforo = "VERDE"
-    elif score >= 4.0:
+    elif score >= 4.5:
         semaforo = "AMARILLO"
     else:
         semaforo = "ROJO"
 
-    # RSI label
-    if rsi_val >= 70:
-        rsi_label = f"Sobrecomprado ({rsi_val:.0f})"
-    elif rsi_val <= 30:
-        rsi_label = f"Sobrevendido ({rsi_val:.0f})"
+    # ── ETIQUETAS ─────────────────────────────────────────────
+    if rsi >= 70:
+        rsi_label = f"Sobrecomprado ({rsi:.0f})"
+    elif rsi <= 30:
+        rsi_label = f"Sobrevendido ({rsi:.0f})"
     else:
-        rsi_label = f"Normal ({rsi_val:.0f})"
+        rsi_label = f"Normal ({rsi:.0f})"
 
-    # Momentum - considers both price change AND unusual volume
     if rel_vol >= 2.0 and chg_pct > 0.5:
         momentum = "ALCISTA FUERTE"
     elif rel_vol >= 2.0 and chg_pct < -0.5:
         momentum = "BAJISTA FUERTE"
-    elif chg_pct > 1.5 or (chg_pct > 0.5 and rel_vol >= 1.5):
+    elif chg_pct > 1.5:
         momentum = "ALCISTA FUERTE"
     elif chg_pct > 0.3:
         momentum = "ALCISTA"
-    elif chg_pct < -1.5 or (chg_pct < -0.5 and rel_vol >= 1.5):
+    elif chg_pct < -1.5:
         momentum = "BAJISTA FUERTE"
     elif chg_pct < -0.3:
         momentum = "BAJISTA"
     else:
         momentum = "LATERAL"
 
-    # Vol label — show real options data when available
-    if has_real_opts:
-        vol_label = f"Vol/OI {opt_vol_oi:.1f}x"
-        if opt_is_sweep:
+    if has_opts:
+        vol_label = f"Vol/OI {vol_oi:.1f}x"
+        if is_sweep:
             vol_label += " 🚨 SWEEP INSTITUCIONAL"
-        elif opt_vol_oi >= 3.0:
+        elif vol_oi >= 3.0:
             vol_label += " 🔥 MUY INUSUAL"
-        elif opt_vol_oi >= 1.5:
+        elif vol_oi >= 1.5:
             vol_label += " ⚡ INUSUAL"
-        vol_label += f" | P/C {opt_pc_ratio:.2f} | {opt_dominant}"
+        vol_label += f" | P/C {pc_ratio:.2f} | {dominant}"
     else:
         vol_label = f"{rel_vol:.1f}x promedio"
-        if rel_vol >= 3:
-            vol_label += " 🔥 MUY INUSUAL"
-        elif rel_vol >= 2:
-            vol_label += " ⚡ INUSUAL"
+        vol_label += " 🔥 MUY INUSUAL" if rel_vol >= 3 else " ⚡ INUSUAL" if rel_vol >= 2 else ""
 
-    # Stocktwits sentiment
-    st_bulls = st.get("bullish")
-    st_bears = st.get("bearish")
-    if st_bulls and st_bears:
-        st_label = f"Bulls {st_bulls:.0f}% · Bears {st_bears:.0f}%"
-    else:
-        st_label = "Sin datos"
-
-    # Why / Risk texts
-    why_parts = []
+    # ── POR QUÉ / RIESGOS ────────────────────────────────────
+    why = []
     if has_alert:
-        why_parts.append(f"Alerta del grupo: {alert_context}")
-    # Catalyst detector findings (pre-movement signals)
-    for cf in cat_found[:3]:
-        why_parts.append(cf)
-    # Gamma squeeze triggers
-    for gt in gamma_triggers[:2]:
-        why_parts.append(gt)
-    # Price mover context
-    if is_price_mover and pts_price_mover > 0:
-        why_parts.append(f"Movimiento de precio fuerte {chg_pct:+.1f}% con volumen {rel_vol:.1f}x — detectado por screener de movers")
-    if has_real_opts and opt_vol_oi >= 1.5:
-        sweep_txt = "SWEEP INSTITUCIONAL — " if opt_is_sweep else ""
-        why_parts.append(f"{sweep_txt}Flujo de opciones inusual: Vol/OI {opt_vol_oi:.1f}x — lado {opt_dominant} dominante (P/C {opt_pc_ratio:.2f})")
-    elif rel_vol >= 2:
-        why_parts.append(f"Volumen {rel_vol:.1f}x sobre promedio — actividad inusual")
-    if above_sma50 and above_sma20 and direction == "CALL":
-        why_parts.append("Precio sobre MA20 y MA50 — estructura alcista")
-    if short_pct >= 15 and direction == "CALL":
-        why_parts.append(f"Short float {short_pct:.0f}% — potencial squeeze alcista")
-    if has_earn:
-        why_parts.append(f"Earnings proximamente: {finviz.get('earnings_date','')} — volatilidad esperada")
-    if has_news:
-        news = finviz.get("news", [])
-        if news:
-            why_parts.append(f"Noticia reciente: {news[0]['title'][:80]}")
-    if not why_parts:
-        why_parts.append(f"Cambio del dia {chg_pct:+.2f}%. Sin catalizadores fuertes identificados.")
+        why.append(f"🔔 Alerta: {alert_context}")
+    if is_sweep:
+        why.append(f"🚨 SWEEP INSTITUCIONAL — Vol/OI {vol_oi:.1f}x, lado {dominant}")
+    elif has_opts and vol_oi >= 1.5:
+        why.append(f"⚡ Flujo inusual opciones: Vol/OI {vol_oi:.1f}x — {dominant} dominante (P/C {pc_ratio:.2f})")
+    for gt in opts.get("gamma_triggers", [])[:2]:
+        why.append(gt)
+    if news.get("title") and news_score >= 2:
+        age_str = f"hace {news_age:.0f}h" if news_age else ""
+        why.append(f"📰 Noticia {age_str}: {news.get('title','')[:80]}")
+    if fund.get("analyst_action"):
+        why.append(f"📊 Analista: {fund['analyst_action']}")
+    if earn_days is not None and earn_days <= 7:
+        why.append(f"⏰ Earnings en {earn_days:.0f} día(s) — volatilidad esperada")
+    if rel_vol >= 2 and not has_opts:
+        why.append(f"📈 Volumen {rel_vol:.1f}x sobre promedio — actividad inusual sin opciones")
+    if above_sma20 and above_sma50 and is_bull:
+        why.append("✅ Estructura alcista: precio sobre MA20 y MA50")
+    if short_pct >= 15 and is_bull:
+        why.append(f"🔥 Short float {short_pct:.0f}% — combustible para squeeze")
+    if not why:
+        why.append(f"Cambio del día {chg_pct:+.2f}%. Sin catalizadores claros identificados.")
 
-    risk_parts = []
-    if rsi_val >= 70 and direction == "CALL":
-        risk_parts.append(f"RSI {rsi_val:.0f} sobrecomprado — posible pullback")
-    if not above_sma50 and direction == "CALL":
-        risk_parts.append("Precio bajo MA50 — tendencia bajista de fondo")
-    if mkt_sentiment == "BAJISTA" and direction == "CALL":
-        risk_parts.append("Mercado general bajista — viento en contra para calls")
-    if abs(chg_pct) > 5:
-        risk_parts.append(f"Movimiento extremo {chg_pct:+.1f}% — posible reversión")
-    if not risk_parts:
-        risk_parts.append("Monitorear VWAP como soporte clave. Respetar el stop.")
+    risk = []
+    if rsi >= 75 and is_bull:
+        risk.append(f"⚠️ RSI {rsi:.0f} sobrecomprado — espera pullback o recorta tamaño")
+    if abs_chg >= 10:
+        risk.append(f"⚠️ Ya se movió {chg_pct:+.1f}% hoy — prima de opciones inflada")
+    if not above_sma50 and is_bull:
+        risk.append("⚠️ Bajo MA50 — tendencia bajista de fondo")
+    if mkt_sent == "BAJISTA" and is_bull:
+        risk.append("⚠️ Mercado general bajista — viento en contra")
+    if precio_vs_vwap > 5 and is_bull:
+        risk.append(f"⚠️ Precio {precio_vs_vwap:+.1f}% sobre VWAP — extendido, espera retroceso")
+    if not risk:
+        risk.append(f"Monitorear VWAP ${vwap:.2f} como soporte. Stop bajo mínimo del día ${price.get('low',0):.2f}.")
 
-    # Suggested strike and targets
-    call_str = round(price * 1.05 / 5) * 5 if price >= 10 else round(price * 1.05, 1)
-    put_str  = round(price * 0.95 / 5) * 5 if price >= 10 else round(price * 0.95, 1)
-    strike   = call_str if direction == "CALL" else put_str
+    # ── STRIKES Y TARGETS ────────────────────────────────────
+    if is_bull:
+        suggested_strike = round(current_price * 1.05 / 5) * 5 if current_price >= 10 else round(current_price * 1.05, 1)
+        target1 = round(current_price * 1.05, 2)
+        target2 = round(current_price * 1.10, 2)
+        stop    = round(current_price * 0.95, 2)
+    else:
+        suggested_strike = round(current_price * 0.95 / 5) * 5 if current_price >= 10 else round(current_price * 0.95, 1)
+        target1 = round(current_price * 0.95, 2)
+        target2 = round(current_price * 0.90, 2)
+        stop    = round(current_price * 1.05, 2)
+
+    # ── ATR-based stop (más preciso) ──────────────────────────
+    if atr > 0:
+        atr_stop = round(current_price - 1.5*atr, 2) if is_bull else round(current_price + 1.5*atr, 2)
+    else:
+        atr_stop = stop
+
+    st_bulls = sent.get("bullish")
+    st_bears = sent.get("bearish")
+    st_label = f"Bulls {st_bulls:.0f}% · Bears {st_bears:.0f}%" if st_bulls and st_bears else "Sin datos"
 
     return {
-        "direction":       direction,
-        "score":           score,
-        "semaforo":        semaforo,
-        "pts_catalyst":    round(pts_catalyst, 1),
-        "pts_flow":        round(pts_vol, 1),
-        "pts_momentum":    round(pts_mom, 1),
-        "pts_sector":      round(pts_sector, 1),
-        "pts_short":       round(pts_short, 1),
-        "score_breakdown": f"Cat {pts_catalyst:.1f}+Vol {pts_vol:.1f}+Mom {pts_mom:.1f}+Sector {pts_sector:.1f}+Short {pts_short:.1f}{gamma_note}{mover_note}{move_note}={score}",
-        # Real options data
-        "opt_vol_oi":      round(opt_vol_oi, 2),
-        "opt_call_vol_oi": round(opt_call_vol_oi, 2),
-        "opt_put_vol_oi":  round(opt_put_vol_oi, 2),
-        "opt_atm_call":    round(opt_atm_call, 2),
-        "opt_atm_put":     round(opt_atm_put, 2),
-        "opt_pc_ratio":    round(opt_pc_ratio, 2),
-        "opt_dominant":    opt_dominant,
-        "opt_is_sweep":    opt_is_sweep,
-        "has_real_opts":   has_real_opts,
-        # Catalyst detection
-        "catalyst_score":  cat_score,
-        "catalyst_signal": cat_signal,
-        "catalyst_analyst": cat_analyst,
-        "catalyst_earn_days": cat_earn_days,
-        "catalyst_earn_alert": cat_earn_alert,
-        "catalyst_news_title": cat_news_title,
-        "catalysts_found": cat_found,
-        "momentum":        momentum,
-        "rsi":             rsi_label,
-        "rsi_value":       rsi_val,
-        "rel_volume":      rel_vol,
-        "vol_desc":        vol_label,
-        "above_sma20":     above_sma20,
-        "above_sma50":     above_sma50,
-        "above_sma200":    above_sma200,
-        "sma20_pct":       sma20_pct or "N/A",
-        "sma50_pct":       sma50_pct or "N/A",
-        "sma200_pct":      sma200_pct or "N/A",
-        "short_float":     finviz.get("short_float", "N/A"),
-        "short_pct":       short_pct,
-        "target_price":    finviz.get("target_price", "N/A"),
-        "recommendation":  finviz.get("recommendation", "N/A"),
-        "beta":            finviz.get("beta", "N/A"),
-        "perf_week":       finviz.get("perf_week", "N/A"),
-        "perf_month":      finviz.get("perf_month", "N/A"),
-        "perf_ytd":        finviz.get("perf_ytd", "N/A"),
-        "high_52w":        finviz.get("52w_high", "N/A"),
-        "low_52w":         finviz.get("52w_low", "N/A"),
-        "inst_own":        finviz.get("inst_own", "N/A"),
-        "sector":          finviz.get("sector", "N/A"),
-        "earnings_date":   finviz.get("earnings_date", "N/A"),
-        "atr":             finviz.get("atr", "N/A"),
-        "st_sentiment":    st_label,
-        "news":            finviz.get("news", []),
-        "why":             " | ".join(why_parts),
-        "risk":            " | ".join(risk_parts),
-        "strike":          strike,
-        "stop":            f"${price * 0.95:.2f}" if price else "N/A",
-        "target_1":        f"${price * 1.05:.2f}" if price else "N/A",
-        "target_2":        f"${price * 1.10:.2f}" if price else "N/A",
-        "ez":              f"${price * 0.98:.2f}–${price:.2f}" if price else "N/A",
-        "vwap_trigger":    f"Sobre VWAP ${yahoo.get('vwap', 0):.2f}" if yahoo.get('vwap') else "Ver VWAP en IBKR",
+        "direction":    direction,
+        "score":        score,
+        "semaforo":     semaforo,
+        "pts_A_flujo":  round(pts_A, 1),
+        "pts_B_catalyst": round(pts_B, 1),
+        "pts_C_momentum": round(pts_C, 1),
+        "pts_D_timing": round(pts_D, 1),
+        "score_breakdown": f"Flujo {pts_A:.1f} + Catalyst {pts_B:.1f} + Mom {pts_C:.1f} + Timing {pts_D:.1f} = {score}",
+        "momentum":     momentum,
+        "rsi_label":    rsi_label,
+        "vol_label":    vol_label,
+        "why":          " | ".join(why),
+        "risk":         " | ".join(risk),
+        "st_sentiment": st_label,
+        "suggested_strike": suggested_strike,
+        "target1":      target1,
+        "target2":      target2,
+        "stop":         stop,
+        "atr_stop":     atr_stop,
+        "vwap":         vwap,
+        "vwap_trigger": f"Sobre VWAP ${vwap:.2f}" if is_bull else f"Bajo VWAP ${vwap:.2f}",
     }
 
 
 # ══════════════════════════════════════════════════════════════
-# FULL TICKER ANALYSIS
+# CAPA 4: ANÁLISIS COMPLETO DE UN TICKER
 # ══════════════════════════════════════════════════════════════
 
-def analyze_ticker(ticker: str, alert_context: str = "", market: Dict = None, mc_data: Dict = None) -> Dict[str, Any]:
+def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "") -> Dict[str, Any]:
     ticker = ticker.upper().strip()
     if not market:
         market = {}
 
-    yahoo  = get_yahoo(ticker)
-    finviz = get_finviz(ticker)
-    st     = get_stocktwits_sentiment(ticker)
+    # Recolectar datos — cada función hace UNA cosa
+    price_data = get_price_data(ticker)
+    fund_data  = get_fundamentals(ticker)
+    opts_data  = get_options_data(ticker)
+    news_data  = get_news_score(ticker)
+    sent_data  = get_sentiment(ticker)
 
-    # If mc_data doesn't have real options data (e.g. called from /api/flow or /api/ticker),
-    # fetch it now so individual ticker lookups also get real options analysis
-    if not mc_data or not mc_data.get("opt_vol_oi"):
-        opts = get_options_flow_real(ticker)
-        if opts:
-            if mc_data is None:
-                mc_data = {}
-            mc_data.update({
-                "opt_vol_oi":      opts.get("best_vol_oi", 0),
-                "opt_call_vol_oi": opts.get("best_call_vol_oi", 0),
-                "opt_put_vol_oi":  opts.get("best_put_vol_oi", 0),
-                "opt_atm_call":    opts.get("atm_call_vol_oi", 0),
-                "opt_atm_put":     opts.get("atm_put_vol_oi", 0),
-                "opt_pc_ratio":    opts.get("pc_ratio", 1.0),
-                "opt_dominant":    opts.get("dominant_side", "NEUTRAL"),
-                "opt_is_sweep":    opts.get("is_sweep", False),
-                "opt_top_strikes": opts.get("top_strikes", []),
-                "mc_rel_vol":      opts.get("mapped_rel_vol", 1.0),
-                "is_unusual":      opts.get("is_unusual", False),
-            })
+    if not price_data.get("price"):
+        return {"ticker": ticker, "error": f"Sin datos para {ticker}", "score": 0, "semaforo": "ROJO"}
 
-    # Catalyst detection — pre-movement signal
-    catalyst = get_catalyst_data(ticker)
+    scoring = compute_score(
+        ticker, price_data, fund_data, opts_data,
+        news_data, sent_data, market, alert_context
+    )
 
-    # Gamma Squeeze detection — requiere precio actual y datos de opciones
-    gamma = {}
-    if yahoo.get("price", 0) > 0:
-        gamma = detect_gamma_squeeze(ticker, yahoo["price"], mc_data or {})
-
-    if not yahoo and not finviz:
-        return {"ticker": ticker, "error": f"Sin datos para {ticker}. Verifica el simbolo.", "score": 0, "semaforo": "ROJO"}
-
-    scoring = compute_score(ticker, yahoo, finviz, st, market, alert_context, mc_data, catalyst, gamma)
-    price   = yahoo.get("price", 0)
+    p = price_data.get("price", 0)
 
     return {
         "ticker":          ticker,
-        "type":            scoring["direction"],
         "direction":       scoring["direction"],
+        "type":            scoring["direction"],
         "score":           scoring["score"],
         "semaforo":        scoring["semaforo"],
-        "pts_catalyst":    scoring["pts_catalyst"],
-        "pts_flow":        scoring["pts_flow"],
-        "pts_momentum":    scoring["pts_momentum"],
-        "pts_sector":      scoring["pts_sector"],
-        "pts_short":       scoring["pts_short"],
+        # Score breakdown por categoría
+        "pts_flujo":       scoring["pts_A_flujo"],
+        "pts_catalyst":    scoring["pts_B_catalyst"],
+        "pts_momentum":    scoring["pts_C_momentum"],
+        "pts_timing":      scoring["pts_D_timing"],
         "score_breakdown": scoring["score_breakdown"],
-        # Price
-        "price":           f"${price:.2f}" if price else "N/A",
-        "spot":            price,
-        "open":            yahoo.get("open", 0),
-        "high":            yahoo.get("high", 0),
-        "low":             yahoo.get("low", 0),
-        "vwap":            f"${yahoo.get('vwap', 0):.2f}" if yahoo.get('vwap') else "N/A",
-        "change_pct":      f"{yahoo.get('change_pct', 0):+.2f}%",
-        "change_abs":      f"${yahoo.get('change_abs', 0):+.2f}",
-        # Volume
-        "volume":          yahoo.get("volume", 0),
-        "avg_volume":      yahoo.get("avg_volume", 0),
-        "rel_volume":      scoring["rel_volume"],
-        "vol_vs_avg":      scoring["vol_desc"],
-        # Technical
-        "rsi":             scoring["rsi"],
-        "rsi_value":       scoring["rsi_value"],
+        # Precio
+        "price":           f"${p:.2f}" if p else "N/A",
+        "spot":            p,
+        "open":            price_data.get("open", 0),
+        "high":            price_data.get("high", 0),
+        "low":             price_data.get("low", 0),
+        "vwap":            f"${scoring['vwap']:.2f}",
+        "change_pct":      f"{price_data.get('change_pct',0):+.2f}%",
+        "change_abs":      f"${price_data.get('change_abs',0):+.2f}",
+        "precio_vs_vwap":  f"{price_data.get('precio_vs_vwap',0):+.2f}%",
+        "day_range_pos":   f"{price_data.get('day_range_pos',0.5)*100:.0f}% del rango",
+        # Volumen
+        "volume":          price_data.get("volume", 0),
+        "avg_volume":      price_data.get("avg_volume", 0),
+        "rel_volume":      price_data.get("rel_volume", 1.0),
+        "vol_vs_avg":      scoring["vol_label"],
+        # Técnico
+        "rsi":             scoring["rsi_label"],
+        "rsi_value":       price_data.get("rsi", 50),
+        "atr":             f"${price_data.get('atr',0):.2f}",
         "momentum":        scoring["momentum"],
-        "ma5_pct":         "N/A",
-        "ma20_pct":        scoring["sma20_pct"],
-        "ma50_pct":        scoring["sma50_pct"],
-        "ma200_pct":       scoring["sma200_pct"],
-        # Risk context
-        "short_float":     scoring["short_float"],
-        "short_pct":       scoring["short_pct"],
-        "target_price":    scoring["target_price"],
-        "recommendation":  scoring["recommendation"],
-        "beta":            scoring["beta"],
-        "perf_week":       scoring["perf_week"],
-        "perf_month":      scoring["perf_month"],
-        "perf_ytd":        scoring["perf_ytd"],
-        "high_52w":        scoring["high_52w"],
-        "low_52w":         scoring["low_52w"],
-        "inst_own":        scoring["inst_own"],
-        "sector":          scoring["sector"],
-        "earnings_date":   scoring["earnings_date"],
-        "atr":             scoring["atr"],
-        "st_sentiment":    scoring["st_sentiment"],
-        # Real options flow data
-        "opt_vol_oi":      scoring.get("opt_vol_oi", 0),
-        "opt_call_vol_oi": scoring.get("opt_call_vol_oi", 0),
-        "opt_put_vol_oi":  scoring.get("opt_put_vol_oi", 0),
-        "opt_pc_ratio":    scoring.get("opt_pc_ratio", 1.0),
-        "opt_dominant":    scoring.get("opt_dominant", "N/A"),
-        "opt_is_sweep":    scoring.get("opt_is_sweep", False),
-        "has_real_opts":   scoring.get("has_real_opts", False),
-        "opt_top_strikes": mc_data.get("opt_top_strikes", []) if mc_data else [],
+        "ma20_pct":        price_data.get("sma20_pct", "N/A"),
+        "ma50_pct":        price_data.get("sma50_pct", "N/A"),
+        "ma200_pct":       price_data.get("sma200_pct", "N/A"),
+        "above_sma20":     price_data.get("above_sma20", False),
+        "above_sma50":     price_data.get("above_sma50", False),
+        "above_sma200":    price_data.get("above_sma200", False),
+        "perf_week":       price_data.get("perf_week", "N/A"),
+        "perf_month":      price_data.get("perf_month", "N/A"),
+        # Fundamentales
+        "short_float":     f"{fund_data.get('short_pct',0):.1f}%",
+        "short_pct":       fund_data.get("short_pct", 0),
+        "beta":            fund_data.get("beta", "N/A"),
+        "sector":          fund_data.get("sector", "N/A"),
+        "earnings_date":   fund_data.get("earnings_date", "N/A"),
+        "earnings_days":   fund_data.get("earnings_days"),
+        "analyst_action":  fund_data.get("analyst_action"),
+        "target_price":    f"${fund_data.get('target_price',0):.2f}" if fund_data.get("target_price") else "N/A",
+        "recommendation":  fund_data.get("recommendation", "N/A"),
+        "high_52w":        f"${fund_data.get('high_52w',0):.2f}" if fund_data.get("high_52w") else "N/A",
+        "low_52w":         f"${fund_data.get('low_52w',0):.2f}" if fund_data.get("low_52w") else "N/A",
+        "inst_own":        fund_data.get("inst_own", "N/A"),
+        # Opciones
+        "has_options":     opts_data.get("has_options", False),
+        "opt_vol_oi":      opts_data.get("vol_oi", 0),
+        "opt_call_vol_oi": opts_data.get("call_vol_oi", 0),
+        "opt_put_vol_oi":  opts_data.get("put_vol_oi", 0),
+        "opt_pc_ratio":    opts_data.get("pc_ratio", 1.0),
+        "opt_dominant":    opts_data.get("dominant", "N/A"),
+        "opt_is_sweep":    opts_data.get("is_sweep", False),
+        "opt_call_wall":   opts_data.get("call_wall"),
+        "opt_put_wall":    opts_data.get("put_wall"),
+        "opt_max_pain":    opts_data.get("max_pain"),
+        "opt_top_strikes": opts_data.get("top_strikes", []),
         "opt_signal": (
-            "🚨 SWEEP" if scoring.get("opt_is_sweep")
-            else "🔥 MUY INUSUAL" if scoring.get("opt_vol_oi", 0) >= 3.0
-            else "⚡ INUSUAL" if scoring.get("opt_vol_oi", 0) >= 1.5
-            else "Normal" if scoring.get("has_real_opts") else "Sin datos"
+            "🚨 SWEEP" if opts_data.get("is_sweep")
+            else "🔥 MUY INUSUAL" if opts_data.get("vol_oi", 0) >= 3.0
+            else "⚡ INUSUAL" if opts_data.get("vol_oi", 0) >= 1.5
+            else "Normal" if opts_data.get("has_options") else "Sin datos"
         ),
-        # Catalyst detection (pre-movement signals)
-        "catalyst_score":    scoring.get("catalyst_score", 0),
-        "catalyst_signal":   scoring.get("catalyst_signal", "NONE"),
-        "catalyst_analyst":  scoring.get("catalyst_analyst"),
-        "catalyst_earn_days": scoring.get("catalyst_earn_days"),
-        "catalyst_earn_alert": scoring.get("catalyst_earn_alert", False),
-        "catalyst_news":     scoring.get("catalyst_news_title"),
-        "catalysts_found":   scoring.get("catalysts_found", []),
-        # News
-        "news":            scoring["news"],
-        "catalyst":        scoring["news"][0]["title"] if scoring["news"] else "Sin noticias recientes",
-        # Analysis
+        # Gamma
+        "gamma_score":     opts_data.get("gamma_score", 0),
+        "gamma_signal":    opts_data.get("gamma_signal", "NONE"),
+        "gamma_triggers":  opts_data.get("gamma_triggers", []),
+        "dealer_pressure": opts_data.get("dealer_pressure", "NEUTRAL"),
+        # Noticias
+        "news_score":      news_data.get("score", 0),
+        "news_title":      news_data.get("title"),
+        "news_age_hours":  news_data.get("age_hours"),
+        "catalyst":        news_data.get("title") or fund_data.get("analyst_action") or "Sin catalizador reciente",
+        # Sentimiento
+        "st_sentiment":    scoring["st_sentiment"],
+        # Análisis
         "why":             scoring["why"],
         "risk":            scoring["risk"],
-        # Option suggestion
-        "strike":          scoring["strike"],
-        "expiry":          "Ver cadena en IBKR",
-        "flow_usd":        f"${mc_data.get('mc_volume', 0):,}" if mc_data else "N/A",
-        "contract":        f"{ticker} {scoring['direction']} ${scoring['strike']:.0f}",
+        # Operación sugerida
+        "strike":          scoring["suggested_strike"],
+        "stop":            f"${scoring['stop']:.2f}",
+        "atr_stop":        f"${scoring['atr_stop']:.2f}",
+        "target_1":        f"${scoring['target1']:.2f}",
+        "target_2":        f"${scoring['target2']:.2f}",
         "vwap_trigger":    scoring["vwap_trigger"],
-        "stop":            scoring["stop"],
-        "target_1":        scoring["target_1"],
-        "target_2":        scoring["target_2"],
-        "ez":              scoring["ez"],
-        "pm":              "Ver cadena en IBKR",
-        "c5":              "—",
-        "c15":             "—",
-        "sl":              scoring["stop"],
-        "sentiment":       "POSITIVO" if yahoo.get("change_pct", 0) > 0 else "NEGATIVO",
-        "control":         "COMPRADORES" if yahoo.get("change_pct", 0) > 0 and scoring["rel_volume"] >= 1.5 else "VENDEDORES",
-        "control_detail":  f"Volumen {scoring['rel_volume']:.1f}x promedio. RSI {scoring['rsi_value']:.0f}. {'Sobre' if scoring['above_sma50'] else 'Bajo'} MA50.",
-        "source":          "yahoo+finviz+stocktwits",
-        "timestamp":       datetime.now().isoformat(timespec='seconds'),
-        # Gamma Squeeze detection
-        "gamma_score":     gamma.get("gamma_score", 0),
-        "gamma_signal":    gamma.get("gamma_signal", "NONE"),
-        "gamma_triggers":  gamma.get("gamma_triggers", []),
-        "gamma_call_wall": gamma.get("gamma_call_wall"),
-        "gamma_put_wall":  gamma.get("gamma_put_wall"),
-        "gamma_max_pain":  gamma.get("gamma_max_pain"),
-        "gamma_atm_ratio": gamma.get("atm_oi_ratio"),
-        "dealer_pressure": gamma.get("dealer_pressure", "NEUTRAL"),
-        # Price mover context (si viene del strong_movers screener)
-        "is_price_mover":  mc_data.get("is_price_mover", False) if mc_data else False,
-        "move_strength":   mc_data.get("move_strength", "") if mc_data else "",
+        "ez":              f"${p*0.98:.2f}–${p:.2f}" if p else "N/A",
+        "expiry":          "Ver cadena en IBKR",
+        "contract":        f"{ticker} {scoring['direction']} ${scoring['suggested_strike']:.0f}",
+        "sl":              f"${scoring['atr_stop']:.2f}",
+        # Contexto
+        "sentiment":       "POSITIVO" if price_data.get("change_pct",0) > 0 else "NEGATIVO",
+        "control":         "COMPRADORES" if price_data.get("change_pct",0) > 0 and price_data.get("rel_volume",1) >= 1.5 else "VENDEDORES",
+        "source":          "yahoo_finance",
+        "timestamp":       datetime.now().isoformat(timespec="seconds"),
     }
 
 
 # ══════════════════════════════════════════════════════════════
-# ENDPOINTS
+# RUTAS HTML
 # ══════════════════════════════════════════════════════════════
 
-@app.route('/api/pulse')
-def api_pulse():
-    """Market pulse: SPY, QQQ, IWM, VIX sentiment."""
-    pulse = get_market_pulse()
-    return jsonify(pulse)
+@app.route("/")
+def home():
+    with open(os.path.join(BASE_DIR, "index.html"), "r", encoding="utf-8") as f:
+        return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
 
-
-@app.route('/api/scan')
-def api_scan():
-    """
-    Autonomous scan with multiple data sources and fallbacks:
-    1. Market pulse (SPY/QQQ/IWM/VIX)
-    2. Unusual Whales free flow (primary)
-    3. Yahoo Finance most active (fallback 1)
-    4. Yahoo Finance trending (fallback 2)
-    5. Analyze top tickers with full Yahoo + Finviz data
-    """
-    market = get_market_pulse()
-
-    # Try sources in order of quality
-    source_name = "unknown"
-    ticker_list = []
-
-    # Source 1: Unusual Whales / Market Chameleon (opciones inusuales)
-    ticker_list = get_market_chameleon_unusual()
-    if ticker_list:
-        source_name = ticker_list[0].get("source", "unusual_whales")
-
-    # Source 2: Screener extra — small caps, IPOs recientes, growth (captura CRCL, CIFR, etc.)
-    extra_movers = get_yahoo_screener_extra()
-
-    # Source 3: Strong movers — acciones con movimiento fuerte de precio+volumen
-    strong_movers = get_strong_movers()
-
-    # Source 4: Yahoo most active (always reliable)
-    yahoo_active = get_yahoo_most_active()
-
-    # Source 5: Yahoo trending
-    yahoo_trend = get_yahoo_trending()
-
-    # Merge all sources; extra_movers y opciones inusuales van primero
-    EXCLUDE_TICKERS = {"SPY","QQQ","IWM","VIX","TLT","GLD","SLV","XLF","XLE","XLK","DIA"}
-    seen = set()
-    merged = []
-    for t in ticker_list + extra_movers + strong_movers + yahoo_active + yahoo_trend:
-        tk = t.get("ticker", "")
-        if tk and tk not in seen and tk not in EXCLUDE_TICKERS:
-            seen.add(tk)
-            merged.append(t)
-
-    # Sort: price movers fuertes primero, luego por vol/OI de opciones
-    def sort_key(x):
-        base = x.get("mc_rel_vol", 0)
-        # Boost movers con movimiento real fuerte
-        if x.get("is_price_mover"):
-            chg = abs(x.get("mc_chg_pct", 0))
-            base += chg * 0.3  # boost proporcional al movimiento
-        return base
-
-    merged.sort(key=sort_key, reverse=True)
-
-    if not merged:
-        # Ultimate fallback
-        merged = [{"ticker": t, "mc_rel_vol": 1.5, "mc_volume": 0, "mc_chg_pct": 0, "mc_bullish": True}
-                  for t in ["NVDA","AMD","TSLA","META","AAPL","MSFT","GOOGL","AMZN","INTC","PLTR"]]
-        source_name = "fallback_default"
-
-    # Analyze top 15 tickers (ampliado de 10 para capturar más señales)
-    items = []
-    for mc in merged[:15]:
-        result = analyze_ticker(mc["ticker"], market=market, mc_data=mc)
-        if "error" not in result:
-            items.append(result)
-
-    items.sort(key=lambda x: x.get("score", 0), reverse=True)
-    verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
-    gammas = sum(1 for x in items if x.get("gamma_score", 0) >= 5)
-    movers = sum(1 for x in items if x.get("is_price_mover"))
-    # Fuentes usadas para el frontend
-    sources_used = list(dict.fromkeys(
-        x.get("source","") for x in merged[:15] if x.get("source")
-    ))
-    
-    # Build summary message
-    top = items[0] if items else None
-    if verdes > 0:
-        summary = f"{verdes} setup(s) VERDE. Mejor: {top['ticker']} {top['score']}/10 — {top['direction']}."
-        if gammas > 0:
-            summary += f" ⚡ {gammas} posible(s) Gamma Squeeze."
-        if movers > 0:
-            summary += f" 📈 {movers} mover(s) fuertes detectados sin opciones."
-    elif items:
-        summary = f"{len(items)} tickers analizados. Ninguno con criterios verdes hoy."
-        if movers > 0:
-            summary += f" {movers} movers fuertes detectados."
-    else:
-        summary = "Sin datos disponibles. Verifica conexion."
-
+@app.route("/api/health")
+def health():
     return jsonify({
-        "source":         source_name,
-        "sources_used":   sources_used,
-        "market":         market,
-        "timestamp":      datetime.now().isoformat(timespec='seconds'),
-        "summary":        summary,
-        "verdes":         verdes,
-        "gamma_squeezes": gammas,
-        "price_movers":   movers,
-        "total_analyzed": len(items),
-        "items":          items,
+        "ok": True, "service": "FlowScan 9", "version": "5.0",
+        "sources": ["yahoo_finance", "stocktwits"],
+        "scoring": "4-factor: Flujo + Catalizador + Momentum + Timing",
+        "time": datetime.now().isoformat(timespec="seconds"),
     })
 
 
-@app.route('/api/flow')
-def api_flow():
-    """Flow endpoint - analyze specific tickers."""
-    tickers_raw = request.args.get('tickers', '')
-    market_mode = request.args.get('market', 'neutral')
+# ══════════════════════════════════════════════════════════════
+# ENDPOINTS PRINCIPALES
+# ══════════════════════════════════════════════════════════════
 
+@app.route("/api/pulse")
+def api_pulse():
+    """Sentimiento de mercado: SPY, QQQ, IWM, VIX."""
+    return jsonify(get_market_pulse())
+
+
+@app.route("/api/scan")
+def api_scan():
+    """
+    Scan autónomo — descubre y analiza las mejores oportunidades del mercado HOY.
+    Sin listas hardcodeadas. Solo fuentes de mercado en vivo.
+    """
+    market = get_market_pulse()
+
+    # Paso 1: descubrir candidatos desde screeners de Yahoo
+    candidates = discover_candidates()
+    if not candidates:
+        return jsonify({"error": "Todos los feeds de Yahoo fallaron. Verifica conectividad.", "items": []}), 503
+
+    # Paso 2: analizar los top candidatos con análisis completo
+    # Analizamos más de los que mostramos para filtrar mejor
+    items = []
+    for cand in candidates[:18]:
+        result = analyze_ticker(cand["ticker"], market=market)
+        if "error" not in result:
+            items.append(result)
+
+    # Paso 3: ordenar por score descendente
+    items.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # Métricas del scan
+    verdes  = sum(1 for x in items if x.get("semaforo") == "VERDE")
+    sweeps  = sum(1 for x in items if x.get("opt_is_sweep"))
+    gammas  = sum(1 for x in items if x.get("gamma_score", 0) >= 5)
+
+    top = items[0] if items else None
+    if verdes > 0:
+        summary = f"{verdes} setup(s) VERDE de {len(items)} analizados. Mejor: {top['ticker']} {top['score']}/10 ({top['direction']})."
+        if sweeps:
+            summary += f" 🚨 {sweeps} sweep(s) institucional(es)."
+        if gammas:
+            summary += f" ⚡ {gammas} posible(s) gamma squeeze."
+    else:
+        summary = f"{len(items)} tickers analizados. Sin señales verdes claras hoy — esperar mejor setup."
+
+    return jsonify({
+        "source":    "live_market_scan",
+        "market":    market,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "summary":   summary,
+        "verdes":    verdes,
+        "sweeps":    sweeps,
+        "gammas":    gammas,
+        "analyzed":  len(items),
+        "items":     items,
+    })
+
+
+@app.route("/api/ticker/<ticker>")
+def api_ticker(ticker: str):
+    """Análisis completo de un ticker específico."""
+    market = get_market_pulse()
+    result = analyze_ticker(ticker.upper(), market=market)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify({"ticker": ticker.upper(), "market": market, "items": [result]})
+
+
+@app.route("/api/flow")
+def api_flow():
+    """Analiza tickers específicos: /api/flow?tickers=NVDA,ASTS,CRCL"""
+    tickers_raw = request.args.get("tickers", "")
     if not tickers_raw:
         return api_scan()
 
     market  = get_market_pulse()
-    tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()][:10]
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()][:10]
     items   = []
     for tk in tickers:
         result = analyze_ticker(tk, market=market)
@@ -2117,352 +1341,187 @@ def api_flow():
 
     items.sort(key=lambda x: x.get("score", 0), reverse=True)
     verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
-
     return jsonify({
-        "source":    "yahoo+finviz+stocktwits",
+        "source":    "yahoo_finance",
         "market":    market,
-        "timestamp": datetime.now().isoformat(timespec='seconds'),
-        "summary":   f"{verdes} con señal verde de {len(items)} analizados." if verdes else f"{len(items)} analizados. Sin señales verdes.",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "summary":   f"{verdes} verde(s) de {len(items)} analizados." if verdes else f"{len(items)} analizados. Sin señales verdes.",
         "items":     items,
     })
 
 
-@app.route('/api/analyze', methods=['POST'])
+@app.route("/api/analyze", methods=["POST"])
 def api_analyze():
-    """Analyze alerts from Discord/Telegram group."""
+    """Analiza alertas del grupo Discord/Telegram."""
     payload     = request.get_json(force=True, silent=True) or {}
-    tickers_raw = payload.get('tickers', '')
-    alert_raw   = payload.get('alert_raw', '')
-    comment     = payload.get('comment', '')
-    market_mode = payload.get('market', 'neutral')
-    direction   = payload.get('direction', '')
-    strike      = payload.get('strike', '')
-    expiry      = payload.get('expiry', '')
-    zona        = payload.get('zona', '')
-    premium     = payload.get('premium', '')
+    tickers_raw = payload.get("tickers", "")
+    alert_raw   = payload.get("alert_raw", "")
+    direction   = payload.get("direction", "")
+    strike      = payload.get("strike", "")
+    expiry      = payload.get("expiry", "")
+    zona        = payload.get("zona", "")
+    premium     = payload.get("premium", "")
+    comment     = payload.get("comment", "")
 
     if not tickers_raw:
-        return jsonify({'error': 'Falta el campo tickers'}), 400
+        return jsonify({"error": "Falta el campo tickers"}), 400
 
     market  = get_market_pulse()
-    tickers = [t.strip().upper() for t in str(tickers_raw).split(',') if t.strip()]
+    tickers = [t.strip().upper() for t in str(tickers_raw).split(",") if t.strip()]
 
-    # Build rich context from alert data
-    ctx_parts = []
-    if alert_raw:
-        ctx_parts.append(alert_raw)
-    if direction:
-        ctx_parts.append(f"Direccion: {direction}")
-    if strike:
-        ctx_parts.append(f"Strike: ${strike}")
-    if expiry:
-        ctx_parts.append(f"Vence: {expiry}")
-    if zona:
-        ctx_parts.append(f"Zona de interes: ${zona}")
-    if premium:
-        ctx_parts.append(f"Premium: {premium}")
-    if comment and comment not in ctx_parts:
-        ctx_parts.append(comment)
-    ctx = " | ".join(ctx_parts) if ctx_parts else ""
+    ctx_parts = [p for p in [alert_raw, f"Dirección: {direction}" if direction else "",
+                              f"Strike: ${strike}" if strike else "",
+                              f"Vence: {expiry}" if expiry else "",
+                              f"Zona: ${zona}" if zona else "",
+                              f"Premium: {premium}" if premium else "",
+                              comment] if p]
+    ctx = " | ".join(ctx_parts)
 
     items = []
     for tk in tickers:
-        result = analyze_ticker(tk, alert_context=ctx, market=market)
+        result = analyze_ticker(tk, market=market, alert_context=ctx)
         if "error" not in result:
-            # Override direction from alert if provided
             if direction:
                 result["direction"] = direction.upper()
                 result["type"] = direction.upper()
-            # Override strike from alert if provided
             if strike:
-                try:
-                    result["strike"] = float(strike)
-                except:
-                    pass
-            # Override expiry from alert if provided
+                try: result["strike"] = float(strike)
+                except: pass
             if expiry:
                 result["expiry"] = expiry
-            # Add zona de interes
             if zona:
-                result["zona_interes"] = zona
-                result["ez"] = f"${zona} zona de interes"
+                result["ez"] = f"${zona} zona de interés"
             items.append(result)
 
     if not items:
-        return jsonify({"source": "yahoo+finviz", "summary": "Sin datos disponibles.", "items": [], "market": market})
+        return jsonify({"error": "Sin datos disponibles", "items": [], "market": market})
 
     items.sort(key=lambda x: x.get("score", 0), reverse=True)
     verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
-
     return jsonify({
-        "source":    "yahoo+finviz+stocktwits",
+        "source":    "yahoo_finance",
         "market":    market,
-        "timestamp": datetime.now().isoformat(timespec='seconds'),
-        "summary":   f"{verdes} setup(s) con señal verde." if verdes else "Sin señales verdes claras.",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "summary":   f"{verdes} setup(s) VERDE." if verdes else "Sin señales verdes claras.",
         "items":     items,
     })
 
 
-@app.route('/api/gamma/<ticker>')
-def api_gamma(ticker: str):
-    """
-    Gamma Squeeze analysis for a specific ticker.
-    Detects: call wall, put wall, max pain, ATM OI concentration, dealer pressure.
-    Example: /api/gamma/NVDA
-    """
-    ticker = ticker.upper().strip()
-    yahoo  = get_yahoo(ticker)
-    price  = yahoo.get("price", 0)
-    if not price:
-        return jsonify({"ticker": ticker, "error": "No se pudo obtener el precio", "ok": False}), 404
-
-    opts = get_options_flow_real(ticker)
-    gamma = detect_gamma_squeeze(ticker, price, opts)
-
-    return jsonify({
-        "ticker":          ticker,
-        "ok":              True,
-        "timestamp":       datetime.now().isoformat(timespec='seconds'),
-        "price":           price,
-        "gamma_score":     gamma.get("gamma_score", 0),
-        "gamma_signal":    gamma.get("gamma_signal", "NONE"),
-        "gamma_triggers":  gamma.get("gamma_triggers", []),
-        "gamma_call_wall": gamma.get("gamma_call_wall"),
-        "gamma_put_wall":  gamma.get("gamma_put_wall"),
-        "gamma_max_pain":  gamma.get("gamma_max_pain"),
-        "atm_oi_ratio":    gamma.get("atm_oi_ratio"),
-        "dealer_pressure": gamma.get("dealer_pressure", "NEUTRAL"),
-        "interpretation": (
-            f"Precio ${price:.2f} está {round((gamma.get('gamma_call_wall',price or 1)-price)/price*100,1) if gamma.get('gamma_call_wall') else 'N/A'}% "
-            f"debajo de Call Wall ${gamma.get('gamma_call_wall','N/A')}. "
-            f"Max Pain: ${gamma.get('gamma_max_pain','N/A')}. "
-            f"Presión dealer: {gamma.get('dealer_pressure','NEUTRAL')}."
-        ) if gamma.get("gamma_call_wall") else "Sin datos de opciones suficientes para análisis gamma.",
-    })
-
-
-@app.route('/api/movers')
-def api_movers():
-    """
-    Detecta acciones con movimiento fuerte de precio HOY,
-    independientemente de si tienen mercado de opciones activo.
-    Incluye gainers, losers y alto volumen relativo.
-    """
-    market = get_market_pulse()
-    movers = get_strong_movers()
-    items  = []
-    for mc in movers[:12]:
-        result = analyze_ticker(mc["ticker"], market=market, mc_data=mc)
-        if "error" not in result:
-            items.append(result)
-
-    items.sort(key=lambda x: abs(float(str(x.get("change_pct","0")).replace("%","").replace("+",""))), reverse=True)
-    verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
-    gammas = sum(1 for x in items if x.get("gamma_score", 0) >= 5)
-
-    return jsonify({
-        "source":    "yahoo_movers",
-        "market":    market,
-        "timestamp": datetime.now().isoformat(timespec='seconds'),
-        "summary":   f"{len(items)} movers detectados. {verdes} VERDE(s). {gammas} posible(s) gamma squeeze.",
-        "verdes":    verdes,
-        "gamma_squeezes": gammas,
-        "items":     items,
-    })
-
-
-@app.route('/api/ticker/<ticker>')
-def api_ticker(ticker: str):
-    market = get_market_pulse()
-    result = analyze_ticker(ticker.upper(), market=market)
-    if "error" in result:
-        return jsonify(result), 404
-    return jsonify({"ticker": ticker.upper(), "market": market, "items": [result], "source": "yahoo+finviz+stocktwits"})
-
-
-@app.route('/api/options/<ticker>')
+@app.route("/api/options/<ticker>")
 def api_options(ticker: str):
-    """
-    Direct options chain analysis for a specific ticker.
-    Returns real vol/OI ratios, put/call ratio, dominant side, top strikes.
-    Use this to check any ticker manually: /api/options/INTC
-    """
+    """Cadena de opciones y gamma squeeze de un ticker: /api/options/NVDA"""
     ticker = ticker.upper().strip()
-    opts = get_options_flow_real(ticker)
-    if not opts:
-        return jsonify({"ticker": ticker, "error": "No options data available", "ok": False}), 404
+    pd     = get_price_data(ticker)
+    if not pd.get("price"):
+        return jsonify({"ticker": ticker, "error": "Sin precio", "ok": False}), 404
+    opts = get_options_data(ticker)
+    return jsonify({
+        "ticker":      ticker, "ok": True,
+        "price":       pd.get("price"),
+        "timestamp":   datetime.now().isoformat(timespec="seconds"),
+        **opts,
+    })
 
+
+@app.route("/api/gamma/<ticker>")
+def api_gamma(ticker: str):
+    """Análisis gamma squeeze específico: /api/gamma/NVDA"""
+    ticker = ticker.upper().strip()
+    pd   = get_price_data(ticker)
+    opts = get_options_data(ticker)
     return jsonify({
         "ticker":          ticker,
-        "ok":              True,
-        "timestamp":       datetime.now().isoformat(timespec='seconds'),
-        "vol_oi":          opts.get("best_vol_oi"),
-        "call_vol_oi":     opts.get("best_call_vol_oi"),
-        "put_vol_oi":      opts.get("best_put_vol_oi"),
-        "atm_call_vol_oi": opts.get("atm_call_vol_oi"),
-        "atm_put_vol_oi":  opts.get("atm_put_vol_oi"),
-        "total_call_vol":  opts.get("total_call_vol"),
-        "total_put_vol":   opts.get("total_put_vol"),
-        "pc_ratio":        opts.get("pc_ratio"),
-        "dominant_side":   opts.get("dominant_side"),
-        "is_unusual":      opts.get("is_unusual"),
-        "is_sweep":        opts.get("is_sweep"),
-        "mapped_rel_vol":  opts.get("mapped_rel_vol"),
-        "top_strikes":     opts.get("top_strikes", []),
-        "signal": (
-            "🚨 SWEEP INSTITUCIONAL" if opts.get("is_sweep")
-            else "🔥 MUY INUSUAL" if opts.get("best_vol_oi", 0) >= 3.0
-            else "⚡ INUSUAL" if opts.get("is_unusual")
-            else "Normal"
-        ),
+        "price":           pd.get("price"),
+        "timestamp":       datetime.now().isoformat(timespec="seconds"),
+        "gamma_score":     opts.get("gamma_score", 0),
+        "gamma_signal":    opts.get("gamma_signal", "NONE"),
+        "gamma_triggers":  opts.get("gamma_triggers", []),
+        "call_wall":       opts.get("call_wall"),
+        "put_wall":        opts.get("put_wall"),
+        "max_pain":        opts.get("max_pain"),
+        "atm_oi_conc":     opts.get("atm_oi_concentration"),
+        "dealer_pressure": opts.get("dealer_pressure", "NEUTRAL"),
     })
 
 
-@app.route('/api/watchlist', methods=['GET'])
+# ══════════════════════════════════════════════════════════════
+# WATCHLIST — solo para monitoreo personal, no afecta el scan
+# ══════════════════════════════════════════════════════════════
+
+@app.route("/api/watchlist", methods=["GET"])
 def api_watchlist_get():
-    """Get current watchlist."""
     tickers = load_watchlist()
-    return jsonify({
-        "tickers": tickers,
-        "count":   len(tickers),
-        "file":    WATCHLIST_FILE,
-        "timestamp": datetime.now().isoformat(timespec='seconds'),
-    })
+    return jsonify({"tickers": tickers, "count": len(tickers),
+                    "timestamp": datetime.now().isoformat(timespec="seconds")})
 
-
-@app.route('/api/watchlist', methods=['POST'])
+@app.route("/api/watchlist", methods=["POST"])
 def api_watchlist_post():
-    """
-    Add or set watchlist tickers.
-    Body: {"tickers": ["INTC","QCOM","NVDA"]}   → replaces full list
-    Body: {"add": ["SOFI","MSTR"]}               → appends to current list
-    Body: {"remove": ["RIVN"]}                   → removes from list
-    """
     payload = request.get_json(force=True, silent=True) or {}
     current = load_watchlist()
 
     if "tickers" in payload:
-        # Full replace
         new_list = [t.upper().strip() for t in payload["tickers"] if t.strip()]
         save_watchlist(new_list)
         return jsonify({"ok": True, "action": "replaced", "tickers": new_list, "count": len(new_list)})
-
     if "add" in payload:
         to_add = [t.upper().strip() for t in payload["add"] if t.strip()]
-        merged = list(dict.fromkeys(current + to_add))  # preserve order, dedupe
+        merged = list(dict.fromkeys(current + to_add))
         save_watchlist(merged)
         return jsonify({"ok": True, "action": "added", "added": to_add, "tickers": merged, "count": len(merged)})
-
     if "remove" in payload:
         to_remove = {t.upper().strip() for t in payload["remove"]}
         filtered = [t for t in current if t not in to_remove]
         save_watchlist(filtered)
         return jsonify({"ok": True, "action": "removed", "removed": list(to_remove), "tickers": filtered, "count": len(filtered)})
+    return jsonify({"error": "Payload must have 'tickers', 'add', or 'remove'"}), 400
 
-    return jsonify({"error": "Payload must have 'tickers', 'add', or 'remove' key"}), 400
-
-
-@app.route('/api/watchlist/scan')
+@app.route("/api/watchlist/scan")
 def api_watchlist_scan():
-    """
-    Scan ALL watchlist tickers right now — independently of screeners.
-    Useful for monitoring INTC, QCOM, etc. at any time.
-    Returns full analysis sorted by score descending.
-    """
+    """Escanea los tickers de tu watchlist personal."""
     tickers = load_watchlist()
-    market  = get_market_pulse()
-    items   = []
+    if not tickers:
+        return jsonify({"error": "Watchlist vacía. Agrega tickers via POST /api/watchlist", "items": []})
+    market = get_market_pulse()
+    items  = []
     for tk in tickers:
         result = analyze_ticker(tk, market=market)
         if "error" not in result:
             items.append(result)
     items.sort(key=lambda x: x.get("score", 0), reverse=True)
     verdes = sum(1 for x in items if x.get("semaforo") == "VERDE")
-    alerts = sum(1 for x in items if x.get("catalyst_earn_alert"))
     sweeps = sum(1 for x in items if x.get("opt_is_sweep"))
     return jsonify({
         "source":    "watchlist_scan",
         "market":    market,
-        "timestamp": datetime.now().isoformat(timespec='seconds'),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
         "watchlist": tickers,
         "count":     len(items),
         "verdes":    verdes,
-        "earn_alerts": alerts,
         "sweeps":    sweeps,
-        "summary":   f"{verdes} verdes · {alerts} earnings alert · {sweeps} sweeps de {len(items)} analizados",
+        "summary":   f"{verdes} verde(s) · {sweeps} sweep(s) de {len(items)} en watchlist",
         "items":     items,
     })
 
 
-@app.route('/api/catalyst/<ticker>')
-def api_catalyst(ticker: str):
-    """
-    Pre-movement catalyst analysis for a single ticker.
-    Detects: analyst upgrades, earnings proximity, news impact.
-    Example: /api/catalyst/QCOM
-    """
-    ticker = ticker.upper().strip()
-    cat = get_catalyst_data(ticker)
-    return jsonify({
-        "ticker":          ticker,
-        "timestamp":       datetime.now().isoformat(timespec='seconds'),
-        "catalyst_score":  cat.get("catalyst_score", 0),
-        "catalyst_signal": cat.get("catalyst_signal", "NONE"),
-        "analyst_action":  cat.get("analyst_action"),
-        "earnings_days":   cat.get("earnings_days"),
-        "earnings_alert":  cat.get("earnings_alert", False),
-        "iv_spike":        cat.get("iv_spike", False),
-        "top_news_score":  cat.get("top_news_score", 0),
-        "top_news_title":  cat.get("top_news_title"),
-        "top_news_kws":    cat.get("top_news_kws", []),
-        "catalysts_found": cat.get("catalysts_found", []),
-    })
-
-
-@app.route('/api/debug')
+@app.route("/api/debug")
 def api_debug():
-    """Test all data sources including new options chain and catalyst detector."""
     out = {}
-    # Yahoo
-    y = get_yahoo("NVDA")
-    out["yahoo"] = {"ok": bool(y.get("price")), "price": y.get("price"), "vol": y.get("volume")}
-    # Finviz
-    f = get_finviz("NVDA")
-    out["finviz"] = {"ok": bool(f.get("rsi14")), "rsi": f.get("rsi14"), "news_count": len(f.get("news",[]))}
-    # Options chain
-    opts = get_options_flow_real("NVDA")
-    out["options_chain"] = {
-        "ok": bool(opts), "vol_oi": opts.get("best_vol_oi"),
-        "pc_ratio": opts.get("pc_ratio"), "dominant": opts.get("dominant_side"),
-        "is_unusual": opts.get("is_unusual"), "top_strikes": opts.get("top_strikes", [])[:3],
-    }
-    # Options screener
-    screener = get_options_unusual_screener()
-    out["options_screener"] = {
-        "ok": len(screener) > 0, "count": len(screener),
-        "unusual_count": sum(1 for x in screener if x.get("is_unusual")),
-        "top3": [{"ticker": x["ticker"], "vol_oi": x.get("opt_vol_oi"), "side": x.get("opt_dominant")} for x in screener[:3]],
-    }
-    # Catalyst detector
-    cat = get_catalyst_data("NVDA")
-    out["catalyst"] = {
-        "ok": True, "score": cat.get("catalyst_score"),
-        "signal": cat.get("catalyst_signal"), "found": cat.get("catalysts_found", []),
-    }
-    # Watchlist
-    wl = load_watchlist()
-    out["watchlist"] = {"ok": True, "count": len(wl), "tickers": wl[:10]}
-    # Stocktwits
-    st = get_stocktwits_sentiment("NVDA")
-    out["stocktwits"] = {"ok": bool(st), "data": st}
-    # Market pulse
+    pd   = get_price_data("NVDA")
+    out["price"]    = {"ok": bool(pd.get("price")), "price": pd.get("price"), "rel_vol": pd.get("rel_volume")}
+    opts = get_options_data("NVDA")
+    out["options"]  = {"ok": opts.get("has_options"), "vol_oi": opts.get("vol_oi"), "gamma": opts.get("gamma_score")}
+    news = get_news_score("NVDA")
+    out["news"]     = {"ok": bool(news.get("title")), "score": news.get("score"), "title": news.get("title")}
+    cands = discover_candidates()
+    out["discover"] = {"ok": len(cands) > 0, "count": len(cands), "top5": [c["ticker"] for c in cands[:5]]}
     pulse = get_market_pulse()
-    out["market_pulse"] = {"sentiment": pulse.get("sentiment"), "spy": pulse.get("SPY"), "vix": pulse.get("vix_price")}
+    out["market"]   = {"sentiment": pulse.get("sentiment"), "vix": pulse.get("vix_price")}
+    out["watchlist"]= {"count": len(load_watchlist())}
     out["timestamp"] = datetime.now().isoformat()
     return jsonify(out)
 
 
 # ── START ─────────────────────────────────────────────────────
-if __name__ == '__main__':
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
