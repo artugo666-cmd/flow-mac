@@ -146,6 +146,15 @@ def get_price_data(ticker: str) -> Dict[str, Any]:
             chg_abs = round(price - prev, 2)
             chg_pct = round(chg_abs / prev * 100, 2)
 
+        # Detectar si el dato es del día actual o está desactualizado
+        # Yahoo reporta el timestamp del último trade
+        mkt_time = int(meta.get("regularMarketTime") or 0)
+        from datetime import timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        data_age_hours = (now_utc.timestamp() - mkt_time) / 3600 if mkt_time else 99
+        # Si el último dato tiene más de 20h, el mercado cerró y los datos son del día anterior
+        data_is_stale = data_age_hours > 20
+
         day_hi = float(meta.get("regularMarketDayHigh") or 0)
         day_lo = float(meta.get("regularMarketDayLow") or 0)
         day_op = float(meta.get("regularMarketOpen") or 0)
@@ -160,6 +169,8 @@ def get_price_data(ticker: str) -> Dict[str, Any]:
             "volume": vol_hoy,
             "change_pct": chg_pct, "change_abs": chg_abs,
             "day_range_pos": day_range_pos,
+            "data_is_stale": data_is_stale,
+            "data_age_hours": round(data_age_hours, 1),
         })
 
     except Exception as e:
@@ -556,37 +567,75 @@ def get_sentiment(ticker: str) -> Dict[str, Any]:
 
 
 def get_market_pulse() -> Dict[str, Any]:
-    """SPY, QQQ, IWM, VIX — sentimiento general del mercado."""
+    """
+    SPY, QQQ, IWM, VIX — sentimiento del mercado.
+    
+    Problema conocido: Yahoo devuelve regularMarketChangePercent = 0
+    cuando el mercado está cerrado (antes de abrir o después de cerrar).
+    
+    Solución: calcular el cambio manualmente con:
+      price = regularMarketPrice   (precio del último trade del día)
+      prev  = chartPreviousClose   (cierre del día anterior)
+      chg   = (price - prev) / prev * 100
+    
+    Estos dos campos SIEMPRE tienen valores reales independientemente
+    del horario de mercado.
+    
+    Adicionalmente: usar range=5d para tener contexto de varios días
+    y detectar si el mercado está abierto o cerrado.
+    """
     pulse = {}
     for sym in ["SPY", "QQQ", "IWM", "^VIX"]:
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
-                params={"interval": "1d", "range": "1d"},
+                params={"interval": "1d", "range": "5d"},
                 headers=HEADERS, timeout=8
             )
             r.raise_for_status()
-            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            key  = "VIX" if sym == "^VIX" else sym
+            result = r.json().get("chart", {}).get("result", [])
+            if not result:
+                continue
+            meta = result[0].get("meta", {})
+            q    = result[0].get("indicators", {}).get("quote", [{}])[0]
+            closes = [c for c in (q.get("close") or []) if c is not None]
+
+            price = float(meta.get("regularMarketPrice") or 0)
+            # Intentar cambio% directo primero
+            chg_pct_direct = float(meta.get("regularMarketChangePercent") or 0)
+            
+            # Si viene en 0, calcularlo manualmente
+            if chg_pct_direct == 0 and len(closes) >= 2:
+                prev_close = closes[-2]   # penúltimo cierre = cierre de ayer
+                last_close = closes[-1]   # último cierre del período
+                if prev_close and prev_close > 0:
+                    chg_pct_direct = round((last_close - prev_close) / prev_close * 100, 2)
+
+            # También intentar con chartPreviousClose como fallback
+            if chg_pct_direct == 0:
+                prev = float(meta.get("chartPreviousClose") or 0)
+                if prev > 0 and price > 0:
+                    chg_pct_direct = round((price - prev) / prev * 100, 2)
+
+            key = "VIX" if sym == "^VIX" else sym
             pulse[key] = {
-                "price":      round(float(meta.get("regularMarketPrice") or 0), 2),
-                "change_pct": round(float(meta.get("regularMarketChangePercent") or 0), 2),
+                "price":      round(price, 2),
+                "change_pct": chg_pct_direct,
             }
-        except:
-            pass
+        except Exception as e:
+            print(f"Market pulse error {sym}: {e}")
 
     spy = pulse.get("SPY", {}).get("change_pct", 0)
     qqq = pulse.get("QQQ", {}).get("change_pct", 0)
     iwm = pulse.get("IWM", {}).get("change_pct", 0)
     vix = pulse.get("VIX", {}).get("price", 20)
-    avg = (spy + qqq + iwm) / 3
+    avg = round((spy + qqq + iwm) / 3, 2)
 
-    # Si todos vienen en 0.00%, puede ser antes/después del horario de mercado
-    # o un fallo de Yahoo — marcar como DATOS_NO_DISPONIBLES
+    # Todos en cero = Yahoo no pudo devolver datos reales
     todos_cero = (spy == 0 and qqq == 0 and iwm == 0)
 
     if todos_cero:
-        sentiment, emoji = "SIN_DATOS", "❓"  # Yahoo no devolvió cambios reales
+        sentiment, emoji = "SIN_DATOS", "❓"
     elif vix >= 30:
         sentiment, emoji = "MUY_VOLATIL", "⚡"
     elif avg >= 0.5:
@@ -597,9 +646,12 @@ def get_market_pulse() -> Dict[str, Any]:
         sentiment, emoji = "NEUTRAL", "➡️"
 
     pulse.update({
-        "sentiment": sentiment, "emoji": emoji,
-        "avg_change": round(avg, 2), "vix_price": vix,
-        "vix_risk": "ALTO" if vix >= 25 else "MODERADO" if vix >= 18 else "BAJO",
+        "sentiment":  sentiment,
+        "emoji":      emoji,
+        "avg_change": avg,
+        "vix_price":  vix,
+        "vix_risk":   "ALTO" if vix >= 25 else "MODERADO" if vix >= 18 else "BAJO",
+        "todos_cero": todos_cero,
     })
     return pulse
 
@@ -707,21 +759,39 @@ def discover_candidates() -> List[Dict[str, Any]]:
     MOVER_SOURCES = {"day_gainers", "day_losers", "small_cap_gainers"}
 
     def is_relevant(c):
-        # Screener de movers → relevante por definicion
-        if c.get("source", "") in MOVER_SOURCES:
+        src  = c.get("source", "")
+        chg  = abs(c.get("chg_pct", 0))
+        rvol = c.get("rel_vol", 1.0)
+
+        # Screeners de movers directos → siempre relevante
+        if src in MOVER_SOURCES:
             return True
-        # Movimiento fuerte del dia (CRCL +12%, ASTS +10% pasan aqui)
-        if abs(c.get("chg_pct", 0)) >= 2.0:
-            return True
-        # Volumen relativo inusual aunque el precio no se mueva mucho
-        if c.get("rel_vol", 1.0) >= 2.0:
-            return True
-        # IPO reciente con volumen masivo hoy
-        if c.get("is_ipo", False):
-            return True
-        # tech growth con cualquier movimiento positivo
-        if c.get("source", "") == "growth_technology_stocks" and c.get("chg_pct", 0) >= 1.0:
-            return True
+
+        # most_actives: criterio MÁS estricto
+        # Problema real: CTRA tiene 7M vol todos los días (S&P500)
+        # pero sin movimiento ni catalizador. Necesita chg >= 3% O rvol >= 3x
+        if src == "most_actives":
+            if chg >= 3.0: return True      # movimiento real hoy
+            if rvol >= 3.0: return True     # vol muy inusual vs promedio
+            if c.get("is_ipo", False): return True
+            return False  # CTRA con chg=0.5% y rvol=1.2x → descartada
+
+        # trending: solo si se mueve
+        if src == "trending":
+            if chg >= 2.0: return True
+            if rvol >= 2.5: return True
+            return False
+
+        # growth_technology: umbral bajo (estas siempre son relevantes)
+        if src == "growth_technology_stocks":
+            if chg >= 1.0: return True
+            if rvol >= 2.0: return True
+            return False
+
+        # Cualquier otra fuente
+        if chg >= 2.0: return True
+        if rvol >= 2.0: return True
+        if c.get("is_ipo", False): return True
         return False
 
     filtered = [c for c in candidates.values() if is_relevant(c)]
@@ -797,6 +867,8 @@ def compute_score(
     mkt_sent      = market.get("sentiment", "NEUTRAL")
     has_alert     = bool(alert_context and len(alert_context.strip()) > 5)
     abs_chg       = abs(chg_pct)
+    data_is_stale = price.get("data_is_stale", False)
+    data_age_h    = price.get("data_age_hours", 0)
 
     # ── DIRECCIÓN — cuál lado tiene más evidencia ─────────────
     # Prioridad: alert > opciones institucionales > precio
@@ -1043,6 +1115,11 @@ def compute_score(
     elif not is_bull and day_range_pos >= 0.7:
         pts_D += 0.3   # vendiendo cerca del máximo del día
 
+    # Datos stale (mercado cerrado): timing no es válido
+    # El chg_pct que ves es del día ANTERIOR — no tomes decisiones con eso
+    if data_is_stale:
+        pts_D = min(pts_D * 0.2, 0.3)
+
     pts_D = min(max(pts_D, 0), 2.5)
 
     # ── SCORE FINAL ───────────────────────────────────────────
@@ -1115,6 +1192,8 @@ def compute_score(
         why.append("✅ Estructura alcista: precio sobre MA20 y MA50")
     if short_pct >= 15 and is_bull:
         why.append(f"🔥 Short float {short_pct:.0f}% — combustible para squeeze")
+    if data_is_stale:
+        why.insert(0, f"⛔ DATOS DESACTUALIZADOS ({data_age_h:.0f}h) — mercado cerrado, no operar con estos datos")
     if not why:
         why.append(f"Cambio del día {chg_pct:+.2f}%. Sin catalizadores claros identificados.")
 
@@ -1312,6 +1391,8 @@ def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "") ->
         "control":         "COMPRADORES" if price_data.get("change_pct",0) > 0 and price_data.get("rel_volume",1) >= 1.5 else "VENDEDORES",
         "source":          "yahoo_finance",
         "timestamp":       datetime.now().isoformat(timespec="seconds"),
+        "data_is_stale":   price_data.get("data_is_stale", False),
+        "data_age_hours":  price_data.get("data_age_hours", 0),
     }
 
 
