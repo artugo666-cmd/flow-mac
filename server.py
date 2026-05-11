@@ -617,10 +617,11 @@ def discover_candidates() -> List[Dict[str, Any]]:
     candidates: Dict[str, Dict] = {}  # ticker → datos
 
     SCREENERS = [
-        ("most_actives",      40),
-        ("day_gainers",       30),
-        ("day_losers",        30),
-        ("small_cap_gainers", 25),
+        ("most_actives",         50),   # mayor volumen absoluto
+        ("day_gainers",          40),   # mayores subidas del dia
+        ("day_losers",           40),   # mayores caidas del dia
+        ("small_cap_gainers",    35),   # IPOs recientes y small caps
+        ("growth_technology_stocks", 30), # tech en momentum — ASTS, CRCL, etc.
     ]
 
     for scrId, count in SCREENERS:
@@ -648,17 +649,23 @@ def discover_candidates() -> List[Dict[str, Any]]:
                 chg_pct = float(q.get("regularMarketChangePercent", 0) or 0)
                 rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
-                # Filtro mínimo de liquidez: evita penny stocks sin volumen
-                if price < 0.50 or avg_vol < 200_000:
+                # Filtros de calidad: precio >= $5, avg_vol >= 1M diario
+                # IPO exception: si vol HOY > 2M aunque avg_vol sea bajo (sin 3m historial)
+                is_ipo = (avg_vol < 1_000_000 and vol_hoy > 3_000_000)
+                if price < 5.0:
+                    continue
+                if avg_vol < 1_000_000 and not is_ipo:
                     continue
 
                 candidates[tk] = {
-                    "ticker":     tk,
-                    "price":      price,
-                    "chg_pct":    chg_pct,
-                    "rel_vol":    rel_vol,
-                    "avg_vol":    avg_vol,
-                    "source":     scrId,
+                    "ticker":  tk,
+                    "price":   price,
+                    "chg_pct": chg_pct,
+                    "rel_vol": rel_vol,
+                    "avg_vol": avg_vol,
+                    "vol_hoy": vol,
+                    "source":  scrId,
+                    "is_ipo":  is_ipo,
                 }
 
             print(f"discover [{scrId}]: {len(candidates)} candidatos acumulados")
@@ -680,9 +687,43 @@ def discover_candidates() -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"discover [trending] error: {e}")
 
-    # Ordenar: mayor (|cambio%| × rel_vol) primero — los que más se mueven hoy
+    # ── FILTRO DE RELEVANCIA ─────────────────────────────────
+    # most_actives incluye acciones con alto volumen ABSOLUTO pero sin
+    # movimiento (CTRA, KO, JNJ en días normales). Son líquidas pero no
+    # son oportunidades hoy. Se filtran ANTES del análisis completo.
+    #
+    # Pasa el filtro si tiene AL MENOS UNO:
+    #   1. chg_pct >= 2%      → se está moviendo hoy
+    #   2. rel_vol >= 2x      → flujo inusual vs su promedio
+    #   3. Viene de day_gainers, day_losers, small_cap_gainers
+    #      → Yahoo ya lo identificó como mover del día
+
+    MOVER_SOURCES = {"day_gainers", "day_losers", "small_cap_gainers"}
+
+    def is_relevant(c):
+        # Screener de movers → relevante por definicion
+        if c.get("source", "") in MOVER_SOURCES:
+            return True
+        # Movimiento fuerte del dia (CRCL +12%, ASTS +10% pasan aqui)
+        if abs(c.get("chg_pct", 0)) >= 2.0:
+            return True
+        # Volumen relativo inusual aunque el precio no se mueva mucho
+        if c.get("rel_vol", 1.0) >= 2.0:
+            return True
+        # IPO reciente con volumen masivo hoy
+        if c.get("is_ipo", False):
+            return True
+        # tech growth con cualquier movimiento positivo
+        if c.get("source", "") == "growth_technology_stocks" and c.get("chg_pct", 0) >= 1.0:
+            return True
+        return False
+
+    filtered = [c for c in candidates.values() if is_relevant(c)]
+    print(f"discover: {len(candidates)} candidatos → {len(filtered)} relevantes (filtro mov/vol aplicado)")
+
+    # Ordenar: mayor (|cambio%| × rel_vol) primero
     ranked = sorted(
-        candidates.values(),
+        filtered,
         key=lambda x: abs(x.get("chg_pct", 0)) * max(x.get("rel_vol", 1.0), 1.0),
         reverse=True
     )
@@ -1278,7 +1319,7 @@ def api_scan():
     # Paso 2: analizar los top candidatos con análisis completo
     # Analizamos más de los que mostramos para filtrar mejor
     items = []
-    for cand in candidates[:18]:
+    for cand in candidates[:20]:
         result = analyze_ticker(cand["ticker"], market=market)
         if "error" not in result:
             items.append(result)
