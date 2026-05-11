@@ -581,7 +581,13 @@ def get_market_pulse() -> Dict[str, Any]:
     vix = pulse.get("VIX", {}).get("price", 20)
     avg = (spy + qqq + iwm) / 3
 
-    if vix >= 30:
+    # Si todos vienen en 0.00%, puede ser antes/después del horario de mercado
+    # o un fallo de Yahoo — marcar como DATOS_NO_DISPONIBLES
+    todos_cero = (spy == 0 and qqq == 0 and iwm == 0)
+
+    if todos_cero:
+        sentiment, emoji = "SIN_DATOS", "❓"  # Yahoo no devolvió cambios reales
+    elif vix >= 30:
         sentiment, emoji = "MUY_VOLATIL", "⚡"
     elif avg >= 0.5:
         sentiment, emoji = "ALCISTA", "📈"
@@ -830,8 +836,14 @@ def compute_score(
         pts_A = 1.0
     elif has_opts:
         pts_A = 0.6  # tiene opciones pero flujo normal
+    elif abs_chg >= 10 and rel_vol >= 4:
+        pts_A = 1.2  # sin opciones detectadas pero movimiento extremo + vol masivo
+    elif abs_chg >= 7  and rel_vol >= 3:
+        pts_A = 0.9
+    elif abs_chg >= 5  and rel_vol >= 2:
+        pts_A = 0.6
     else:
-        pts_A = 0.2  # sin datos de opciones
+        pts_A = 0.2  # sin datos de opciones y sin movimiento relevante
 
     # Bonus: flujo ATM confirma dirección (más específico que flujo general)
     atm_bonus = 0.0
@@ -886,8 +898,16 @@ def compute_score(
 
     # Volumen inusual sin opciones = algo está pasando aunque no sepamos qué
     if pts_B == 0:
-        if rel_vol >= 5:
-            pts_B = 1.5   # volumen 5x sin noticia obvia = acumulación silenciosa
+        # Sin catalizador detectado — usar precio + volumen como proxy
+        # Movimiento fuerte + vol alto = algo está pasando (institucional silencioso)
+        if abs_chg >= 8 and rel_vol >= 3:
+            pts_B = 1.8   # +8% con vol 3x = catalizador implícito fuerte
+        elif abs_chg >= 5 and rel_vol >= 2:
+            pts_B = 1.4   # +5% con vol 2x = catalizador implícito moderado
+        elif abs_chg >= 3 and rel_vol >= 2:
+            pts_B = 1.0
+        elif rel_vol >= 5:
+            pts_B = 1.5   # vol 5x sin movimiento = acumulación silenciosa
         elif rel_vol >= 3:
             pts_B = 1.0
         elif rel_vol >= 2:
@@ -913,13 +933,19 @@ def compute_score(
             pts_C = 1.2
         elif above_sma20:
             pts_C = 0.8
+        elif chg_pct >= 8:
+            pts_C = 1.4   # +8% es momentum fuerte aunque esté bajo MAs (ASTS, CRCL)
+        elif chg_pct >= 5:
+            pts_C = 1.0   # +5% con tendencia rompiendo es señal real
         elif chg_pct > 2:
-            pts_C = 0.6   # subiendo con fuerza aunque esté bajo MAs
+            pts_C = 0.6
         else:
             pts_C = 0.2
 
         # Bonus: volumen confirma el movimiento alcista
-        if rel_vol >= 3 and chg_pct > 1:
+        if rel_vol >= 5 and chg_pct > 3:
+            pts_C = min(pts_C + 0.5, 2.5)
+        elif rel_vol >= 3 and chg_pct > 1:
             pts_C = min(pts_C + 0.4, 2.5)
         elif rel_vol >= 2 and chg_pct > 0.5:
             pts_C = min(pts_C + 0.2, 2.5)
@@ -950,10 +976,19 @@ def compute_score(
             pts_C = min(pts_C + 0.2, 2.5)
 
     # Mercado general — viento a favor o en contra
-    mkt_mod = 0.3 if mkt_sent == "ALCISTA" and is_bull else \
-              0.3 if mkt_sent == "BAJISTA" and not is_bull else \
-             -0.3 if mkt_sent == "BAJISTA" and is_bull else \
-             -0.3 if mkt_sent == "ALCISTA" and not is_bull else 0.0
+    # SIN_DATOS = no penalizar ni bonificar (no sabemos el estado real)
+    if mkt_sent in ("SIN_DATOS", "NEUTRAL", "MUY_VOLATIL"):
+        mkt_mod = 0.0
+    elif mkt_sent == "ALCISTA" and is_bull:
+        mkt_mod = 0.3
+    elif mkt_sent == "BAJISTA" and not is_bull:
+        mkt_mod = 0.3
+    elif mkt_sent == "BAJISTA" and is_bull:
+        mkt_mod = -0.3
+    elif mkt_sent == "ALCISTA" and not is_bull:
+        mkt_mod = -0.3
+    else:
+        mkt_mod = 0.0
     pts_C = min(max(pts_C + mkt_mod, 0), 2.5)
 
     # ════════════════════════════════════════════════════════
@@ -976,17 +1011,19 @@ def compute_score(
     elif rsi >= 60 and not is_bull:
         pts_D += 0.3
 
-    # Movimiento del día — si ya se movió mucho, el tren pasó
+    # Movimiento del día — penalizar solo si es extremo O no tiene catalizador
+    # Con catalizador fuerte (earnings, noticia, sweep), el movimiento ES el setup
+    tiene_catalyst = pts_B >= 1.6
     if abs_chg >= 20:
-        pts_D -= 1.5   # movimiento extremo, prima de opciones inflada
+        pts_D -= 1.2   # siempre: prima muy inflada independiente del catalizador
     elif abs_chg >= 15:
-        pts_D -= 1.0
+        pts_D -= 0.8
     elif abs_chg >= 10:
-        pts_D -= 0.6
+        pts_D -= 0.2 if tiene_catalyst else 0.6  # con razón = oportunidad, sin razón = peligro
     elif abs_chg >= 7:
-        pts_D -= 0.3
-    elif 2 <= abs_chg <= 5 and rel_vol >= 2:
-        pts_D += 0.4   # movimiento saludable con volumen = setup ideal
+        pts_D -= 0.0 if tiene_catalyst else 0.3
+    elif 2 <= abs_chg <= 8 and rel_vol >= 2:
+        pts_D += 0.4   # setup ideal: movimiento moderado con volumen
 
     # Posición vs VWAP — entrada cerca del VWAP = mejor R/R
     if is_bull:
@@ -1160,6 +1197,10 @@ def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "") ->
 
     if not price_data.get("price"):
         return {"ticker": ticker, "error": f"Sin datos para {ticker}", "score": 0, "semaforo": "ROJO"}
+
+    # Doble check con precio real (el screener puede tener precio diferente al real)
+    if price_data.get("price", 0) < 5.0:
+        return {"ticker": ticker, "error": f"{ticker} precio real ${price_data['price']:.2f} < $5.00", "score": 0, "semaforo": "ROJO"}
 
     scoring = compute_score(
         ticker, price_data, fund_data, opts_data,
