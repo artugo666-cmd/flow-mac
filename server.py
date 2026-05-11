@@ -675,11 +675,12 @@ def discover_candidates() -> List[Dict[str, Any]]:
     candidates: Dict[str, Dict] = {}  # ticker → datos
 
     SCREENERS = [
-        ("most_actives",         50),   # mayor volumen absoluto
-        ("day_gainers",          40),   # mayores subidas del dia
-        ("day_losers",           40),   # mayores caidas del dia
-        ("small_cap_gainers",    35),   # IPOs recientes y small caps
-        ("growth_technology_stocks", 30), # tech en momentum — ASTS, CRCL, etc.
+        ("most_actives",             50),   # mayor volumen absoluto
+        ("day_gainers",              50),   # mayores subidas del dia — AUMENTADO a 50
+        ("day_losers",               40),   # mayores caidas del dia
+        ("small_cap_gainers",        50),   # IPOs recientes y small caps — AUMENTADO a 50
+        ("growth_technology_stocks", 30),   # tech en momentum — ASTS, CRCL, etc.
+        ("aggressive_small_caps",    40),   # micro/small caps agresivas — captura GSIT-tipo
     ]
 
     for scrId, count in SCREENERS:
@@ -708,11 +709,14 @@ def discover_candidates() -> List[Dict[str, Any]]:
                 rel_vol = round(vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
                 # Filtros de calidad: precio >= $5, avg_vol >= 1M diario
-                # IPO exception: si vol HOY > 2M aunque avg_vol sea bajo (sin 3m historial)
-                is_ipo = (avg_vol < 1_000_000 and vol_hoy > 3_000_000)
-                if price < 5.0:
+                # IPO/mover exception: si vol HOY > 2M aunque avg_vol sea bajo
+                # BUG FIX: usar 'vol' no 'vol_hoy' (nombre correcto en este scope)
+                is_ipo = (avg_vol < 1_000_000 and vol > 2_000_000)
+                # Mover extremo: subida >= 15% con volumen real hoy = siempre analizar
+                is_extreme_mover = (abs(chg_pct) >= 15.0 and vol >= 500_000)
+                if price < 2.0:  # Bajado de $5 a $2 para no perder small caps en movimiento
                     continue
-                if avg_vol < 1_000_000 and not is_ipo:
+                if avg_vol < 1_000_000 and not is_ipo and not is_extreme_mover:
                     continue
 
                 candidates[tk] = {
@@ -724,6 +728,7 @@ def discover_candidates() -> List[Dict[str, Any]]:
                     "vol_hoy": vol,
                     "source":  scrId,
                     "is_ipo":  is_ipo,
+                    "is_extreme_mover": is_extreme_mover,
                 }
 
             print(f"discover [{scrId}]: {len(candidates)} candidatos acumulados")
@@ -763,6 +768,12 @@ def discover_candidates() -> List[Dict[str, Any]]:
         chg  = abs(c.get("chg_pct", 0))
         rvol = c.get("rel_vol", 1.0)
 
+        # Mover extremo (+15% o más) → SIEMPRE analizar sin importar fuente
+        if c.get("is_extreme_mover", False):
+            return True
+        if chg >= 15.0:
+            return True
+
         # Screeners de movers directos → siempre relevante
         if src in MOVER_SOURCES:
             return True
@@ -797,10 +808,14 @@ def discover_candidates() -> List[Dict[str, Any]]:
     filtered = [c for c in candidates.values() if is_relevant(c)]
     print(f"discover: {len(candidates)} candidatos → {len(filtered)} relevantes (filtro mov/vol aplicado)")
 
-    # Ordenar: mayor (|cambio%| × rel_vol) primero
+    # Ordenar: movers extremos primero, luego por |cambio%| x rel_vol
+    # Garantiza que un GSIT +59% no quede enterrado por un NVDA con vol alto
     ranked = sorted(
         filtered,
-        key=lambda x: abs(x.get("chg_pct", 0)) * max(x.get("rel_vol", 1.0), 1.0),
+        key=lambda x: (
+            1 if x.get("is_extreme_mover") or abs(x.get("chg_pct", 0)) >= 15 else 0,
+            abs(x.get("chg_pct", 0)) * max(x.get("rel_vol", 1.0), 1.0),
+        ),
         reverse=True
     )
 
@@ -1278,8 +1293,9 @@ def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "") ->
         return {"ticker": ticker, "error": f"Sin datos para {ticker}", "score": 0, "semaforo": "ROJO"}
 
     # Doble check con precio real (el screener puede tener precio diferente al real)
-    if price_data.get("price", 0) < 5.0:
-        return {"ticker": ticker, "error": f"{ticker} precio real ${price_data['price']:.2f} < $5.00", "score": 0, "semaforo": "ROJO"}
+    # Bajado de $5 a $2 para no perder small caps en movimiento (GSIT-tipo)
+    if price_data.get("price", 0) < 2.0:
+        return {"ticker": ticker, "error": f"{ticker} precio real ${price_data['price']:.2f} < $2.00", "score": 0, "semaforo": "ROJO"}
 
     scoring = compute_score(
         ticker, price_data, fund_data, opts_data,
@@ -1439,9 +1455,10 @@ def api_scan():
         return jsonify({"error": "Todos los feeds de Yahoo fallaron. Verifica conectividad.", "items": []}), 503
 
     # Paso 2: analizar los top candidatos con análisis completo
-    # Analizamos más de los que mostramos para filtrar mejor
+    # AUMENTADO de 20 a 50 para no perder movers que caen fuera del top 20
+    # El cuello de botella anterior era aquí — CRCL/GSIT podían estar en posición 21-150
     items = []
-    for cand in candidates[:20]:
+    for cand in candidates[:50]:
         result = analyze_ticker(cand["ticker"], market=market)
         if "error" not in result:
             items.append(result)
