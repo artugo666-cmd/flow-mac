@@ -923,12 +923,20 @@ def compute_score(
         pts_A = 1.0
     elif has_opts:
         pts_A = 0.6  # tiene opciones pero flujo normal
+    # Sin opciones — vol masivo + movimiento fuerte = institucional silencioso
+    # Subido el techo: antes max 1.2, ahora hasta 2.0 si el vol es verdaderamente extremo
+    elif abs_chg >= 20 and rel_vol >= 10:
+        pts_A = 2.0  # GSIT/CRCL tipo: +20%+ con vol 10x = dinero real detrás
+    elif abs_chg >= 15 and rel_vol >= 7:
+        pts_A = 1.8
+    elif abs_chg >= 10 and rel_vol >= 5:
+        pts_A = 1.6
     elif abs_chg >= 10 and rel_vol >= 4:
-        pts_A = 1.2  # sin opciones detectadas pero movimiento extremo + vol masivo
+        pts_A = 1.4
     elif abs_chg >= 7  and rel_vol >= 3:
-        pts_A = 0.9
+        pts_A = 1.0
     elif abs_chg >= 5  and rel_vol >= 2:
-        pts_A = 0.6
+        pts_A = 0.7
     else:
         pts_A = 0.2  # sin datos de opciones y sin movimiento relevante
 
@@ -983,24 +991,44 @@ def compute_score(
     elif analyst_type in ("main", "reit", "reiterate"):
         pts_B = max(pts_B, 1.2)
 
-    # Volumen inusual sin opciones = algo está pasando aunque no sepamos qué
+    # Volumen inusual — ahora SUMA al catalizador existente, no lo reemplaza
+    # Antes: solo activaba si pts_B == 0. Ahora siempre suma si el vol es real
+    # Lógica: noticia débil + volumen explosivo = ambas señales cuentan
+    vol_bonus_B = 0.0
+    if abs_chg >= 20 and rel_vol >= 8:
+        vol_bonus_B = 0.7   # movimiento extremo con vol masivo = catalizador implícito fuerte
+    elif abs_chg >= 10 and rel_vol >= 5:
+        vol_bonus_B = 0.5
+    elif abs_chg >= 8 and rel_vol >= 3:
+        vol_bonus_B = 0.4
+    elif abs_chg >= 5 and rel_vol >= 2:
+        vol_bonus_B = 0.3
+    elif rel_vol >= 5:
+        vol_bonus_B = 0.4   # vol 5x sin movimiento = acumulación silenciosa
+    elif rel_vol >= 3:
+        vol_bonus_B = 0.2
+    elif rel_vol >= 2:
+        vol_bonus_B = 0.1
+
+    # Si no había catalizador, el vol implícito ES el catalizador (base mínima)
     if pts_B == 0:
-        # Sin catalizador detectado — usar precio + volumen como proxy
-        # Movimiento fuerte + vol alto = algo está pasando (institucional silencioso)
         if abs_chg >= 8 and rel_vol >= 3:
-            pts_B = 1.8   # +8% con vol 3x = catalizador implícito fuerte
+            pts_B = 1.8
         elif abs_chg >= 5 and rel_vol >= 2:
-            pts_B = 1.4   # +5% con vol 2x = catalizador implícito moderado
+            pts_B = 1.4
         elif abs_chg >= 3 and rel_vol >= 2:
             pts_B = 1.0
         elif rel_vol >= 5:
-            pts_B = 1.5   # vol 5x sin movimiento = acumulación silenciosa
+            pts_B = 1.5
         elif rel_vol >= 3:
             pts_B = 1.0
         elif rel_vol >= 2:
             pts_B = 0.6
         else:
             pts_B = 0.2
+    else:
+        # Ya había catalizador — sumar el bonus de vol encima
+        pts_B = pts_B + vol_bonus_B
 
     pts_B = min(pts_B, 2.5)
 
@@ -1085,14 +1113,16 @@ def compute_score(
     pts_D = 1.0  # base neutral
 
     # RSI — sobrecomprado/sobrevendido penaliza el timing
+    # EXCEPCIÓN: RSI alto con vol 5x+ = momentum genuino institucional, no sobreextensión
+    vol_confirma = rel_vol >= 5.0  # vol masivo = institucionales detrás, RSI no importa tanto
     if rsi >= 80 and is_bull:
-        pts_D -= 0.8   # muy sobrecomprado, prima de opciones inflada
+        pts_D -= 0.3 if vol_confirma else 0.8   # con vol masivo: penalidad mínima
     elif rsi >= 70 and is_bull:
-        pts_D -= 0.4
+        pts_D -= 0.1 if vol_confirma else 0.4   # con vol masivo: casi sin penalidad
     elif rsi <= 20 and not is_bull:
-        pts_D -= 0.8
+        pts_D -= 0.3 if vol_confirma else 0.8
     elif rsi <= 30 and not is_bull:
-        pts_D -= 0.4
+        pts_D -= 0.1 if vol_confirma else 0.4
     elif rsi <= 40 and is_bull:
         pts_D += 0.3   # RSI moderado en tendencia alcista = mejor entrada
     elif rsi >= 60 and not is_bull:
@@ -1100,15 +1130,24 @@ def compute_score(
 
     # Movimiento del día — penalizar solo si es extremo O no tiene catalizador
     # Con catalizador fuerte (earnings, noticia, sweep), el movimiento ES el setup
+    # Con vol institucional real (5x+), reducir penalidad — el movimiento tiene combustible
     tiene_catalyst = pts_B >= 1.6
+    tiene_vol_inst  = rel_vol >= 5.0  # vol institucional confirmado
     if abs_chg >= 20:
-        pts_D -= 1.2   # siempre: prima muy inflada independiente del catalizador
+        # +20%: siempre penalizar, pero menos si hay vol institucional real
+        pts_D -= 0.6 if tiene_vol_inst else 1.2
     elif abs_chg >= 15:
-        pts_D -= 0.8
+        pts_D -= 0.3 if tiene_vol_inst else 0.8
     elif abs_chg >= 10:
-        pts_D -= 0.2 if tiene_catalyst else 0.6  # con razón = oportunidad, sin razón = peligro
+        # Con razón Y vol = oportunidad real; sin ninguno = peligro
+        if tiene_catalyst and tiene_vol_inst:
+            pts_D -= 0.0
+        elif tiene_catalyst or tiene_vol_inst:
+            pts_D -= 0.2
+        else:
+            pts_D -= 0.6
     elif abs_chg >= 7:
-        pts_D -= 0.0 if tiene_catalyst else 0.3
+        pts_D -= 0.0 if (tiene_catalyst or tiene_vol_inst) else 0.3
     elif 2 <= abs_chg <= 8 and rel_vol >= 2:
         pts_D += 0.4   # setup ideal: movimiento moderado con volumen
 
@@ -1463,8 +1502,11 @@ def api_scan():
         if "error" not in result:
             items.append(result)
 
-    # Paso 3: ordenar por score descendente
+    # Paso 3: ordenar por score descendente y quedarse con top 10
+    # El sistema analiza 50 internamente pero solo muestra los 10 mejores
+    # Menos ruido, más foco en lo que realmente vale la pena
     items.sort(key=lambda x: x.get("score", 0), reverse=True)
+    items = items[:10]
 
     # Métricas del scan
     verdes  = sum(1 for x in items if x.get("semaforo") == "VERDE")
