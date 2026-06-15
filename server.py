@@ -12,9 +12,39 @@ Uso standalone:  python analyzer_module.py DXYZ
 """
 
 import sys
+import time
 import yfinance as yf
 import pandas as pd
 import numpy as np
+
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:
+    class YFRateLimitError(Exception):
+        pass
+
+
+# ============================================================
+# HELPER — Retry con backoff para evitar rate limit de Yahoo
+# ============================================================
+
+def _safe_yf_call(func, *args, retries=3, base_delay=2, **kwargs):
+    """
+    Ejecuta una llamada a yfinance con reintentos y backoff exponencial.
+    Yahoo Finance rate-limita IPs compartidas (ej. Render free tier).
+    """
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except YFRateLimitError as e:
+            last_error = e
+            wait = base_delay * (2 ** attempt)
+            time.sleep(wait)
+        except Exception as e:
+            last_error = e
+            time.sleep(base_delay)
+    raise last_error
 
 
 # ============================================================
@@ -22,9 +52,16 @@ import numpy as np
 # ============================================================
 
 def get_fundamentals(ticker: str) -> dict:
-    """Extrae métricas fundamentales clave vía yfinance."""
+    """Extrae métricas fundamentales clave vía yfinance, con retry."""
     t = yf.Ticker(ticker)
-    info = t.info
+
+    try:
+        info = _safe_yf_call(lambda: t.info)
+    except Exception as e:
+        return {
+            "ticker": ticker,
+            "error": f"No se pudieron obtener fundamentales (rate limit Yahoo): {e}",
+        }
 
     data = {
         "ticker": ticker,
@@ -59,6 +96,9 @@ def score_fundamentals(f: dict) -> dict:
     Convierte fundamentales en señales ALZA / BAJA / NEUTRAL.
     Cada regla es ajustable según tu criterio de PEMEX-grade analysis.
     """
+    if f.get("error"):
+        return {"score_fundamental": 0, "signals": [(f["error"], "ERROR", 0)]}
+
     signals = []
     score = 0  # -10 a +10 acumulado
 
@@ -152,9 +192,14 @@ def get_technical_levels(ticker: str, period="6mo") -> dict:
       - Pivot points clásicos (último periodo)
       - Máximos/mínimos locales (swing highs/lows)
       - Medias móviles como soporte/resistencia dinámico
+    Con retry para evitar rate limit de Yahoo.
     """
     t = yf.Ticker(ticker)
-    hist = t.history(period=period)
+
+    try:
+        hist = _safe_yf_call(lambda: t.history(period=period))
+    except Exception as e:
+        return {"error": f"No se pudo obtener histórico (rate limit Yahoo): {e}"}
 
     if hist.empty:
         return {"error": "Sin datos históricos"}
