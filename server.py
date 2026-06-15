@@ -1,18 +1,21 @@
 """
-FlowScan v10 - Módulo de Análisis Profundo
+FlowScan v10 - Server Principal
 ============================================
-Analiza un ticker en 4 capas:
-  1. Fundamentales (PER, EPS, Deuda)
-  2. Niveles técnicos (Soportes/Resistencias)
-  3. Interpretación de Options Flow (input manual desde SensaMarket/Unusual Whales)
-  4. Score compuesto con variables alcistas/bajistas
+Servidor Flask con endpoint de análisis profundo.
 
-Diseñado para integrarse como blueprint en tu app Flask existente.
-Uso standalone:  python analyzer_module.py DXYZ
+IMPORTANTE: este archivo NO ejecuta yfinance al arrancar.
+analyze() solo se llama cuando alguien pide /analyze/<ticker>.
+
+Si tenías rutas adicionales en tu server.py anterior
+(dashboard HTML, scanner autónomo, parser de Discord, etc.)
+ESAS RUTAS NO ESTÁN AQUÍ — hay que recuperarlas de un commit
+anterior en GitHub y agregarlas a este archivo.
 """
 
-import sys
+import os
 import time
+from flask import Flask, jsonify
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -24,23 +27,21 @@ except ImportError:
         pass
 
 
+app = Flask(__name__)
+
+
 # ============================================================
 # HELPER — Retry con backoff para evitar rate limit de Yahoo
 # ============================================================
 
 def _safe_yf_call(func, *args, retries=3, base_delay=2, **kwargs):
-    """
-    Ejecuta una llamada a yfinance con reintentos y backoff exponencial.
-    Yahoo Finance rate-limita IPs compartidas (ej. Render free tier).
-    """
     last_error = None
     for attempt in range(retries):
         try:
             return func(*args, **kwargs)
         except YFRateLimitError as e:
             last_error = e
-            wait = base_delay * (2 ** attempt)
-            time.sleep(wait)
+            time.sleep(base_delay * (2 ** attempt))
         except Exception as e:
             last_error = e
             time.sleep(base_delay)
@@ -52,18 +53,16 @@ def _safe_yf_call(func, *args, retries=3, base_delay=2, **kwargs):
 # ============================================================
 
 def get_fundamentals(ticker: str) -> dict:
-    """Extrae métricas fundamentales clave vía yfinance, con retry."""
     t = yf.Ticker(ticker)
-
     try:
         info = _safe_yf_call(lambda: t.info)
     except Exception as e:
-        return {
-            "ticker": ticker,
-            "error": f"No se pudieron obtener fundamentales (rate limit Yahoo): {e}",
-        }
+        return {"ticker": ticker, "error": f"No se pudieron obtener fundamentales (rate limit Yahoo): {e}"}
 
-    data = {
+    if not info:
+        return {"ticker": ticker, "error": "Yahoo devolvió respuesta vacía (posible rate limit)"}
+
+    return {
         "ticker": ticker,
         "precio_actual": info.get("currentPrice") or info.get("regularMarketPrice"),
         "per_trailing": info.get("trailingPE"),
@@ -88,21 +87,15 @@ def get_fundamentals(ticker: str) -> dict:
         "52w_high": info.get("fiftyTwoWeekHigh"),
         "52w_low": info.get("fiftyTwoWeekLow"),
     }
-    return data
 
 
 def score_fundamentals(f: dict) -> dict:
-    """
-    Convierte fundamentales en señales ALZA / BAJA / NEUTRAL.
-    Cada regla es ajustable según tu criterio de PEMEX-grade analysis.
-    """
     if f.get("error"):
         return {"score_fundamental": 0, "signals": [(f["error"], "ERROR", 0)]}
 
     signals = []
-    score = 0  # -10 a +10 acumulado
+    score = 0
 
-    # --- EPS growth ---
     eg = f.get("earnings_growth")
     if eg is not None:
         if eg > 0.15:
@@ -112,7 +105,6 @@ def score_fundamentals(f: dict) -> dict:
             signals.append(("EPS cayendo (%.1f%%)" % (eg * 100), "BAJA", -2))
             score -= 2
 
-    # --- PER vs sector (regla simple: PER muy alto = riesgo de corrección) ---
     per = f.get("per_forward") or f.get("per_trailing")
     if per is not None:
         if per > 60:
@@ -122,7 +114,6 @@ def score_fundamentals(f: dict) -> dict:
             signals.append((f"PER forward bajo ({per:.1f}x) — posible value", "ALZA", 1))
             score += 1
 
-    # --- Deuda ---
     dte = f.get("debt_to_equity")
     if dte is not None:
         if dte > 150:
@@ -132,7 +123,6 @@ def score_fundamentals(f: dict) -> dict:
             signals.append((f"Debt/Equity sano ({dte:.0f}%)", "ALZA", 1))
             score += 1
 
-    # --- Free cash flow ---
     fcf = f.get("free_cashflow")
     if fcf is not None:
         if fcf < 0:
@@ -142,7 +132,6 @@ def score_fundamentals(f: dict) -> dict:
             signals.append(("Free Cash Flow positivo", "ALZA", 1))
             score += 1
 
-    # --- Precio vs medias móviles ---
     price = f.get("precio_actual")
     ma50 = f.get("ma50")
     ma200 = f.get("ma200")
@@ -156,11 +145,10 @@ def score_fundamentals(f: dict) -> dict:
         elif price > ma200 and price < ma50:
             signals.append(("Corrección dentro de tendencia alcista mayor", "NEUTRAL", 0))
 
-    # --- Distancia a 52w high/low (zona de compra) ---
     h52 = f.get("52w_high")
     l52 = f.get("52w_low")
     if price and h52 and l52 and h52 != l52:
-        pos = (price - l52) / (h52 - l52)  # 0 = en el low, 1 = en el high
+        pos = (price - l52) / (h52 - l52)
         if pos < 0.25:
             signals.append((f"Precio cerca del low 52w ({pos*100:.0f}% del rango) — posible zona de compra", "ALZA", 1))
             score += 1
@@ -168,7 +156,6 @@ def score_fundamentals(f: dict) -> dict:
             signals.append((f"Precio cerca del high 52w ({pos*100:.0f}% del rango) — extendido, cuidado con entradas", "BAJA", -1))
             score -= 1
 
-    # --- Target de analistas ---
     target = f.get("target_mean_price")
     if price and target:
         upside = (target - price) / price
@@ -183,19 +170,11 @@ def score_fundamentals(f: dict) -> dict:
 
 
 # ============================================================
-# CAPA 2 — NIVELES TÉCNICOS (Soportes / Resistencias)
+# CAPA 2 — NIVELES TÉCNICOS
 # ============================================================
 
 def get_technical_levels(ticker: str, period="6mo") -> dict:
-    """
-    Calcula soportes y resistencias usando:
-      - Pivot points clásicos (último periodo)
-      - Máximos/mínimos locales (swing highs/lows)
-      - Medias móviles como soporte/resistencia dinámico
-    Con retry para evitar rate limit de Yahoo.
-    """
     t = yf.Ticker(ticker)
-
     try:
         hist = _safe_yf_call(lambda: t.history(period=period))
     except Exception as e:
@@ -212,17 +191,14 @@ def get_technical_levels(ticker: str, period="6mo") -> dict:
     last_high = high.iloc[-1]
     last_low = low.iloc[-1]
 
-    # --- Pivot Points clásicos (basado en última sesión) ---
     pivot = (last_high + last_low + last_close) / 3
     r1 = 2 * pivot - last_low
     s1 = 2 * pivot - last_high
     r2 = pivot + (last_high - last_low)
     s2 = pivot - (last_high - last_low)
 
-    # --- Swing highs / lows (ventana de 5 días) ---
     window = 5
-    swing_highs = []
-    swing_lows = []
+    swing_highs, swing_lows = [], []
     for i in range(window, len(hist) - window):
         seg_high = high.iloc[i - window:i + window + 1]
         seg_low = low.iloc[i - window:i + window + 1]
@@ -231,11 +207,9 @@ def get_technical_levels(ticker: str, period="6mo") -> dict:
         if low.iloc[i] == seg_low.min():
             swing_lows.append(round(low.iloc[i], 2))
 
-    # Niveles más relevantes = los más cercanos al precio actual, sin duplicados
     resistencias = sorted(set([r for r in swing_highs if r > last_close]))[:3]
     soportes = sorted(set([s for s in swing_lows if s < last_close]), reverse=True)[:3]
 
-    # --- Medias móviles ---
     ma20 = close.rolling(20).mean().iloc[-1]
     ma50 = close.rolling(50).mean().iloc[-1]
     ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
@@ -243,34 +217,22 @@ def get_technical_levels(ticker: str, period="6mo") -> dict:
     return {
         "precio_actual": round(last_close, 2),
         "pivot_points": {
-            "pivot": round(pivot, 2),
-            "r1": round(r1, 2),
-            "r2": round(r2, 2),
-            "s1": round(s1, 2),
-            "s2": round(s2, 2),
+            "pivot": round(pivot, 2), "r1": round(r1, 2), "r2": round(r2, 2),
+            "s1": round(s1, 2), "s2": round(s2, 2),
         },
         "resistencias_swing": resistencias,
         "soportes_swing": soportes,
         "ma20": round(ma20, 2) if not np.isnan(ma20) else None,
         "ma50": round(ma50, 2) if not np.isnan(ma50) else None,
-        "ma200": round(ma200, 2) if ma200 and not np.isnan(ma200) else None,
+        "ma200": round(ma200, 2) if ma200 is not None and not np.isnan(ma200) else None,
     }
 
 
 # ============================================================
-# CAPA 3 — OPTIONS FLOW (input manual desde SensaMarket / Unusual Whales)
+# CAPA 3 — OPTIONS FLOW
 # ============================================================
 
 def score_options_flow(flow_data: list) -> dict:
-    """
-    flow_data: lista de dicts con sweeps detectados manualmente, ej:
-    [
-      {"type": "CALL", "side": "Ask", "strike": 40, "premium": 150000, "sentiment": "BULLISH"},
-      {"type": "PUT",  "side": "Ask", "strike": 35, "premium": 50000,  "sentiment": "BEARISH"},
-    ]
-
-    Calcula ratio put/call ponderado por premium y dirección neta del flujo.
-    """
     if not flow_data:
         return {"score_flow": 0, "signals": [("Sin datos de flow", "NEUTRAL", 0)]}
 
@@ -278,12 +240,11 @@ def score_options_flow(flow_data: list) -> dict:
     put_premium = sum(f["premium"] for f in flow_data if f["type"] == "PUT")
     total = call_premium + put_premium
 
-    signals = []
-    score = 0
-
     if total == 0:
         return {"score_flow": 0, "signals": [("Sin premium registrado", "NEUTRAL", 0)]}
 
+    signals = []
+    score = 0
     call_pct = call_premium / total
     put_call_ratio = put_premium / call_premium if call_premium > 0 else float("inf")
 
@@ -313,12 +274,7 @@ def score_options_flow(flow_data: list) -> dict:
 # ============================================================
 
 def composite_decision(fund_score: int, flow_score: int, technical_bias: str = "NEUTRAL") -> dict:
-    """
-    Combina los scores en una decisión final tipo FlowScan
-    (ENTRAR / ESPERAR / NO OPERAR)
-    """
     bias_score = {"ALZA": 2, "NEUTRAL": 0, "BAJA": -2}.get(technical_bias, 0)
-
     total = fund_score + flow_score + bias_score
 
     if total >= 4:
@@ -340,41 +296,15 @@ def composite_decision(fund_score: int, flow_score: int, technical_bias: str = "
 
 
 # ============================================================
-# RUNNER PRINCIPAL
+# RUNNER
 # ============================================================
 
 def analyze(ticker: str, flow_data: list = None):
-    print(f"\n{'='*60}")
-    print(f"  ANÁLISIS COMPLETO: {ticker}")
-    print(f"{'='*60}\n")
-
-    # Capa 1
     fund = get_fundamentals(ticker)
     fund_score_data = score_fundamentals(fund)
 
-    print("--- FUNDAMENTALES ---")
-    print(f"Precio actual: ${fund.get('precio_actual')}")
-    print(f"PER forward: {fund.get('per_forward')}")
-    print(f"EPS forward: {fund.get('eps_forward')}")
-    print(f"Debt/Equity: {fund.get('debt_to_equity')}")
-    print(f"Sector: {fund.get('sector')}")
-    print()
-    print("Señales fundamentales:")
-    for s, direction, pts in fund_score_data["signals"]:
-        print(f"  [{direction:>7}] {s}  ({pts:+d})")
-    print(f"\n  Score Fundamental: {fund_score_data['score_fundamental']:+d}")
-
-    # Capa 2
-    print("\n--- NIVELES TÉCNICOS ---")
     tech = get_technical_levels(ticker)
     if "error" not in tech:
-        print(f"Precio: ${tech['precio_actual']}")
-        print(f"Pivot: {tech['pivot_points']}")
-        print(f"Resistencias cercanas: {tech['resistencias_swing']}")
-        print(f"Soportes cercanos: {tech['soportes_swing']}")
-        print(f"MA20: {tech['ma20']} | MA50: {tech['ma50']} | MA200: {tech['ma200']}")
-
-        # Bias técnico simple
         price = tech["precio_actual"]
         if tech["ma50"] and price > tech["ma50"]:
             technical_bias = "ALZA"
@@ -383,27 +313,15 @@ def analyze(ticker: str, flow_data: list = None):
         else:
             technical_bias = "NEUTRAL"
     else:
-        print(tech["error"])
         technical_bias = "NEUTRAL"
 
-    # Capa 3
-    print("\n--- OPTIONS FLOW ---")
     flow_score_data = score_options_flow(flow_data or [])
-    for s, direction, pts in flow_score_data["signals"]:
-        print(f"  [{direction:>7}] {s}")
-    print(f"\n  Score Flow: {flow_score_data['score_flow']:+d}")
 
-    # Capa 4
-    print("\n--- DECISIÓN COMPUESTA ---")
     decision = composite_decision(
         fund_score_data["score_fundamental"],
         flow_score_data["score_flow"],
         technical_bias,
     )
-    for k, v in decision.items():
-        print(f"  {k}: {v}")
-
-    print(f"\n{'='*60}\n")
 
     return {
         "fundamentals": fund,
@@ -414,13 +332,33 @@ def analyze(ticker: str, flow_data: list = None):
     }
 
 
+# ============================================================
+# RUTAS FLASK
+# ============================================================
+
+@app.route("/")
+def home():
+    return jsonify({"status": "ok", "service": "FlowScan v10 Analyzer"})
+
+
+@app.route("/analyze/<ticker>")
+def analyze_ticker(ticker):
+    try:
+        result = analyze(ticker.upper())
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "alive"})
+
+
+# ============================================================
+# ARRANQUE — NO ejecuta yfinance aquí
+# ============================================================
+
 if __name__ == "__main__":
-    ticker = sys.argv[1] if len(sys.argv) > 1 else "DXYZ"
-
-    # Ejemplo de flow_data manual (lo que copiarías de tu screenshot de SensaMarket)
-    example_flow = [
-        {"type": "CALL", "side": "Ask", "strike": 40, "premium": 102530, "sentiment": "BULLISH"},
-        {"type": "PUT", "side": "Ask", "strike": 40, "premium": 29050, "sentiment": "BEARISH"},
-    ]
-
-    analyze(ticker, flow_data=example_flow)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
