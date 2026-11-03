@@ -3086,7 +3086,12 @@ th:first-child,td:first-child{{text-align:left;white-space:normal}} th{{color:#6
 # Sin ella → archivo local (Render lo borra al reiniciar), pero siempre se
 # vuelve a sembrar con data/alertas_historial.txt del repo.
 # ══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip().strip('"').strip("'").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Si se pegó el bloque completo del .env de Neon, tomar la primera dirección postgres (la no-pooled)
+_m = re.search(r"""(postgres(?:ql)?://[^"'\s]+)""", DATABASE_URL)
+if _m:
+    DATABASE_URL = _m.group(1)
+DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'").strip()
 if DATABASE_URL.startswith("DATABASE_URL="):          # por si se pegó la línea completa del .env
     DATABASE_URL = DATABASE_URL.split("=", 1)[1].strip().strip('"').strip("'")
 DATABASE_URL = re.sub(r"\s+", "", DATABASE_URL).strip('"').strip("'")   # saltos de línea al copiar
