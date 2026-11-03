@@ -3873,10 +3873,41 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                  f"\n📒 Señales registradas hoy: {n_sig} · seguimiento: {APP_URL}/senales" +
                  (f"\n\nAvisos de hoy: {sum(1 for k in st.kv_many(f'sent|{day}|') if k.endswith('|mad'))} madurando"
                   ) + f"\n{APP_URL}/alertas")
-        return {"ok": True, "et": now.strftime("%H:%M"), "alertas": len(d["items"]), "conteo": c,
-                "enviados": sent, "errores": errors[:3], "segundos": d.get("segundos")}
+        res = {"ok": True, "et": now.strftime("%H:%M"), "alertas": len(d["items"]), "conteo": c,
+               "enviados": sent, "errores": errors[:3], "segundos": d.get("segundos")}
+        try:
+            st.kv_set("monitor_last", json.dumps({**res, "cuando": now.isoformat(timespec="minutes"),
+                                                  "madurando": [f"{x['ticker']} {x['dir']} 🧨{x.get('dinamita')}" for x in mad]}))
+            if sent:
+                st.kv_set("monitor_last_sent", now.isoformat(timespec="minutes"))
+        except Exception as e:
+            print(f"monitor_last error: {e}")
+        return res
     finally:
         _MON_LOCK.release()
+
+
+@app.route("/api/monitor/status")
+def api_monitor_status():
+    """Estado del vigilante: última ronda, último aviso enviado y qué está madurando."""
+    st = get_store()
+    last = st.kv_get("monitor_last")
+    now = datetime.now(NY_TZ)
+    out = {"ahora_et": now.strftime("%Y-%m-%d %H:%M"), "telegram": bool(TG_TOKEN),
+           "chat": bool(_tg_chat_id()), "almacen": st.mode,
+           "ultima_ronda": json.loads(last) if last else None,
+           "ultimo_aviso_enviado": st.kv_get("monitor_last_sent")}
+    if out["ultima_ronda"]:
+        try:
+            t = datetime.fromisoformat(out["ultima_ronda"]["cuando"])
+            out["minutos_desde_ultima_ronda"] = round((now - t).total_seconds() / 60)
+            out["diagnostico"] = ("✅ el vigilante está corriendo" if out["minutos_desde_ultima_ronda"] <= 12
+                                  else "⚠️ el vigilante no ha corrido: revisa cron-job.org")
+        except Exception:
+            pass
+    else:
+        out["diagnostico"] = "⚠️ sin rondas registradas: revisa cron-job.org"
+    return jsonify(out)
 
 
 @app.route("/api/monitor/tick")
