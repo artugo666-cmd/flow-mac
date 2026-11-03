@@ -448,6 +448,8 @@ def get_price_data(ticker: str) -> Dict[str, Any]:
 
         vols = [b["v"] for b in done if b["v"] > 0]
         avg_vol = int(sum(vols[-20:]) / len(vols[-20:])) if vols else 0
+        # Volumen de la última sesión completa vs las 20 anteriores
+        rel_prev = round(vols[-1] / (sum(vols[-21:-1]) / 20), 2) if len(vols) >= 21 else None
 
         # ── RVOL por hora del día ──
         vol_sess = intraday.get("vol_sess", out.get("volume", 0)) or 0
@@ -493,6 +495,7 @@ def get_price_data(ticker: str) -> Dict[str, Any]:
             "change_pct": chg_pct, "change_abs": chg_abs,
             "avg_volume": avg_vol,
             "rel_volume": rel_vol, "rel_volume_raw": rel_raw, "rvol_method": method,
+            "rel_volume_prev": rel_prev,
             "sma20": sma20, "sma50": sma50, "sma200": sma200,
             "above_sma20": bool(sma20 and price > sma20),
             "above_sma50": bool(sma50 and price > sma50),
@@ -2101,6 +2104,7 @@ def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "",
         "or_low":          price_data.get("or_low"),
         "market_open":     price_data.get("market_open", False),
         "rel_volume_raw":  price_data.get("rel_volume_raw"),
+        "rel_volume_prev": price_data.get("rel_volume_prev"),
         "rvol_method":     price_data.get("rvol_method"),
         "light":           light,
         "_price_data":     price_data if light else None,
@@ -2664,6 +2668,14 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
             dyn += 0.4; dyn_why.append(f"SPY {spy_regime.lower()} el pivot — mercado a favor")
         elif spy_regime in ("SOBRE", "BAJO"):
             dyn -= 0.4; dyn_why.append(f"SPY {spy_regime.lower()} el pivot — mercado en contra")
+    # Lecciones del backtest (19-oct→2-nov, 71 alertas; muestra chica, se recalibra con más datos)
+    if horizon == "LEAP":
+        dyn -= 1.0; dyn_why.append("✗ LEAP: en el backtest solo 14% iba arriba a 5 sesiones — sirve como dirección, no como trade corto")
+    if otm is not None and otm > 10:
+        dyn -= 1.0; dyn_why.append(f"✗ strike {otm:.0f}% OTM: en el backtest los >10% OTM perdieron (R −0.32)")
+    rvp = item.get("rel_volume_prev")
+    if rvp is not None and rvp >= 1.5:
+        dyn -= 0.8; dyn_why.append(f"✗ ayer ya hubo volumen fuerte ({rvp:.1f}x): en el backtest esas alertas llegaron tarde (R −1.0)")
     dyn = round(max(0.0, min(10.0, dyn)), 1)
 
     # ── Zonas de la alerta vs precio ──
@@ -2676,8 +2688,10 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
     near_zone = next((z for z in zones if z["near"]), None)
 
     # ── Etiqueta principal ──
-    if side == "PUT" and hedge >= 60:
-        label, color, tip = "🛡️ COBERTURA", "b", "Probable protección de una posición larga — no la tomes como señal bajista"
+    if side == "PUT" and hedge >= 60 and dyn < 6.5:
+        label, color, tip = "🛡️ POSIBLE COBERTURA", "b", \
+            ("Put sobre acción en tendencia alcista. Puede ser protección o anticipar una caída: "
+             "en el backtest estos puts funcionaron bien (8 casos). Trátala como put normal y confirma con precio.")
     elif dyn >= 6.5:
         label, color, tip = "🧨 DINAMITA", "g", "Tiene combustible para moverse ya — revisa la entrada"
     elif side == "PUT" and 40 <= hedge < 60:
@@ -2696,7 +2710,7 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
         label, color, tip = "⚪ SIN CHISPA", "r", "Sin combustible hoy"
 
     operable = (label in ("🧨 DINAMITA",) and st == "EN_ZONA" and dir_ok) or \
-               (near_zone is not None and dyn >= 4.5 and hedge < 60)
+               (near_zone is not None and dyn >= 4.5)
 
     return {
         "alert_label": label, "alert_color": color, "alert_tip": tip,
@@ -2710,7 +2724,7 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
 
 def _alert_rank_key(x: Dict) -> Tuple:
     order = {"🧨 DINAMITA": 0, "🔥 CALENTANDO": 1, "📍 EN ZONA SIN CHISPA": 2, "👀 VIGILAR ZONA": 2, "🏦 POSICIONAL": 3,
-             "🏦 LEAP": 4, "❓ PUT AMBIGUO": 5, "🛡️ COBERTURA": 6, "⚪ SIN CHISPA": 7}
+             "🛡️ POSIBLE COBERTURA": 3, "🏦 LEAP": 4, "❓ PUT AMBIGUO": 5, "⚪ SIN CHISPA": 7}
     return (0 if x.get("alert_operable") else 1, order.get(x.get("alert_label"), 9),
             -(x.get("dinamita") or 0), -(x.get("alert", {}).get("premium") or 0))
 
