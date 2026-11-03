@@ -2486,14 +2486,302 @@ def message_date(raw: str) -> Optional[str]:
     return None
 
 
-def parse_alert_message(raw: str, include_index: bool = False) -> Dict[str, Any]:
-    """Parser del mensaje diario del grupo, tal cual se recibe.
-    Soporta los dos formatos que publican en el grupo:
-      · albert_rodriguez: "AMZN 1 millones dólares calls vencen 15 enero 2027 strike 250 (zona…)"
-      · Huderax:          "CRWD 🟢 $1M CALLS · $257.50 STRIKE · JAN 21, 2028"
-    """
+_MONTHS = {
+    "ene": 1, "enero": 1, "jan": 1, "january": 1,
+    "feb": 2, "febrero": 2, "february": 2,
+    "mar": 3, "marzo": 3, "march": 3,
+    "abr": 4, "abril": 4, "apr": 4, "april": 4,
+    "may": 5, "mayo": 5,
+    "jun": 6, "junio": 6, "june": 6,
+    "jul": 7, "julio": 7, "july": 7,
+    "ago": 8, "agosto": 8, "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "septiembre": 9, "setiembre": 9, "september": 9,
+    "oct": 10, "octubre": 10, "october": 10,
+    "nov": 11, "noviembre": 11, "november": 11,
+    "dic": 12, "diciembre": 12, "dec": 12, "december": 12,
+}
+_MON_RE = "|".join(sorted(_MONTHS, key=len, reverse=True))
+
+# Palabras en mayúsculas que NO son tickers
+_NOT_TICKER = {
+    "CALL", "CALLS", "PUT", "PUTS", "STRIKE", "STRIKES", "EXP", "EXPIRY", "EXPIRATION", "VENCE", "VENCEN",
+    "USD", "MXN", "MM", "MDD", "K", "M", "B", "ET", "EST", "PM", "AM", "DTE", "OTM", "ITM", "ATM", "IV", "OI",
+    "VOL", "BUY", "SELL", "BOUGHT", "SOLD", "ASK", "BID", "MID", "SWEEP", "SWEEPS", "BLOCK", "SPLIT", "FLOW",
+    "WATCH", "WATCHLIST", "THE", "AND", "FOR", "TOTAL", "ALERTS", "ALERT", "ALERTA", "ALERTAS", "UNUSUAL",
+    "OPTIONS", "OPTION", "ACTIVITY", "HOTTEST", "PREVIOUS", "SESSION", "NEW", "AT", "ON", "IN", "TO", "OF",
+    "BY", "UP", "DE", "LA", "EL", "EN", "Y", "CON", "PARA", "ZONA", "PIVOT", "NOTA", "LISTA",
+    "PREMIUM", "PRIMA", "TYPE", "TIPO", "SIDE", "LADO", "CONTRACTS", "CONTRATOS", "BULLISH", "BEARISH",
+    "AREAS", "ÁREAS", "INTERÉS", "INTERES", "RESUMEN", "MESAS", "HOY", "TODAY", "NEWS", "C", "P", "Q",
+} | {m.upper() for m in _MONTHS}
+
+
+def _year_fix(y: Optional[str]) -> Optional[int]:
+    if not y:
+        return None
+    y = y.strip("'’ ")
+    if not y.isdigit():
+        return None
+    v = int(y)
+    return v + 2000 if v < 100 else v
+
+
+def _build_date(y: Optional[int], mo: int, d: int) -> Optional[datetime]:
+    today = datetime.now(NY_TZ).date()
+    try:
+        if y:
+            return datetime(y, mo, d)
+        dt = datetime(today.year, mo, d)
+        if dt.date() < today - timedelta(days=3):
+            dt = datetime(today.year + 1, mo, d)
+        return dt
+    except ValueError:
+        return None
+
+
+def _find_expiry(text: str) -> Tuple[Optional[datetime], Optional[Tuple[int, int]]]:
+    """Fecha de vencimiento en cualquier formato común. Regresa (fecha, span)."""
+    pats = [
+        # 2026-12-18
+        (r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", lambda m: _build_date(int(m[1]), int(m[2]), int(m[3]))),
+        # 12/18/2026 · 12/18/26 · 12/18 · 18/12/2026 (si el primero >12 es día)
+        (r"(?<![\d.])(\d{1,2})/(\d{1,2})(?:/('?\d{2,4}))?(?![\d.])",
+         lambda m: (_build_date(_year_fix(m[3]), int(m[2]), int(m[1])) if int(m[1]) > 12
+                    else _build_date(_year_fix(m[3]), int(m[1]), int(m[2])))),
+        # JAN 15, 2027 · Dec 18 '26 · Nov-20-26 · dic 18
+        (rf"\b({_MON_RE})\.?[-\s]?(\d{{1,2}})(?:st|nd|rd|th)?\b,?(?:[-\s]+(?:de\s+)?(?:'(\d{{2}})|(\d{{4}})\b|(\d{{2}})\b))?",
+         lambda m: _build_date(_year_fix(m[3] or m[4] or m[5]), _MONTHS[m[1].lower()], int(m[2]))),
+        # 15 enero 2027 · 15 de enero de 2027 · 15-ene-27 · 18 diciembre
+        (rf"\b(\d{{1,2}})[-\s]+(?:de\s+)?({_MON_RE})\.?\b(?:[-\s,]+(?:de\s+|del\s+)?(?:'(\d{{2}})|(\d{{4}})\b|(\d{{2}})\b))?",
+         lambda m: _build_date(_year_fix(m[3] or m[4] or m[5]), _MONTHS[m[2].lower()], int(m[1]))),
+    ]
+    best = None
+    for pat, fn in pats:
+        for m in re.finditer(pat, text, re.I):
+            groups = (m.group(0),) + m.groups()
+            d = fn(groups)
+            if d and (best is None or m.start() < best[1][0]):
+                best = (d, m.span())
+            if d:
+                break
+    return (best[0], best[1]) if best else (None, None)
+
+
+def _find_premium(text: str) -> Tuple[float, Optional[Tuple[int, int]]]:
+    pats = [
+        r"\$?\s*(\d+(?:[.,]\d+)?)\s*(millones|millón|millon|mdd|mm|m)\b(?!\s*(?:de\s+)?contra)",
+        r"\$?\s*(\d+(?:[.,]\d+)?)\s*(mil|k)\b(?!\s*(?:de\s+)?contra)",
+        r"\$\s*(\d{1,3}(?:,\d{3}){2,})\b",
+        r"(?:premium|prima)\s*[:=]?\s*\$?\s*(\d+(?:[.,]\d+)?)\s*([mk])?",
+    ]
+    for pat in pats:
+        m = re.search(pat, text, re.I)
+        if not m:
+            continue
+        n = _num(m.group(1)) or 0.0
+        u = (m.group(2) if m.lastindex and m.lastindex >= 2 else "") or ""
+        u = u.lower()
+        if u.startswith("mill") or u in ("m", "mm", "mdd"):
+            n *= 1e6
+        elif u in ("mil", "k"):
+            n *= 1e3
+        if n >= 10_000:
+            return n, m.span()
+    return 0.0, None
+
+
+def _find_side(text: str) -> Optional[str]:
+    m = re.search(r"\b(calls?|puts?)\b", text, re.I)
+    if m:
+        return "CALL" if m.group(1).lower().startswith("call") else "PUT"
+    m = re.search(r"(?<![A-Za-z])\$?\d+(?:\.\d+)?\s?([CP])\b", text)
+    if m:
+        return "CALL" if m.group(1) == "C" else "PUT"
+    if "🟢" in text or re.search(r"\balcista|bullish\b", text, re.I):
+        return "CALL"
+    if "🔴" in text or re.search(r"\bbajista|bearish\b", text, re.I):
+        return "PUT"
+    return None
+
+
+def _find_strike(text: str) -> Tuple[Optional[float], Optional[Tuple[int, int]]]:
+    pats = [
+        r"strike\s*[:=]?\s*\$?\s*(\d+(?:\.\d+)?)",
+        r"\$?\s*(\d+(?:\.\d+)?)\s*strike",
+        r"(?<![\w.])\$?(\d+(?:\.\d+)?)\s?[CP]\b",
+        r"\b(?:calls?|puts?)\s+(?:de\s+|del\s+|a\s+|@\s*)?\$?(\d+(?:\.\d+)?)\b(?!\s*(?:mil|millon|millones|[mk]\b|%|de\s+contra|d[oó]lares))",
+        r"(?<![\w.$/])(\d+(?:\.\d+)?)\s+(?:calls?|puts?)\b",
+    ]
+    for pat in pats:
+        m = re.search(pat, text, re.I)
+        if m:
+            v = _num(m.group(1))
+            if v and 0 < v < 100000:
+                return v, m.span()
+    return None, None
+
+
+def _find_ticker(text: str) -> Optional[str]:
+    m = re.search(r"\$([A-Z]{1,5}(?:\.[A-Z])?)\b", text)          # $NVDA
+    if m and m.group(1) not in _NOT_TICKER:
+        return m.group(1)
+    for m in re.finditer(r"(?<![A-Za-z0-9$])([A-Z]{1,5}(?:\.[A-Z])?)(?![a-z0-9])", text):
+        tk = m.group(1)
+        if tk in _NOT_TICKER:
+            continue
+        if len(tk) == 1 and m.start() > 3:                          # tickers de 1 letra solo al inicio
+            continue
+        return tk
+    return None
+
+
+_LEVEL_KW = r"(?:watch|vigilar|zona|zonas|soporte|support|resistencia|resistance|nivel|level|gap|pivot|objetivo|target|invalida)"
+
+
+def _find_levels(text: str) -> List[Dict[str, Any]]:
+    levels: List[Dict[str, Any]] = []
+    chunks = re.findall(r"\(([^)]*)\)", text)
+    rest = re.sub(r"\([^)]*\)", " ", text)
+    for m in re.finditer(_LEVEL_KW + r"(?:[^.;|]|\.(?=\d))*", rest, re.I):
+        chunks.append(m.group(0))
+    for ch in chunks:
+        for seg in re.split(r"[·;,|]|\by\b|\band\b", ch):
+            mm = re.search(r"\$\s*(\d+(?:\.\d+)?)", seg) or re.search(r"(?<![\w/])(\d+(?:\.\d+)?)(?![\w/%])", seg)
+            if not mm:
+                continue
+            p = float(mm.group(1))
+            if p <= 0:
+                continue
+            lab = (seg[:mm.start()] + " " + seg[mm.end():]).replace("$", "")
+            lab = re.sub(r"\s+", " ", lab).strip(" :-–—") or "zona interés"
+            if not any(abs(l["price"] - p) < 1e-9 for l in levels):
+                levels.append({"price": p, "label": lab})
+    return levels
+
+
+def _alert_from_text(text: str, include_index: bool) -> Optional[Dict[str, Any]]:
+    """Extrae una alerta de una línea/bloque sin importar el orden ni el formato."""
+    side = _find_side(text)
+    if not side:
+        return None
+    work = text
+    premium, psp = _find_premium(work)
+    if psp:
+        work = work[:psp[0]] + " " * (psp[1] - psp[0]) + work[psp[1]:]
+    exp, esp = _find_expiry(work)
+    if esp:
+        work = work[:esp[0]] + " " * (esp[1] - esp[0]) + work[esp[1]:]
+    strike, ssp = _find_strike(work)
+    if ssp:
+        work = work[:ssp[0]] + " " * (ssp[1] - ssp[0]) + work[ssp[1]:]
+    ticker = _find_ticker(text)
+    if not ticker or (ticker in _ALERT_EXCLUDE and not include_index):
+        return None
+    if not premium and not strike:
+        return None
+    note = ""
+    nm = re.search(r"\s-\s*([a-záéíóú ]+)$", re.sub(r"\([^)]*\)", "", text), re.I)
+    if nm:
+        note = nm.group(1).strip()
+    return {"ticker": ticker, "raw": text.strip(), "dir": side, "premium": premium, "strike": strike,
+            "expiry": exp.strftime("%Y-%m-%d") if exp else None, "levels": _find_levels(work), "note": note}
+
+
+def _hot_desk(line: str) -> Optional[Dict[str, Any]]:
+    low = line.lower()
+    if not (("contrato" in low or "contract" in low) and "%" in line):
+        return None
+    tk = _find_ticker(line)
+    dm = re.search(r"([\d.,]+)\s*(millones|millón|millon|mil|[MK])?\s*(?:de\s+)?contra(?:to|ct)s?\W*(\d+(?:[.,]\d+)?)\s*%\s*(calls?|puts?)?", line, re.I)
+    if not tk or not dm:
+        return None
+    n = _num(dm.group(1)) or 0
+    u = (dm.group(2) or "").lower()
+    n = n * 1e6 if u.startswith("mill") or u == "m" else n * 1e3 if u in ("mil", "k") else n
+    return {"ticker": tk, "contracts": int(n), "pct": _num(dm.group(3)) or 0,
+            "dir": "PUT" if (dm.group(4) or "").lower().startswith("put") else "CALL"}
+
+
+def _rule_parse(raw: str, include_index: bool) -> Tuple[List[Dict], List[Dict], int]:
+    """Regresa (alertas, mesas, líneas que parecían alerta)."""
+    alerts: List[Dict] = []
+    desks: List[Dict] = []
+    candidates = 0
+    for ln in raw.splitlines():
+        t = re.sub(r"[*_`~]", "", ln).replace(" ", " ").strip()
+        t = re.sub(r"^[^\w$(]+", "", t).strip()
+        if not t:
+            continue
+        d = _hot_desk(t)
+        if d:
+            desks.append(d)
+            continue
+        # Línea de continuación (zonas) → se pega a la alerta anterior
+        if alerts and not _find_side(t) and re.search(r"\d", t) and \
+                (re.match(r"^" + _LEVEL_KW, t, re.I) or re.match(r"^(if|si|en caso|possible|posible)\b", t, re.I)):
+            for lv in _find_levels(t if re.match(_LEVEL_KW, t, re.I) else "zona " + t):
+                if not any(abs(l["price"] - lv["price"]) < 1e-9 for l in alerts[-1]["levels"]):
+                    alerts[-1]["levels"].append(lv)
+            alerts[-1]["raw"] += " · " + t
+            continue
+        if _find_side(t) and re.search(r"\d", t) and not re.match(r"^(total|hottest|unusual)", t, re.I):
+            candidates += 1
+        a = _alert_from_text(t, include_index)
+        if a:
+            alerts.append(a)
+    return alerts, desks, candidates
+
+
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+LLM_MODEL = os.environ.get("FLOWSCAN_LLM_MODEL", "claude-haiku-5-5")
+
+
+def _llm_parse(raw: str) -> List[Dict]:
+    """Respaldo opcional: si existe ANTHROPIC_API_KEY, Claude extrae las alertas de
+    cualquier formato. Solo se usa cuando las reglas no logran leer el mensaje."""
+    if not ANTHROPIC_KEY:
+        return []
+    prompt = ("Extrae las alertas de opciones de este mensaje de un grupo de trading. Ignora encabezados, "
+              "niveles de SPY/SPX y 'mesas calientes' (conteos de contratos con %). Responde SOLO un JSON: "
+              '[{"ticker":"NVDA","dir":"CALL|PUT","premium_usd":1200000,"strike":185,'
+              '"expiry":"YYYY-MM-DD","levels":[{"price":180,"label":"zona interés"}]}]. '
+              "Si falta un dato usa null. Fecha de hoy: " + datetime.now(NY_TZ).strftime("%Y-%m-%d") +
+              "\n\nMENSAJE:\n" + raw[:6000])
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+                          headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                                   "content-type": "application/json"},
+                          json={"model": LLM_MODEL, "max_tokens": 2000,
+                                "messages": [{"role": "user", "content": prompt}]}, timeout=25)
+        txt = "".join(b.get("text", "") for b in r.json().get("content", []))
+        js = json.loads(txt[txt.find("["): txt.rfind("]") + 1])
+    except Exception as e:
+        print(f"LLM parse error: {e}")
+        return []
+    out = []
+    for x in js if isinstance(js, list) else []:
+        try:
+            tk = str(x.get("ticker") or "").upper().strip("$ ")
+            side = str(x.get("dir") or "").upper()
+            if not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", tk) or side not in ("CALL", "PUT"):
+                continue
+            out.append({"ticker": tk, "raw": f"(IA) {tk} {side}", "dir": side,
+                        "premium": float(x.get("premium_usd") or 0), "strike": x.get("strike"),
+                        "expiry": x.get("expiry"), "note": "",
+                        "levels": [{"price": float(l["price"]), "label": str(l.get("label") or "zona")}
+                                   for l in (x.get("levels") or []) if l.get("price")]})
+        except Exception:
+            continue
+    return out
+
+
+def parse_alert_message(raw: str, include_index: bool = False, allow_llm: bool = True) -> Dict[str, Any]:
+    """Lee el mensaje del grupo en cualquier formato.
+    Cada dato (ticker, call/put, monto, strike, vencimiento, zonas) se busca por separado,
+    sin importar el orden, el idioma, emojis, viñetas o Markdown. Las líneas de zonas que
+    vienen abajo de una alerta ('↳ watch $500', 'soporte 411') se pegan a esa alerta.
+    Si las reglas dejan líneas sin leer y hay ANTHROPIC_API_KEY, se usa IA como respaldo."""
     out: Dict[str, Any] = {"pivot_spy": None, "spy_levels": [], "spx_levels": [],
-                           "hot_desks": [], "alerts": []}
+                           "hot_desks": [], "alerts": [], "parser": "reglas"}
     raw = (raw or "").replace(" ", " ").replace("⁠", "")
 
     piv = re.search(r"(\d{3,5}(?:\.\d+)?)\s*PIVOT", raw, re.I) or re.search(r"PIVOT\s*[:·]?\s*(\d{3,5}(?:\.\d+)?)", raw, re.I)
@@ -2504,87 +2792,23 @@ def parse_alert_message(raw: str, include_index: bool = False) -> Dict[str, Any]
         if m:
             out[field] = [float(x) for x in re.findall(r"\d{3,5}(?:\.\d+)?", m.group(1))]
 
-    # Normalización (formato Huderax con Markdown de Discord):
-    #   "🔹 *FSLR* 🟢  $500K CALLS · …"  y en la línea siguiente "↳ watch $500"
-    lines_in: List[str] = []
-    for ln in raw.splitlines():
-        t = re.sub(r"[*_`~]", "", ln).strip()
-        t = re.sub(r"^[^\w$(]+", "", t).strip()            # viñetas/emojis al inicio
-        if not t:
-            continue
-        if re.match(r"^(watch|watchlist|vigilar|zona)\b", t, re.I) and lines_in:
-            body = re.sub(r"^(watch(list)?|vigilar|zona)\s*:?", "", t, flags=re.I)
-            parts = []
-            for seg in re.split(r"[·;,]", body):
-                m2 = re.search(r"\$\s*(\d+(?:\.\d+)?)", seg) or re.search(r"\b(\d+(?:\.\d+)?)\b", seg)
-                if not m2:
-                    continue
-                lab = (seg[:m2.start()] + " " + seg[m2.end():]).replace("$", "")
-                lab = re.sub(r"\s+", " ", lab).strip(" :-") or "zona interés"
-                parts.append(f"{m2.group(1)} {lab}")
-            if parts:
-                lines_in[-1] += " (" + ", ".join(parts) + ")"
-            continue
-        lines_in.append(t)
+    alerts, desks, candidates = _rule_parse(raw, include_index)
+    out["hot_desks"] = desks
+    if allow_llm and ANTHROPIC_KEY and (not alerts or candidates > len(alerts) + 1):
+        llm = [a for a in _llm_parse(raw) if include_index or a["ticker"] not in _ALERT_EXCLUDE]
+        if len(llm) > len(alerts):
+            alerts, out["parser"] = llm, "ia"
+    out["lineas_sin_leer"] = max(0, candidates - len(alerts))
 
-    seen = set()
-    for line in lines_in:
-        line = line.strip().strip("-•*·").strip()
-        tk = re.match(r"^\$?([A-Z]{1,6})\b", line)
-        if not tk:
+    seen, uniq = set(), []
+    for a in alerts:
+        k = (a["ticker"], a["dir"], a.get("strike"), a.get("expiry"))
+        if k in seen:
             continue
-        ticker = tk.group(1)
-        if ticker in ("ÁREAS", "AREAS", "TOTAL", "UNUSUAL", "HOTTEST"):
-            continue
-        if ticker in _ALERT_EXCLUDE and not include_index:
-            continue
-        low = line.lower()
-
-        # Mesas calientes: "GOOG 939 mil de contratos 61 % calls"
-        if ("contrato" in low or "contract" in low) and "%" in line:
-            dm = re.search(r"([\d.,]+)\s*(millones|millón|millon|mil|[MK])?\s*(?:de\s+)?contra(?:to|ct)s?\W*(\d+(?:[.,]\d+)?)\s*%\s*(calls?|puts?)?", line, re.I)
-            if dm:
-                n = _num(dm.group(1)) or 0
-                u = (dm.group(2) or "").lower()
-                n = n * 1e6 if u.startswith("mill") or u == "m" else n * 1e3 if u in ("mil", "k") else n
-                pct = _num(dm.group(3)) or 0
-                out["hot_desks"].append({"ticker": ticker, "contracts": int(n),
-                                         "pct": pct, "dir": "PUT" if (dm.group(4) or "").lower().startswith("put") else "CALL"})
-            continue
-
-        # Alerta: requiere calls/puts + monto o strike
-        side = re.search(r"\b(calls?|puts?)\b", line, re.I)
-        if not side or ticker in seen:
-            continue
-        premium = _parse_money(line)
-        sk = re.search(r"strike\s*\$?\s*([\d.,]+)", line, re.I) or re.search(r"\$?\s*([\d.,]+)\s*strike", line, re.I)
-        strike = _num(sk.group(1)) if sk else None
-        if not premium and not strike:
-            continue
-        exp = _parse_expiry(line)
-
-        # Niveles entre paréntesis: "(54 zona interés en caso de romperse)", "(429 posible gap, 411 posible soporte)"
-        levels = []
-        for grp in re.findall(r"\(([^)]*)\)", line):
-            for part in grp.split(","):
-                lm = re.match(r"\s*\$?([\d.]+)\s*(.*)", part)
-                if lm:
-                    levels.append({"price": float(lm.group(1)), "label": lm.group(2).strip() or "zona"})
-        tail = re.sub(r"\([^)]*\)", "", line)
-        note = ""
-        nm = re.search(r"\s-\s*([a-záéíóú ]+)$", tail, re.I) or re.search(r"\s-([a-záéíóú]+)\s*$", tail, re.I)
-        if nm:
-            note = nm.group(1).strip()
-
-        seen.add(ticker)
-        out["alerts"].append({
-            "ticker": ticker, "raw": line,
-            "dir": "CALL" if "call" in side.group(1).lower() else "PUT",
-            "premium": premium, "strike": strike,
-            "expiry": exp.strftime("%Y-%m-%d") if exp else None,
-            "levels": levels, "note": note,
-        })
-    out["alerts"].sort(key=lambda a: a["premium"], reverse=True)
+        seen.add(k)
+        uniq.append(a)
+    uniq.sort(key=lambda a: a["premium"] or 0, reverse=True)
+    out["alerts"] = uniq
     return out
 
 
@@ -2847,6 +3071,7 @@ def api_alerts():
         "hot_desks": parsed["hot_desks"],
         "summary": summary, "counts": counts, "operables": ops,
         "failed": failed, "segundos": round(time.time() - t0, 1),
+        "parser": parsed.get("parser"), "lineas_sin_leer": parsed.get("lineas_sin_leer", 0),
         "guardadas": saved, "almacen": get_store().mode,
         "items": items,
     })

@@ -641,32 +641,38 @@ function runDiscord() {
     }
     if(d.market){window._market=d.market;renderPulse(d.market);updatePivotBar();}
     var resultItems=[];
+    // La tabla se arma con lo que leyó el SERVIDOR (lee cualquier formato).
+    var rt=table.querySelector('.rank-table');
+    Array.prototype.slice.call(rt.querySelectorAll('.rank-row:not(.rk-head)')).forEach(function(r){r.remove();});
+    var hot=rt.lastElementChild;
+    var mkRow=function(key,tk,dir,prem){
+      var r=document.createElement('div'); r.className='rank-row'; r.id='rkrow-'+key;
+      r.setAttribute('onclick',"scrollToCard('"+key+"')");
+      r.innerHTML='<span class="rk-pos"></span><span class="rk-tick" style="color:'+(dir==='CALL'?'var(--grn)':'var(--red)')+'">'+tk+'</span><span class="rk-dir '+(dir==='CALL'?'call':'put')+'">'+dir+'</span><span class="rk-monto">'+fmtMonto(prem)+'</span><span class="rk-reason"></span><span class="rk-badge"><span class="rk-score"></span></span>';
+      if(hot && !hot.classList.contains('rank-row')) rt.insertBefore(r, hot); else rt.appendChild(r);
+    };
     (d.items||[]).forEach(function(item,i){
       var a=item.alert||{};
       var lv=(a.levels||[]);
+      item._key=item.ticker+'-'+a.dir+'-'+i;
       item._alert={ticker:item.ticker, raw:a.raw||'', dir:a.dir, montoUSD:a.premium||0,
                    strike:a.strike||'', expiry:a.expiry||'', zona:lv.length?lv[0].price:'',
                    coment:lv.map(function(l){return '$'+l.price+' '+l.label;}).join(' · ')+(a.note?(lv.length?' · ':'')+a.note:'')};
       item._monto=a.premium||0;
       item._order=i;
       resultItems.push(item);
-      if(!table.querySelector('#rkrow-'+item.ticker)){
-        // el backend encontró una alerta que el parser del navegador no vio
-        var extra=document.createElement('div'); extra.className='rank-row'; extra.id='rkrow-'+item.ticker;
-        extra.innerHTML='<span class="rk-pos"></span><span class="rk-tick">'+item.ticker+'</span><span class="rk-dir '+(a.dir==='CALL'?'call':'put')+'">'+a.dir+'</span><span class="rk-monto">'+fmtMonto(a.premium)+'</span><span class="rk-reason"></span><span class="rk-badge"><span class="rk-score"></span></span>';
-        table.querySelector('.rank-table').appendChild(extra);
-      }
-      updateRankRow(table, item.ticker, item, d.items.length);
+      mkRow(item._key, item.ticker, a.dir, a.premium);
+      updateRankRow(table, item._key, item, d.items.length);
     });
-    (d.failed||[]).forEach(function(tk){markRankRowError(table, tk);});
-    // Filas que el parser del navegador creyó alerta pero el servidor no (p.ej. mesas calientes)
-    var got={}; resultItems.forEach(function(x){got[x.ticker]=1;}); (d.failed||[]).forEach(function(t){got[t]=1;});
-    parsed.alerts.forEach(function(a){ if(!got[a.ticker]){ var r=table.querySelector('#rkrow-'+a.ticker); if(r) r.remove(); } });
+    (d.failed||[]).forEach(function(tk,i){
+      var key='fail-'+i; mkRow(key, tk, '—', 0); markRankRowError(table, key);
+    });
+    if(d.parser==='ia'){ d.summary=(d.summary||'')+' · (leído con IA)'; }
+    if(d.lineas_sin_leer){ d.summary=(d.summary||'')+' · ⚠️ '+d.lineas_sin_leer+' línea(s) que parecían alerta no se pudieron leer'; }
     window._alertsSummary=d.summary||'';
     finishDiscord(resEl, resultItems, parsed, table, pgEl, btn);
   })
   .catch(function(e){
-    parsed.alerts.forEach(function(a){markRankRowError(table, a.ticker);});
     showErr('discord','Error al clasificar alertas: '+e);
     pgEl.className='pg'; btn.disabled=false; busy=false;
   });
@@ -804,14 +810,14 @@ function finishDiscord(resEl, items, parsed, table, pgEl, btn){
 
   // Re-numerar filas por score
   byScore.forEach(function(item,i){
-    var row = table.querySelector('#rkrow-'+item.ticker);
+    var row = table.querySelector('#rkrow-'+(item._key||item.ticker));
     if(row) row.querySelector('.rk-pos').textContent = i+1;
   });
 
   // Reordenar filas en el DOM por score
   var tbody = table.querySelector('.rank-table');
   byScore.forEach(function(item){
-    var row = table.querySelector('#rkrow-'+item.ticker);
+    var row = table.querySelector('#rkrow-'+(item._key||item.ticker));
     if(row) tbody.appendChild(row);
   });
 
@@ -1047,7 +1053,7 @@ function buildSummary(rs,title){
     var earn=t.earnings_days!==null&&t.earnings_days!==undefined&&t.earnings_days<=7;
     var cls=earn?'nc-o':t.semaforo==='VERDE'?'nc-g':t.semaforo==='AMARILLO'?'nc-y':'nc-r';
     var earntag=earn?'🚨':'';
-    return '<span class="nav-chip '+cls+'" onclick="scrollToCard(\''+t.ticker+'\')">'+earntag+t.ticker+' '+t.score+'</span>';
+    return '<span class="nav-chip '+cls+'" onclick="scrollToCard(\''+(t._key||t.ticker)+'\')">'+earntag+t.ticker+' '+t.score+'</span>';
   }).join('');
 
   var el=document.createElement('div');
@@ -1201,7 +1207,7 @@ function buildCard(d, idx, alert){
   var card=document.createElement('div');
   card.className='card '+(call?'call':'put')+(sc<4.5?' dim':'')+(earnUrgent?' earn-alert':'');
   card.dataset.score=sc;
-  card.id='card-'+d.ticker;
+  card.id='card-'+(d._key||d.ticker);
   card.style.animationDelay=(idx*.05)+'s';
 
   card.innerHTML=
