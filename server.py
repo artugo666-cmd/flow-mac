@@ -524,13 +524,27 @@ def _fundamentals_finviz(ticker: str) -> Dict[str, Any]:
         print(f"Finviz {ticker}: HTTP {r.status_code}")
         return out
     html = r.text or ""
-    i = html.find("snapshot-table2")
-    if i < 0:
+    if "snapshot-table2" not in html and "Short Float" not in html:
         return out
-    table = html[i: html.find("</table>", i)]
-    cells = [re.sub(r"<[^>]+>", "", c).strip()
-             for c in re.findall(r"<td[^>]*>(.*?)</td>", table, re.S)]
-    kv = {cells[j]: cells[j + 1] for j in range(0, len(cells) - 1, 2)}
+
+    t0 = html.find("snapshot-table2")
+    snap = html[t0:] if t0 >= 0 else html
+
+    def field(label: str) -> str:
+        """Valor de la celda que sigue a la etiqueta, sin depender de clases CSS."""
+        m = re.search(r">\s*" + re.escape(label) + r"\s*<", snap)
+        if not m:
+            return ""
+        j = snap.find("<td", m.end())
+        if j < 0:
+            return ""
+        k = snap.find("</td>", j)
+        cell = snap[snap.find(">", j) + 1: k]
+        return re.sub(r"<[^>]+>", "", cell).replace("&nbsp;", " ").strip()
+
+    labels = ("Short Float", "Beta", "Target Price", "Recom", "52W Range", "Inst Own", "Earnings")
+    kv = {lb: field(lb) for lb in labels}
+    out["fv_fields"] = sum(1 for v in kv.values() if v and v != "-")
 
     def num(key, pct=False):
         v = kv.get(key, "").replace("%", "").replace(",", "").strip()
@@ -699,7 +713,8 @@ def get_news_score(ticker: str) -> Dict[str, Any]:
             if abs(ns) > abs(best_score):
                 best_score, best_title, best_kws, best_age = ns, title, kws, round(age_h, 1)
 
-        out.update({"score": best_score, "title": best_title, "keywords": best_kws, "age_hours": best_age})
+        out.update({"score": best_score, "title": best_title, "keywords": best_kws, "age_hours": best_age,
+                    "fetched": len(r.json().get("news", []))})
     except Exception as e:
         print(f"News error {ticker}: {e}")
     return out
@@ -776,6 +791,15 @@ def _fetch_chain(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]
     return 0.0, [], "none"
 
 
+def _voi_ok(strike: float, vol: int, oi: int, spot: float) -> bool:
+    """Un strike cuenta para vol/OI solo si es relevante: a ±15% del precio, con
+    volumen ≥200 y OI ≥100. Antes bastaba OI≥50 y cualquier volumen: un contrato
+    lotería lejano con OI 50 y 2,500 de volumen daba 50x → NVDA siempre 'sweep'."""
+    if not spot or vol < 200 or oi < 100:
+        return False
+    return abs(strike - spot) / spot <= 0.15
+
+
 def get_options_data(ticker: str) -> Dict[str, Any]:
     """
     Cadena de opciones real de Yahoo — vol/OI, P/C ratio, call wall, put wall, max pain.
@@ -827,8 +851,8 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
                 if sk > 0:
                     prev = call_oi_strike.get(sk, {"oi": 0, "vol": 0})
                     call_oi_strike[sk] = {"oi": prev["oi"]+oi, "vol": prev["vol"]+vol}
-                if oi >= 50 and vol > 0:
-                    ratio = vol / oi
+                if _voi_ok(sk, vol, oi, current_price):
+                    ratio = min(vol / oi, 20.0)
                     if ratio > best_call_voi:
                         best_call_voi = round(ratio, 2)
                     if atm_lo <= sk <= atm_hi and ratio > atm_cv:
@@ -844,8 +868,8 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
                 if sk > 0:
                     prev = put_oi_strike.get(sk, {"oi": 0, "vol": 0})
                     put_oi_strike[sk] = {"oi": prev["oi"]+oi, "vol": prev["vol"]+vol}
-                if oi >= 50 and vol > 0:
-                    ratio = vol / oi
+                if _voi_ok(sk, vol, oi, current_price):
+                    ratio = min(vol / oi, 20.0)
                     if ratio > best_put_voi:
                         best_put_voi = round(ratio, 2)
                     if atm_lo <= sk <= atm_hi and ratio > atm_pv:
@@ -2781,7 +2805,8 @@ def api_debug():
                        "or_high": pd.get("or_high"), "or_low": pd.get("or_low"),
                        "market_open": pd.get("market_open"), "session_minutes": pd.get("session_minutes")}
     fund = get_fundamentals("NVDA")
-    out["fundamentals"] = {"ok": fund.get("short_pct") is not None, "source": fund.get("fund_source"),
+    out["fundamentals"] = {"ok": bool(fund.get("fv_fields") or fund.get("fund_source") == "yahoo"),
+                           "fields": fund.get("fv_fields"), "source": fund.get("fund_source"),
                            "short_pct": fund.get("short_pct"), "sector": fund.get("sector"),
                            "earnings_date": fund.get("earnings_date"), "target": fund.get("target_price")}
     opts = get_options_data("NVDA")
@@ -2789,7 +2814,8 @@ def api_debug():
                        "strikes": len(opts.get("strikes") or []), "source": opts.get("options_source"),
                        "call_wall": opts.get("call_wall"), "put_wall": opts.get("put_wall")}
     news = get_news_score("NVDA")
-    out["news"]     = {"ok": bool(news.get("title")), "score": news.get("score"), "title": news.get("title")}
+    out["news"]     = {"ok": news.get("fetched") is not None, "fetched": news.get("fetched"),
+                       "score": news.get("score"), "title": news.get("title")}
     cands = discover_candidates()
     out["discover"] = {"ok": len(cands) > 0, "count": len(cands), "top5": [c["ticker"] for c in cands[:5]]}
     pulse = get_market_pulse()
