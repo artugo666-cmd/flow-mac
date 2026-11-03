@@ -722,6 +722,11 @@ function updateRankRow(table, ticker, item, total){
   var scCol = sc>=7?'var(--grn)':sc>=4?'var(--yel)':'var(--red)';
   var sem = item.semaforo||'ROJO';
   var semTxt = sem==='VERDE'?'✅ ENTRAR':sem==='AMARILLO'?'⏳ ESPERAR':'❌ EVITAR';
+  if(sem==='VERDE' && item.entry_state && item.entry_state!=='EN_ZONA'){
+    var stMap={ESPERA_PULLBACK:'🟢 ESPERA PULLBACK',ESPERA_RUPTURA:'🟢 ESPERA RUPTURA',EXTENDIDO:'⚠️ EXTENDIDO',
+               INVALIDADO:'❌ ROTO',ESPERA_RANGO:'⏳ 15 MIN',MERCADO_CERRADO:'🌙 CERRADO'};
+    semTxt = stMap[item.entry_state]||semTxt;
+  }
   var earnDays = item.earnings_days;
   var earnHtml = (earnDays!==null&&earnDays!==undefined&&earnDays<=7)?
     '<span class="earn-urgent" style="color:var(--ora);font-size:.52rem;display:block">🚨 EARN '+Math.round(earnDays)+'d</span>':'';
@@ -1040,6 +1045,11 @@ function buildCard(d, idx, alert){
   var sc=parseFloat(d.score||0);
   var decCls=sc>=7?'dec-g':sc>=4.5?'dec-y':'dec-r';
   var decTxt=sc>=7?'✅ ENTRAR — espera la zona':sc>=4.5?'⏳ ESPERAR — aguarda confirmación':'❌ NO OPERAR — no reúne criterios';
+  // v5.1: la decisión combina score (calidad del setup) con estado de entrada (momento)
+  if(d.entry_decision){
+    decTxt=d.entry_decision;
+    decCls=d.entry_color==='g'?'dec-g':d.entry_color==='r'?'dec-r':'dec-y';
+  }
   var scCol=sc>=7?'var(--grn)':sc>=4.5?'var(--yel)':'var(--red)';
 
   var price=parseFloat(d.spot||0);
@@ -1126,12 +1136,15 @@ function buildCard(d, idx, alert){
       '<div class="opt-label">🎯 Operación sugerida — verificar en IBKR</div>'+
       '<div class="opt-grid">'+
         '<div class="opt-item"><div class="opt-item-lbl">Tipo</div><div class="opt-item-val" style="color:'+(call?'var(--grn)':'var(--red)')+'">'+type+'</div></div>'+
-        '<div class="opt-item"><div class="opt-item-lbl">Strike sugerido</div><div class="opt-item-val" style="color:var(--yel)">$'+parseFloat(strike).toFixed(0)+'</div></div>'+
+        '<div class="opt-item"><div class="opt-item-lbl">Strike sugerido</div><div class="opt-item-val" style="color:var(--yel)">$'+(+parseFloat(strike).toFixed(2))+'</div></div>'+
         '<div class="opt-item"><div class="opt-item-lbl">Stop / T1</div><div class="opt-item-val" style="font-size:.72rem">'+(d.stop||'N/A')+' / '+(d.target_1||'N/A')+'</div></div>'+
         '<div class="opt-item"><div class="opt-item-lbl">Zona entrada</div><div class="opt-item-val" style="font-size:.72rem;color:var(--yel)">'+(d.ez||'N/A')+'</div></div>'+
         '<div class="opt-item"><div class="opt-item-lbl">VWAP</div><div class="opt-item-val" style="color:var(--blu)">'+(d.vwap||'N/A')+'</div></div>'+
         '<div class="opt-item"><div class="opt-item-lbl">ATR riesgo</div><div class="opt-item-val">'+(d.atr||'N/A')+'</div></div>'+
+        (d.entry_plan?'<div class="opt-item"><div class="opt-item-lbl">T2 / Riesgo</div><div class="opt-item-val" style="font-size:.72rem">'+(d.target_2||'N/A')+' / '+(d.entry_risk_pct!=null?d.entry_risk_pct+'%':'N/A')+'</div></div>':'')+
+        (d.or_high?'<div class="opt-item"><div class="opt-item-lbl">Rango apertura</div><div class="opt-item-val" style="font-size:.72rem">$'+(+d.or_low).toFixed(2)+'–$'+(+d.or_high).toFixed(2)+'</div></div>':'')+
       '</div>'+
+      (d.entry_trigger?'<div class="opt-why">🎯 '+d.entry_trigger+'</div>':'')+
       (d.why?'<div class="opt-why">💡 '+d.why+'</div>':'')+
     '</div>';
   }
