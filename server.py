@@ -2437,9 +2437,13 @@ def _parse_money(line: str) -> float:
 
 def _parse_expiry(line: str) -> Optional[datetime]:
     m = re.search(r"vence[n]?\s+(?:el\s+)?(\d{1,2})\s+(?:de\s+)?([a-záéíóú]+)(?:\s+(?:de\s+)?(\d{4}))?", line, re.I)
-    if not m:
-        return None
-    day, mes, year = int(m.group(1)), m.group(2).lower()[:3], m.group(3)
+    if m:
+        day, mes, year = int(m.group(1)), m.group(2).lower()[:3], m.group(3)
+    else:
+        e = re.search(r"\b([A-Z][a-zA-Z]{2})[a-zA-Z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b", line)
+        if not e:
+            return None
+        day, mes, year = int(e.group(2)), e.group(1).lower()[:3], e.group(3)
     month = _MESES.get(mes)
     if not month:
         return None
@@ -2456,8 +2460,12 @@ def _parse_expiry(line: str) -> Optional[datetime]:
     return d
 
 
-def parse_alert_message(raw: str) -> Dict[str, Any]:
-    """Parser del mensaje diario del grupo, tal cual se recibe."""
+def parse_alert_message(raw: str, include_index: bool = False) -> Dict[str, Any]:
+    """Parser del mensaje diario del grupo, tal cual se recibe.
+    Soporta los dos formatos que publican en el grupo:
+      · albert_rodriguez: "AMZN 1 millones dólares calls vencen 15 enero 2027 strike 250 (zona…)"
+      · Huderax:          "CRWD 🟢 $1M CALLS · $257.50 STRIKE · JAN 21, 2028"
+    """
     out: Dict[str, Any] = {"pivot_spy": None, "spy_levels": [], "spx_levels": [],
                            "hot_desks": [], "alerts": []}
     raw = (raw or "").replace(" ", " ").replace("⁠", "")
@@ -2477,20 +2485,22 @@ def parse_alert_message(raw: str) -> Dict[str, Any]:
         if not tk:
             continue
         ticker = tk.group(1)
-        if ticker in _ALERT_EXCLUDE or ticker in ("ÁREAS", "AREAS", "SPY", "SPX"):
+        if ticker in ("ÁREAS", "AREAS", "TOTAL", "UNUSUAL", "HOTTEST"):
+            continue
+        if ticker in _ALERT_EXCLUDE and not include_index:
             continue
         low = line.lower()
 
         # Mesas calientes: "GOOG 939 mil de contratos 61 % calls"
-        if "contrato" in low and "%" in line:
-            dm = re.search(r"([\d.,]+)\s*(millones|millón|millon|mil|[MK])?\s*(?:de\s+)?contratos?\s*(\d+(?:[.,]\d+)?)\s*%\s*(calls?|puts?)", line, re.I)
+        if ("contrato" in low or "contract" in low) and "%" in line:
+            dm = re.search(r"([\d.,]+)\s*(millones|millón|millon|mil|[MK])?\s*(?:de\s+)?contra(?:to|ct)s?\W*(\d+(?:[.,]\d+)?)\s*%\s*(calls?|puts?)?", line, re.I)
             if dm:
                 n = _num(dm.group(1)) or 0
                 u = (dm.group(2) or "").lower()
                 n = n * 1e6 if u.startswith("mill") or u == "m" else n * 1e3 if u in ("mil", "k") else n
                 pct = _num(dm.group(3)) or 0
                 out["hot_desks"].append({"ticker": ticker, "contracts": int(n),
-                                         "pct": pct, "dir": "CALL" if "call" in dm.group(4).lower() else "PUT"})
+                                         "pct": pct, "dir": "PUT" if (dm.group(4) or "").lower().startswith("put") else "CALL"})
             continue
 
         # Alerta: requiere calls/puts + monto o strike
@@ -2498,7 +2508,7 @@ def parse_alert_message(raw: str) -> Dict[str, Any]:
         if not side or ticker in seen:
             continue
         premium = _parse_money(line)
-        sk = re.search(r"strike\s*\$?\s*([\d.,]+)", line, re.I)
+        sk = re.search(r"strike\s*\$?\s*([\d.,]+)", line, re.I) or re.search(r"\$?\s*([\d.,]+)\s*strike", line, re.I)
         strike = _num(sk.group(1)) if sk else None
         if not premium and not strike:
             continue
@@ -2765,6 +2775,263 @@ def api_alerts():
         "failed": failed, "segundos": round(time.time() - t0, 1),
         "items": items,
     })
+
+
+# ══════════════════════════════════════════════════════════════
+# BACKTEST DE ALERTAS DEL GRUPO
+# Mide cada alerta desde la apertura del día en que se publicó, con
+# indicadores calculados SOLO con datos hasta el cierre previo (sin ver el futuro).
+# ══════════════════════════════════════════════════════════════
+HIST_FILE = os.path.join(BASE_DIR, "data", "alertas_historial.txt")
+_YF_SYMBOL = {"SPX": "^GSPC", "VIX": "^VIX", "NDX": "^NDX", "RUT": "^RUT"}
+_BT_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _daily_bars(ticker: str, rng: str = "1y") -> List[Dict[str, Any]]:
+    sym = _YF_SYMBOL.get(ticker, ticker)
+    r = yget(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", {"interval": "1d", "range": rng}, timeout=12)
+    if r.status_code != 200:
+        return []
+    res = (r.json().get("chart", {}).get("result") or [{}])[0]
+    off = int((res.get("meta") or {}).get("gmtoffset") or -18000)
+    bars = _parse_bars(res)
+    for b in bars:
+        b["d"] = datetime.utcfromtimestamp(b["t"] + off).strftime("%Y-%m-%d")
+    return bars
+
+
+def _load_history() -> List[Tuple[str, str]]:
+    if not os.path.exists(HIST_FILE):
+        return []
+    txt = open(HIST_FILE, encoding="utf-8").read()
+    parts = re.split(r"^=== (\d{4}-\d{2}-\d{2}) ===\s*$", txt, flags=re.M)
+    return [(parts[i], parts[i + 1]) for i in range(1, len(parts) - 1, 2)]
+
+
+def _bt_one(a: Dict, day: str, bars: List[Dict], spy: List[Dict], pivot: Optional[float]) -> Optional[Dict]:
+    idx = next((i for i, b in enumerate(bars) if b["d"] >= day), None)
+    if idx is None or idx < 30:
+        return None
+    pre, win = bars[:idx], bars[idx: idx + 10]
+    side = a["dir"]; sgn = 1 if side == "CALL" else -1
+    o = win[0]["o"]
+    if not o:
+        return None
+    hi = max(b["h"] for b in win); lo = min(b["l"] for b in win)
+    mfe = ((hi - o) if sgn > 0 else (o - lo)) / o * 100
+    mae = ((o - lo) if sgn > 0 else (hi - o)) / o * 100
+    best = max(range(len(win)), key=lambda i: win[i]["h"]) if sgn > 0 else min(range(len(win)), key=lambda i: win[i]["l"])
+    ret5 = sgn * (win[4]["c"] - o) / o * 100 if len(win) >= 5 else None
+    ret10 = sgn * (win[9]["c"] - o) / o * 100 if len(win) >= 10 else None
+
+    closes = [b["c"] for b in pre]
+    def sma(n): return sum(closes[-n:]) / n if len(closes) >= n else None
+    s20, s50, s200 = sma(20), sma(50), sma(200)
+    trs = [max(pre[i]["h"] - pre[i]["l"], abs(pre[i]["h"] - pre[i - 1]["c"]), abs(pre[i]["l"] - pre[i - 1]["c"]))
+           for i in range(len(pre) - 14, len(pre))]
+    atr = sum(trs) / len(trs)
+    rsi = _wilder_rsi(closes)
+    last = closes[-1]
+    vavg = sum(b["v"] for b in pre[-21:-1]) / 20 if len(pre) >= 21 else 0
+    rvol_prev = pre[-1]["v"] / vavg if vavg else 1.0
+
+    otm = None
+    if a.get("strike"):
+        otm = ((a["strike"] - o) if sgn > 0 else (o - a["strike"])) / o * 100
+    dte = (datetime.strptime(a["expiry"], "%Y-%m-%d").date() - datetime.strptime(day, "%Y-%m-%d").date()).days \
+        if a.get("expiry") else None
+
+    trend_ok = (s50 is not None) and ((last > s50) if sgn > 0 else (last < s50))
+    extended = (rsi >= 75 if sgn > 0 else rsi <= 25) or (s20 is not None and sgn * (last - s20) > 2 * atr)
+    hedge_like = side == "PUT" and s50 and s200 and last > s50 and last > s200 and otm is not None and 3 <= otm <= 20
+    spy_ok = None
+    if pivot:
+        sb = next((b for b in spy if b["d"] == win[0]["d"]), None)
+        if sb:
+            spy_ok = (sb["o"] > pivot) if sgn > 0 else (sb["o"] < pivot)
+
+    # Operación simple: entra en apertura, stop 1 ATR, objetivo 1.5 ATR, máx 10 sesiones.
+    # Si en la misma vela tocara stop y objetivo, se cuenta el stop (conservador).
+    r_mult, exit_day, how = None, None, None
+    stop, tgt = o - sgn * atr, o + sgn * 1.5 * atr
+    for i, b in enumerate(win):
+        hit_stop = (b["l"] <= stop) if sgn > 0 else (b["h"] >= stop)
+        hit_tgt = (b["h"] >= tgt) if sgn > 0 else (b["l"] <= tgt)
+        if hit_stop:
+            r_mult, exit_day, how = -1.0, i + 1, "stop"; break
+        if hit_tgt:
+            r_mult, exit_day, how = 1.5, i + 1, "objetivo"; break
+    if r_mult is None and len(win) >= 10:
+        r_mult, exit_day, how = round(sgn * (win[-1]["c"] - o) / atr, 2), 10, "tiempo"
+
+    # Zonas de la alerta: ¿las tocó?
+    zones = []
+    for lv in a.get("levels") or []:
+        z = lv["price"]
+        touch = next((i for i, b in enumerate(win) if b["l"] <= z <= b["h"]), None)
+        after = None
+        if touch is not None:
+            rest = win[touch:]
+            after = round(((max(b["h"] for b in rest) - z) if sgn > 0 else (z - min(b["l"] for b in rest))) / z * 100, 1)
+        zones.append({"price": z, "label": lv["label"], "dist_open_pct": round((z - o) / o * 100, 1),
+                      "touched_day": (touch + 1) if touch is not None else None, "mfe_after_touch": after})
+
+    return {
+        "date": day, "ticker": a["ticker"], "dir": side, "premium": a["premium"], "strike": a.get("strike"),
+        "expiry": a.get("expiry"), "dte": dte, "otm_pct": round(otm, 1) if otm is not None else None,
+        "open": round(o, 2), "sessions": len(win), "complete": len(win) >= 10,
+        "mfe_pct": round(mfe, 1), "mae_pct": round(mae, 1), "mfe_day": best + 1,
+        "ret5_pct": round(ret5, 1) if ret5 is not None else None,
+        "ret10_pct": round(ret10, 1) if ret10 is not None else None,
+        "atr_pct": round(atr / o * 100, 1), "rsi_prev": rsi, "rvol_prev": round(rvol_prev, 2),
+        "trend_ok": bool(trend_ok), "extended": bool(extended), "hedge_like": bool(hedge_like), "spy_ok": spy_ok,
+        "r_mult": r_mult, "exit_day": exit_day, "exit_how": how,
+        "reached_strike": (otm is not None and otm > 0 and mfe >= otm),
+        "zones": zones,
+    }
+
+
+def _bt_stats(rows: List[Dict]) -> Dict[str, Any]:
+    n = len(rows)
+    if not n:
+        return {"n": 0}
+    def pct(cond): return round(sum(1 for r in rows if cond(r)) / n * 100)
+    rr = [r["r_mult"] for r in rows if r["r_mult"] is not None]
+    r5 = [r["ret5_pct"] for r in rows if r["ret5_pct"] is not None]
+    return {
+        "n": n,
+        "mfe_ge3": pct(lambda r: r["mfe_pct"] >= 3),
+        "mfe_ge5": pct(lambda r: r["mfe_pct"] >= 5),
+        "mfe_ge10": pct(lambda r: r["mfe_pct"] >= 10),
+        "contra_ge5": pct(lambda r: r["mae_pct"] >= 5),     # volado: ¿y si apostabas al revés?
+        "mfe_med": round(statistics.median(r["mfe_pct"] for r in rows), 1),
+        "mae_med": round(statistics.median(r["mae_pct"] for r in rows), 1),
+        "ret5_pos": round(sum(1 for x in r5 if x > 0) / len(r5) * 100) if r5 else None,
+        "ret5_med": round(statistics.median(r5), 1) if r5 else None,
+        "trades": len(rr),
+        "r_avg": round(sum(rr) / len(rr), 2) if rr else None,
+        "r_win": round(sum(1 for x in rr if x > 0) / len(rr) * 100) if rr else None,
+    }
+
+
+def run_backtest() -> Dict[str, Any]:
+    t0 = time.time()
+    hist = _load_history()
+    alerts: List[Tuple[str, Dict, Optional[float]]] = []
+    for day, txt in hist:
+        p = parse_alert_message(txt, include_index=True)
+        for a in p["alerts"]:
+            alerts.append((day, a, p["pivot_spy"]))
+    tickers = sorted({a["ticker"] for _, a, _ in alerts} | {"SPY"})
+    bars: Dict[str, List[Dict]] = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        futs = {ex.submit(_daily_bars, tk): tk for tk in tickers}
+        done, _ = wait(futs, timeout=max(SCAN_BUDGET_S, 20))
+        for f in done:
+            try:
+                bars[futs[f]] = f.result()
+            except Exception as e:
+                print(f"backtest {futs[f]}: {e}")
+    spy = bars.get("SPY", [])
+    rows, missing = [], []
+    for day, a, pivot in alerts:
+        r = _bt_one(a, day, bars.get(a["ticker"]) or [], spy, pivot)
+        (rows.append(r) if r else missing.append(f"{day} {a['ticker']}"))
+
+    ready = [r for r in rows if r["sessions"] >= 5]   # con al menos 5 sesiones para juzgar
+    def G(name, cond):
+        return {"grupo": name, **_bt_stats([r for r in ready if cond(r)])}
+
+    flowscan = lambda r: r["trend_ok"] and not r["extended"] and not r["hedge_like"] and \
+        (r["otm_pct"] is None or r["otm_pct"] <= 15)
+    groups = [
+        G("Todas", lambda r: True),
+        G("CALLs", lambda r: r["dir"] == "CALL"),
+        G("PUTs", lambda r: r["dir"] == "PUT"),
+        G("Vence ≤45 días", lambda r: r["dte"] is not None and r["dte"] <= 45),
+        G("Vence 46–180 días", lambda r: r["dte"] is not None and 45 < r["dte"] <= 180),
+        G("Vence >180 días (LEAP)", lambda r: r["dte"] is not None and r["dte"] > 180),
+        G("Strike ≤10% OTM", lambda r: r["otm_pct"] is not None and r["otm_pct"] <= 10),
+        G("Strike >10% OTM", lambda r: r["otm_pct"] is not None and r["otm_pct"] > 10),
+        G("Tendencia a favor", lambda r: r["trend_ok"]),
+        G("Tendencia en contra", lambda r: not r["trend_ok"]),
+        G("Extendida al alertar", lambda r: r["extended"]),
+        G("No extendida", lambda r: not r["extended"]),
+        G("Volumen previo ≥1.5x", lambda r: r["rvol_prev"] >= 1.5),
+        G("Volumen previo normal", lambda r: r["rvol_prev"] < 1.5),
+        G("PUT tipo cobertura", lambda r: r["hedge_like"]),
+        G("PUT direccional", lambda r: r["dir"] == "PUT" and not r["hedge_like"]),
+        G("SPY a favor del pivot", lambda r: r["spy_ok"] is True),
+        G("SPY en contra del pivot", lambda r: r["spy_ok"] is False),
+        G("Prima ≥ $1M", lambda r: (r["premium"] or 0) >= 1e6),
+        G("Prima < $1M", lambda r: (r["premium"] or 0) < 1e6),
+        G("★ Filtro FlowScan (tendencia + no extendida + no cobertura + strike ≤15%)", flowscan),
+        G("✗ Rechazadas por el filtro", lambda r: not flowscan(r)),
+    ]
+    zr = [z for r in ready for z in r["zones"]]
+    zt = [z for z in zr if z["touched_day"]]
+    zone_stats = {
+        "zonas": len(zr), "tocadas": len(zt),
+        "mfe_despues_de_tocar_med": round(statistics.median(z["mfe_after_touch"] for z in zt), 1) if zt else None,
+        "ge5_despues_de_tocar": round(sum(1 for z in zt if z["mfe_after_touch"] >= 5) / len(zt) * 100) if zt else None,
+    }
+    return {
+        "generado": datetime.now().isoformat(timespec="seconds"),
+        "metodo": ("Entrada = apertura del día de la alerta. Indicadores con datos hasta el cierre previo. "
+                   "MFE/MAE = máximo a favor / en contra en 10 sesiones. '≥5% al revés' = cuántas veces apostar en "
+                   "contra de la alerta también daba ≥5% (línea base de volado). Operación simple: stop 1 ATR, "
+                   "objetivo 1.5 ATR, salida a las 10 sesiones. Estadísticas solo con alertas de ≥5 sesiones."),
+        "alertas": len(alerts), "medidas": len(rows), "con_5_sesiones": len(ready), "sin_datos": missing,
+        "segundos": round(time.time() - t0, 1),
+        "grupos": groups, "zonas": zone_stats,
+        "filas": sorted(rows, key=lambda r: (r["date"], r["ticker"])),
+    }
+
+
+@app.route("/api/backtest")
+def api_backtest():
+    if _BT_CACHE["data"] and request.args.get("fresh") != "1" and time.time() - _BT_CACHE["ts"] < 1800:
+        return jsonify(_BT_CACHE["data"])
+    data = run_backtest()
+    _BT_CACHE.update({"ts": time.time(), "data": data})
+    return jsonify(data)
+
+
+@app.route("/backtest")
+def page_backtest():
+    """Vista legible en el celular del backtest."""
+    d = _BT_CACHE["data"] if _BT_CACHE["data"] and time.time() - _BT_CACHE["ts"] < 1800 else None
+    if not d:
+        d = run_backtest(); _BT_CACHE.update({"ts": time.time(), "data": d})
+    def cell(v, suf=""):
+        return "—" if v is None else f"{v}{suf}"
+    rows = "".join(
+        f"<tr><td>{g['grupo']}</td><td>{g['n']}</td><td>{cell(g.get('mfe_ge5'),'%')}</td><td>{cell(g.get('mfe_ge10'),'%')}</td>"
+        f"<td>{cell(g.get('contra_ge5'),'%')}</td><td>{cell(g.get('mae_med'),'%')}</td><td>{cell(g.get('ret5_pos'),'%')}</td><td>{cell(g.get('r_avg'))}</td></tr>"
+        for g in d["grupos"])
+    det = "".join(
+        f"<tr><td>{r['date'][5:]}</td><td>{r['ticker']}</td><td>{r['dir']}</td><td>{cell(r['dte'])}</td>"
+        f"<td>{cell(r['otm_pct'],'%')}</td><td>{r['mfe_pct']}%</td><td>{r['mae_pct']}%</td><td>{cell(r['ret5_pct'],'%')}</td>"
+        f"<td>{cell(r['r_mult'])}</td><td>{'✓' if r['trend_ok'] else '✗'}{'⚠' if r['extended'] else ''}{'🛡' if r['hedge_like'] else ''}</td></tr>"
+        for r in d["filas"])
+    z = d["zonas"]
+    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Backtest alertas</title><style>
+body{{background:#07080a;color:#dde2f0;font:13px/1.4 system-ui,sans-serif;margin:0;padding:14px}}
+h1{{font-size:18px;margin:0 0 4px}} p{{color:#6b748f;margin:4px 0 12px}}
+.t{{overflow-x:auto;margin-bottom:18px}} table{{border-collapse:collapse;width:100%;font-size:12px}}
+th,td{{padding:6px 8px;border-bottom:1px solid #1d2235;text-align:right;white-space:nowrap}}
+th:first-child,td:first-child{{text-align:left;white-space:normal}} th{{color:#6b748f;font-weight:600}}
+</style></head><body>
+<h1>Backtest de alertas del grupo</h1>
+<p>{d['alertas']} alertas · {d['con_5_sesiones']} con ≥5 sesiones para medir · generado {d['generado']}</p>
+<p>{d['metodo']}</p>
+<div class="t"><table><tr><th>Grupo</th><th>n</th><th>≥5% a favor</th><th>≥10% a favor</th><th>≥5% al revés (volado)</th><th>En contra (mediana)</th><th>Arriba a 5 sesiones</th><th>R promedio</th></tr>{rows}</table></div>
+<p>Zonas de las alertas: {z['zonas']} · tocadas {z['tocadas']} · después de tocarlas, mediana a favor {cell(z['mfe_despues_de_tocar_med'],'%')} · ≥5% en {cell(z['ge5_despues_de_tocar'],'%')}</p>
+<h1>Detalle</h1>
+<div class="t"><table><tr><th>Fecha</th><th>Tk</th><th>Lado</th><th>DTE</th><th>OTM</th><th>A favor</th><th>En contra</th><th>5 ses.</th><th>R</th><th>Filtro</th></tr>{det}</table></div>
+</body></html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ══════════════════════════════════════════════════════════════
