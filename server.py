@@ -2140,6 +2140,7 @@ def health():
         "rvol": "normalizado por hora del día",
         "yahoo_crumb": bool(YF.crumb), "http_backend": YF.backend,
         "almacen_alertas": "postgres" if DATABASE_URL else "archivo",
+        "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
         "time": datetime.now().isoformat(timespec="seconds"),
     })
 
@@ -3108,6 +3109,8 @@ class AlertStore:
                         k TEXT PRIMARY KEY, day DATE NOT NULL, ticker TEXT NOT NULL, dir TEXT NOT NULL,
                         premium DOUBLE PRECISION, strike DOUBLE PRECISION, expiry DATE,
                         levels JSONB, note TEXT, raw TEXT, source TEXT, created TIMESTAMPTZ DEFAULT now())""")
+                    c.execute("""CREATE TABLE IF NOT EXISTS kv (
+                        k TEXT PRIMARY KEY, v TEXT, updated TIMESTAMPTZ DEFAULT now())""")
                 self.mode = "postgres"
             except Exception as e:
                 self.pg, self.error = None, f"Postgres no disponible: {e}"
@@ -3178,13 +3181,38 @@ class AlertStore:
                                 "levels": r[6] if isinstance(r[6], list) else json.loads(r[6] or "[]"),
                                 "note": r[7], "raw": r[8], "source": r[9]})
                 return out
-        return sorted((v for v in self.mem.values() if v["day"] >= first_day), key=lambda x: (x["day"], x["ticker"]))
+        return sorted((v for k, v in self.mem.items() if k != "_kv" and v["day"] >= first_day),
+                      key=lambda x: (x["day"], x["ticker"]))
+
+    # ── clave/valor (estado del vigilante, chat de Telegram) ──
+    def kv_get(self, k: str) -> Optional[str]:
+        if self.pg:
+            with self._conn() as c:
+                r = c.execute("SELECT v FROM kv WHERE k=%s", (k,)).fetchone()
+                return r[0] if r else None
+        return (self.mem.get("_kv") or {}).get(k)
+
+    def kv_set(self, k: str, v: str) -> None:
+        if self.pg:
+            with self._conn() as c:
+                c.execute("""INSERT INTO kv (k, v) VALUES (%s,%s)
+                             ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated=now()""", (k, v))
+            return
+        with self.lock:
+            self.mem.setdefault("_kv", {})[k] = v
+            self._flush()
+
+    def kv_many(self, prefix: str) -> Dict[str, str]:
+        if self.pg:
+            with self._conn() as c:
+                return {r[0]: r[1] for r in c.execute("SELECT k, v FROM kv WHERE k LIKE %s", (prefix + "%",)).fetchall()}
+        return {k: v for k, v in (self.mem.get("_kv") or {}).items() if k.startswith(prefix)}
 
     def days(self) -> List[str]:
         if self.pg:
             with self._conn() as c:
                 return [r[0].isoformat() for r in c.execute("SELECT DISTINCT day FROM alerts ORDER BY day").fetchall()]
-        return sorted({v["day"] for v in self.mem.values()})
+        return sorted({v["day"] for k, v in self.mem.items() if k != "_kv"})
 
 
 _STORE: Optional[AlertStore] = None
@@ -3368,6 +3396,170 @@ a{{color:#4d9fff}}
 {''.join(cards) or '<p>Sin alertas guardadas.</p>'}
 </body></html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# ══════════════════════════════════════════════════════════════
+# TELEGRAM
+# TELEGRAM_BOT_TOKEN en Render. El chat se detecta solo: basta con que
+# el usuario le haya escrito "hola" al bot una vez.
+# ══════════════════════════════════════════════════════════════
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+MONITOR_KEY = os.environ.get("MONITOR_KEY", "").strip()
+APP_URL = os.environ.get("APP_URL", "https://flow-mac.onrender.com").rstrip("/")
+
+
+def _tg_chat_id() -> Optional[str]:
+    env = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if env:
+        return env
+    st = get_store()
+    cid = st.kv_get("telegram_chat_id")
+    if cid or not TG_TOKEN:
+        return cid
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", timeout=8)
+        for u in reversed(r.json().get("result", [])):
+            chat = (u.get("message") or u.get("edited_message") or {}).get("chat") or {}
+            if chat.get("id"):
+                cid = str(chat["id"])
+                st.kv_set("telegram_chat_id", cid)
+                return cid
+    except Exception as e:
+        print(f"Telegram getUpdates: {e}")
+    return None
+
+
+def tg_send(text: str) -> Tuple[bool, str]:
+    if not TG_TOKEN:
+        return False, "Falta TELEGRAM_BOT_TOKEN en Render"
+    cid = _tg_chat_id()
+    if not cid:
+        return False, "No encuentro tu chat: mándale 'hola' a tu bot en Telegram y reintenta"
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": cid, "text": text[:4000], "parse_mode": "HTML",
+                                "disable_web_page_preview": True}, timeout=10)
+        ok = r.status_code == 200 and r.json().get("ok")
+        return bool(ok), "enviado" if ok else f"Telegram respondió {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, str(e)
+
+
+@app.route("/api/telegram/test")
+def api_telegram_test():
+    ok, msg = tg_send("✅ <b>FlowScan conectado</b>\nDesde aquí te llegarán los avisos del vigilante.\n"
+                      f"Alertas activas: {APP_URL}/alertas")
+    return jsonify({"ok": ok, "detalle": msg, "almacen": get_store().mode, "chat": bool(_tg_chat_id())})
+
+
+# ══════════════════════════════════════════════════════════════
+# VIGILANTE
+# Un servicio externo gratuito (cron-job.org) llama /api/monitor/tick cada
+# 5 minutos en horario de mercado: eso mantiene despierto a Render y en cada
+# ronda se revisan las alertas de 10 sesiones. Solo avisa cuando algo CAMBIA.
+# ══════════════════════════════════════════════════════════════
+_MON_LOCK = threading.Lock()
+
+
+def _h(t: Any) -> str:
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _fmt_alert(x: Dict, head: str) -> str:
+    lines = [f"{head} <b>{x['ticker']} {x['dir']}</b>  (alerta {x['day'][5:]}, strike {x.get('strike') or '—'}, vence {x.get('expiry') or '—'})"]
+    lines.append(f"{_h(x['life_why'])}")
+    if x.get("spot"):
+        lines.append(f"Precio ${x['spot']:.2f} · origen ${x['origin']} ({x['move_pct']:+}%)")
+    if x.get("entry_decision"):
+        lines.append(_h(x["entry_decision"]))
+    if x.get("dinamita") is not None:
+        lines.append(f"🧨 Dinamita {x['dinamita']}")
+    for w in (x.get("dinamita_why") or [])[:3]:
+        lines.append(f"· {_h(w)}")
+    if x.get("repeats", 1) > 1:
+        lines.append(f"🔁 Repetida {x['repeats']} días")
+    if x.get("conflict"):
+        lines.append("⚔️ Conflicto: " + ", ".join(x["conflict"]))
+    lines.append("👉 Confirma en SensaMarket (mismo lado · sweeps/ask · vencimientos cortos) antes de entrar")
+    return "\n".join(lines)
+
+
+def monitor_tick(force: bool = False) -> Dict[str, Any]:
+    now = datetime.now(NY_TZ)
+    mins = now.hour * 60 + now.minute
+    if not force and (now.weekday() >= 5 or mins < 9 * 60 + 25 or mins > 16 * 60 + 15):
+        return {"ok": True, "skip": "fuera de horario de mercado", "et": now.strftime("%H:%M")}
+    if not _MON_LOCK.acquire(blocking=False):
+        return {"ok": True, "skip": "ronda en curso"}
+    try:
+        st = get_store()
+        day = now.strftime("%Y-%m-%d")
+        d = active_alerts()
+        _ACTIVE_CACHE.update({"ts": time.time(), "data": d})
+        prev = st.kv_many("life|")
+        sent, errors = [], []
+
+        def send(key: str, text: str):
+            if st.kv_get(key):
+                return
+            ok, msg = tg_send(text)
+            if ok:
+                st.kv_set(key, now.isoformat(timespec="minutes"))
+                sent.append(key)
+            else:
+                errors.append(msg)
+
+        live = mins >= 9 * 60 + 45            # antes de 9:45 no se avisan entradas (rango de apertura)
+        cap = 6                               # máximo de avisos individuales por ronda (anti-spam)
+        for x in d["items"]:
+            ak = _alert_key(x["day"], x)
+            before = prev.get("life|" + ak)
+            now_life = x["life"]
+            if now_life != before:
+                st.kv_set("life|" + ak, now_life)
+            if not live:
+                continue
+            if len(sent) >= cap:
+                continue
+            if now_life == "🧨 MADURANDO":
+                send(f"sent|{day}|{ak}|mad", _fmt_alert(x, "🧨 MADURANDO"))
+            elif before == "🧨 MADURANDO" and now_life == "❌ MUERTA":
+                send(f"sent|{day}|{ak}|dead", _fmt_alert(x, "❌ SE INVALIDÓ — si entraste, respeta tu stop:"))
+            elif before == "🧨 MADURANDO" and now_life == "🚂 YA CORRIÓ":
+                send(f"sent|{day}|{ak}|ran", _fmt_alert(x, "🚂 YA CORRIÓ — si entraste, toma parcial o sube el stop:"))
+
+        c = d.get("counts", {})
+        resumen = " · ".join(f"{k} {v}" for k, v in c.items())
+        mad = [x for x in d["items"] if x["life"] == "🧨 MADURANDO"][:8]
+        car, seen_c = [], set()
+        for x in d["items"]:
+            if x["life"] == "🌱 CARGADA" and x.get("repeats", 1) > 1 and (x["ticker"], x["dir"]) not in seen_c:
+                seen_c.add((x["ticker"], x["dir"])); car.append(x)
+        car = car[:8]
+        if mins >= 9 * 60 + 45:
+            send(f"sent|{day}|open", "🌅 <b>Apertura</b> — alertas de 10 sesiones\n" + resumen +
+                 ("\n\n🧨 Madurando: " + ", ".join(f"{x['ticker']} {x['dir']}" for x in mad) if mad else "") +
+                 ("\n🔁 Cargadas repetidas: " + ", ".join(f"{x['ticker']} {x['dir']} ×{x['repeats']}" for x in car) if car else "") +
+                 f"\n\n{APP_URL}/alertas")
+        if mins >= 16 * 60 + 5:
+            send(f"sent|{day}|close", "🌙 <b>Cierre</b>\n" + resumen +
+                 (f"\n\nAvisos de hoy: {sum(1 for k in st.kv_many(f'sent|{day}|') if k.endswith('|mad'))} madurando"
+                  ) + f"\n{APP_URL}/alertas")
+        return {"ok": True, "et": now.strftime("%H:%M"), "alertas": len(d["items"]), "conteo": c,
+                "enviados": sent, "errores": errors[:3], "segundos": d.get("segundos")}
+    finally:
+        _MON_LOCK.release()
+
+
+@app.route("/api/monitor/tick")
+def api_monitor_tick():
+    if MONITOR_KEY and request.args.get("key") != MONITOR_KEY:
+        return jsonify({"ok": False, "error": "key inválida"}), 403
+    try:
+        return jsonify(monitor_tick(force=request.args.get("force") == "1"))
+    except Exception as e:
+        print(f"monitor error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ══════════════════════════════════════════════════════════════
