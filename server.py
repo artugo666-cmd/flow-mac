@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import threading
@@ -111,6 +112,8 @@ class _YahooSession:
             except Exception:
                 pass
             r = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8)
+            if r.status_code != 200:   # a veces bloquean query1 y query2 no
+                r = s.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=8)
             txt = (r.text or "").strip()
             if r.status_code == 200 and txt and "<" not in txt and len(txt) < 40:
                 self.cookies = self._cookie_dict(s)
@@ -504,7 +507,99 @@ def get_price_data(ticker: str) -> Dict[str, Any]:
     return out
 
 
+_FV_SECTORS = {
+    "technology": "Technology", "healthcare": "Healthcare", "financial": "Financial Services",
+    "consumercyclical": "Consumer Cyclical", "consumerdefensive": "Consumer Defensive",
+    "industrials": "Industrials", "energy": "Energy", "basicmaterials": "Basic Materials",
+    "realestate": "Real Estate", "utilities": "Utilities",
+    "communicationservices": "Communication Services",
+}
+
+
+def _fundamentals_finviz(ticker: str) -> Dict[str, Any]:
+    """Respaldo cuando Yahoo bloquea quoteSummary: tabla snapshot de Finviz."""
+    out: Dict[str, Any] = {}
+    r = YF._session().get("https://finviz.com/quote.ashx", params={"t": ticker, "p": "d"}, timeout=10)
+    if r.status_code != 200:
+        print(f"Finviz {ticker}: HTTP {r.status_code}")
+        return out
+    html = r.text or ""
+    i = html.find("snapshot-table2")
+    if i < 0:
+        return out
+    table = html[i: html.find("</table>", i)]
+    cells = [re.sub(r"<[^>]+>", "", c).strip()
+             for c in re.findall(r"<td[^>]*>(.*?)</td>", table, re.S)]
+    kv = {cells[j]: cells[j + 1] for j in range(0, len(cells) - 1, 2)}
+
+    def num(key, pct=False):
+        v = kv.get(key, "").replace("%", "").replace(",", "").strip()
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    out["short_pct"] = round(num("Short Float") or 0.0, 1)
+    out["beta"] = round(num("Beta") or 0.0, 2)
+    tp = num("Target Price")
+    out["target_price"] = round(tp, 2) if tp else None
+    rec = num("Recom")
+    if rec:
+        out["recommendation"] = ("Strong Buy" if rec <= 1.5 else "Buy" if rec <= 2.5 else
+                                 "Hold" if rec <= 3.5 else "Sell" if rec <= 4.5 else "Strong Sell")
+    else:
+        out["recommendation"] = "N/A"
+    rng = kv.get("52W Range", "")
+    if " - " in rng:
+        try:
+            lo52, hi52 = (float(x.replace(",", "")) for x in rng.split(" - ")[:2])
+            out["low_52w"], out["high_52w"] = round(lo52, 2), round(hi52, 2)
+        except ValueError:
+            pass
+    io = kv.get("Inst Own")
+    out["inst_own"] = io if io and io != "-" else "N/A"
+    m = re.search(r"f=sec_([a-z]+)", html)
+    out["sector"] = _FV_SECTORS.get(m.group(1), m.group(1).title()) if m else "N/A"
+    out["industry"] = "N/A"
+
+    # Earnings: "Nov 19 AMC" (sin año)
+    out["earnings_date"], out["earnings_ts"], out["earnings_days"] = "N/A", 0, None
+    em = re.match(r"([A-Z][a-z]{2})\s+(\d{1,2})", kv.get("Earnings", ""))
+    if em:
+        now = datetime.now(NY_TZ)
+        try:
+            ed = datetime.strptime(f"{em.group(1)} {em.group(2)} {now.year}", "%b %d %Y").replace(tzinfo=NY_TZ)
+            if (ed - now).days < -60:
+                ed = ed.replace(year=now.year + 1)
+            out["earnings_ts"] = ed.timestamp()
+            out["earnings_date"] = ed.strftime("%d-%b-%Y")
+            out["earnings_days"] = round((ed.timestamp() - now.timestamp()) / 86400, 0)
+        except ValueError:
+            pass
+    out["analyst_action"] = None
+    out["analyst_action_type"] = None
+    out["fund_source"] = "finviz"
+    return out
+
+
 def get_fundamentals(ticker: str) -> Dict[str, Any]:
+    """Fundamentales: Yahoo quoteSummary (requiere crumb) → respaldo Finviz."""
+    out: Dict[str, Any] = {}
+    if YF.get_crumb():
+        out = _fundamentals_yahoo(ticker)
+        if out.get("sector"):
+            out["fund_source"] = "yahoo"
+            return out
+    try:
+        fv = _fundamentals_finviz(ticker)
+        if fv:
+            return fv
+    except Exception as e:
+        print(f"Finviz error {ticker}: {e}")
+    return out
+
+
+def _fundamentals_yahoo(ticker: str) -> Dict[str, Any]:
     """Fundamentales, short float, earnings, sector — Yahoo quoteSummary."""
     out = {}
     try:
@@ -610,6 +705,77 @@ def get_news_score(ticker: str) -> Dict[str, Any]:
     return out
 
 
+def _chain_yahoo(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]]]:
+    """Cadena de Yahoo (requiere crumb). Regresa (precio, [(calls, puts)] de las 3 expiraciones más cercanas)."""
+    if not YF.get_crumb():      # sin crumb es 401 seguro: no gastar el request
+        return 0.0, []
+    r = yget(f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}", timeout=12, needs_crumb=True)
+    if r.status_code != 200:
+        return 0.0, []
+    chain = r.json().get("optionChain", {}).get("result", [])
+    if not chain:
+        return 0.0, []
+    price = float(chain[0].get("quote", {}).get("regularMarketPrice") or 0)
+    dates = chain[0].get("expirationDates", [])
+    exps = []
+    for i, exp_ts in enumerate(dates[:3]):
+        if i == 0:
+            res2 = chain   # la primera respuesta ya trae la expiración más cercana
+        else:
+            r2 = yget(f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
+                      {"date": exp_ts}, timeout=12, needs_crumb=True)
+            if r2.status_code != 200:
+                break
+            res2 = r2.json().get("optionChain", {}).get("result", [])
+        if not res2:
+            continue
+        opt = (res2[0].get("options") or [{}])[0]
+        exps.append((opt.get("calls", []), opt.get("puts", [])))
+    return price, exps
+
+
+_OCC_RE = re.compile(r"^(.*)(\d{6})([CP])(\d{8})$")
+
+
+def _chain_cboe(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]]]:
+    """Respaldo: cadena retrasada (~15 min) del CDN público de CBOE. Sin crumb ni API key.
+    Cada contrato viene como símbolo OCC (NVDA251121C00200000) con volume y open_interest."""
+    r = YF._session().get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json", timeout=12)
+    if r.status_code != 200:
+        return 0.0, []
+    d = (r.json() or {}).get("data", {}) or {}
+    price = float(d.get("current_price") or d.get("close") or 0)
+    by_exp: Dict[str, Tuple[List[Dict], List[Dict]]] = {}
+    for o in d.get("options", []) or []:
+        m = _OCC_RE.match(str(o.get("option", "")))
+        if not m or m.group(1) != ticker:          # ignora raíces ajustadas (NVDA1, etc.)
+            continue
+        exp, cp, strike = m.group(2), m.group(3), int(m.group(4)) / 1000.0
+        rec = {"strike": strike, "volume": int(o.get("volume") or 0),
+               "openInterest": int(o.get("open_interest") or 0), "gamma": o.get("gamma")}
+        calls, puts = by_exp.setdefault(exp, ([], []))
+        (calls if cp == "C" else puts).append(rec)
+    today = datetime.now(NY_TZ).strftime("%y%m%d")
+    keys = sorted(k for k in by_exp if k >= today)[:3]
+    return price, [by_exp[k] for k in keys]
+
+
+def _fetch_chain(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]], str]:
+    try:
+        price, exps = _chain_yahoo(ticker)
+        if price and exps:
+            return price, exps, "yahoo"
+    except Exception as e:
+        print(f"Yahoo options {ticker}: {e}")
+    try:
+        price, exps = _chain_cboe(ticker)
+        if price and exps:
+            return price, exps, "cboe"
+    except Exception as e:
+        print(f"CBOE options {ticker}: {e}")
+    return 0.0, [], "none"
+
+
 def get_options_data(ticker: str) -> Dict[str, Any]:
     """
     Cadena de opciones real de Yahoo — vol/OI, P/C ratio, call wall, put wall, max pain.
@@ -632,22 +798,12 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
     }
 
     try:
-        r = yget(
-            f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
-            timeout=12, needs_crumb=True
-        )
-        r.raise_for_status()
-        chain = r.json().get("optionChain", {}).get("result", [])
-        if not chain:
+        current_price, expirations, source = _fetch_chain(ticker)
+        if not expirations or not current_price:
             return out
         out["source_ok"] = True
-
-        current_price = float(chain[0].get("quote", {}).get("regularMarketPrice") or 0)
-        dates = chain[0].get("expirationDates", [])
-        if not dates or not current_price:
-            return out
-
         out["has_options"] = True
+        out["options_source"] = source
 
         # Acumular datos de las 3 expiraciones más cercanas
         best_call_voi = 0.0; best_put_voi = 0.0
@@ -660,24 +816,9 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
         atm_lo = current_price * 0.95
         atm_hi = current_price * 1.05
 
-        first_strikes: List[float] = []
-        for i, exp_ts in enumerate(dates[:3]):
-            if i == 0:
-                res2 = chain   # la primera respuesta ya trae la expiración más cercana
-            else:
-                r2 = yget(
-                    f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}",
-                    {"date": exp_ts}, timeout=12, needs_crumb=True
-                )
-                r2.raise_for_status()
-                res2 = r2.json().get("optionChain", {}).get("result", [])
-            if not res2:
-                continue
-            calls = (res2[0].get("options") or [{}])[0].get("calls", [])
-            puts  = (res2[0].get("options") or [{}])[0].get("puts",  [])
-            if i == 0:
-                first_strikes = sorted({float(c.get("strike") or 0) for c in calls + puts if c.get("strike")})
-
+        c0, p0 = expirations[0]
+        first_strikes: List[float] = sorted({float(c.get("strike") or 0) for c in c0 + p0 if c.get("strike")})
+        for calls, puts in expirations:
             for c in calls:
                 vol = int(c.get("volume", 0) or 0)
                 oi  = int(c.get("openInterest", 0) or 0)
@@ -1871,6 +2012,8 @@ def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "",
         "opt_put_wall":    opts_data.get("put_wall"),
         "opt_max_pain":    opts_data.get("max_pain"),
         "opt_top_strikes": opts_data.get("top_strikes", []),
+        "options_source":  opts_data.get("options_source"),
+        "fund_source":     fund_data.get("fund_source"),
         "opt_signal": (
             "🚨 SWEEP" if opts_data.get("is_sweep")
             else "🔥 MUY INUSUAL" if opts_data.get("vol_oi", 0) >= 3.0
@@ -2270,11 +2413,13 @@ def api_debug():
                        "or_high": pd.get("or_high"), "or_low": pd.get("or_low"),
                        "market_open": pd.get("market_open"), "session_minutes": pd.get("session_minutes")}
     fund = get_fundamentals("NVDA")
-    out["fundamentals"] = {"ok": bool(fund.get("sector")), "short_pct": fund.get("short_pct"),
-                           "earnings_date": fund.get("earnings_date")}
+    out["fundamentals"] = {"ok": fund.get("short_pct") is not None, "source": fund.get("fund_source"),
+                           "short_pct": fund.get("short_pct"), "sector": fund.get("sector"),
+                           "earnings_date": fund.get("earnings_date"), "target": fund.get("target_price")}
     opts = get_options_data("NVDA")
     out["options"]  = {"ok": opts.get("has_options"), "vol_oi": opts.get("vol_oi"), "gamma": opts.get("gamma_score"),
-                       "strikes": len(opts.get("strikes") or [])}
+                       "strikes": len(opts.get("strikes") or []), "source": opts.get("options_source"),
+                       "call_wall": opts.get("call_wall"), "put_wall": opts.get("put_wall")}
     news = get_news_score("NVDA")
     out["news"]     = {"ok": bool(news.get("title")), "score": news.get("score"), "title": news.get("title")}
     cands = discover_candidates()
