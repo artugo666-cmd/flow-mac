@@ -3581,48 +3581,76 @@ def active_alerts(sessions: int = 10) -> Dict[str, Any]:
                       "repeats": len({x["day"] for x in same}),
                       "conflict": sorted({f"{x['day'][5:]} {x['dir']}" for x in opp})})
 
-    # Las cargadas se evalúan hoy (precio/estructura) para ver si maduran
+    # Las cargadas se evalúan hoy para ver si maduran, en dos pasadas:
+    #   1) ligera (precio/volumen/estructura) para TODAS — antes se cortaba en 40 por orden
+    #      alfabético y las de la T a la Z nunca se revisaban
+    #   2) completa (opciones/noticias/earnings) para las más prometedoras — sin esto la
+    #      dinamita no podía pasar de ~4 y el 🧨 era casi imposible
     alive = [x for x in items if x["life"] == "🌱 CARGADA"]
-    alive_tk = sorted({x["ticker"] for x in alive})[:40]
-    remaining = SCAN_BUDGET_S - (time.time() - t0) - 1
-    analyzed: Dict[str, Dict] = {}
-    if alive_tk and remaining > 2:
-        ex = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
-        futs = {ex.submit(analyze_ticker, tk, {}, "", True): tk for tk in alive_tk}
-        done, _ = wait(futs, timeout=remaining)
+    alive.sort(key=lambda x: (x["day"], x.get("repeats", 1)), reverse=True)
+    alive_tk = list(dict.fromkeys(x["ticker"] for x in alive))[:80]
+
+    def _run(tks: List[str], light: bool, budget: float, pcache: Dict[str, Dict] = None) -> Dict[str, Dict]:
+        res: Dict[str, Dict] = {}
+        if not tks or budget <= 2:
+            return res
+        ex = ThreadPoolExecutor(max_workers=SCAN_WORKERS if light else max(4, SCAN_WORKERS // 2))
+        futs = {ex.submit(analyze_ticker, tk, {}, "", light, (pcache or {}).get(tk)): tk for tk in tks}
+        done, _ = wait(futs, timeout=budget)
         for f in done:
             try:
                 r = f.result()
                 if "error" not in r:
-                    analyzed[futs[f]] = r      # conserva _price_data para recalcular por dirección
+                    res[futs[f]] = r
             except Exception as e:
                 print(f"active analyze {futs[f]}: {e}")
         ex.shutdown(wait=False, cancel_futures=True)
+        return res
 
-    for x in items:
-        it = analyzed.get(x["ticker"])
-        if x["life"] != "🌱 CARGADA" or not it:
-            continue
-        # Plan de entrada en la dirección DE LA ALERTA (no la del movimiento del día):
-        # antes un PUT en una acción que subía recibía zona/stop de CALL.
+    def _evaluate(x: Dict, it: Dict) -> None:
+        # Plan de entrada en la dirección DE LA ALERTA (no la del movimiento del día)
         pd_ = it.get("_price_data") or {}
-        plan = compute_entry_plan(pd_, x["dir"], {}) if pd_.get("price") else (it.get("entry_plan") or {})
+        opts = {"call_wall": it.get("opt_call_wall"), "put_wall": it.get("opt_put_wall")}
+        plan = compute_entry_plan(pd_, x["dir"], opts) if pd_.get("price") else (it.get("entry_plan") or {})
         dec = _plan_action(plan) if plan else (it.get("entry_decision") or "")
         it2 = {**it, "direction": x["dir"], "entry_plan": plan, "entry_state": plan.get("entry_state")}
         c = classify_alert(x, it2, [], None)
         x.update({"dinamita": c["dinamita"], "dinamita_why": c["dinamita_why"],
                   "alert_near_zone": c["alert_near_zone"], "alert_zones": c["alert_zones"],
                   "entry_state": plan.get("entry_state"), "entry_decision": dec,
-                  "entry_plan": plan, "spot": it.get("spot")})
+                  "entry_plan": plan, "spot": it.get("spot"), "full_data": not it.get("light", True)})
+
+    light_res = _run(alive_tk, True, (SCAN_BUDGET_S - (time.time() - t0)) * 0.45)
+    for x in alive:
+        if x["ticker"] in light_res:
+            _evaluate(x, light_res[x["ticker"]])
+
+    # Pasada completa para las más prometedoras (en zona, con volumen o con algo de dinamita)
+    promising = [x for x in alive if x.get("dinamita") is not None and
+                 (x.get("alert_near_zone") or x["dinamita"] >= 1.5 or
+                  (light_res.get(x["ticker"]) or {}).get("rel_volume", 1) >= 1.5)]
+    promising.sort(key=lambda x: (bool(x.get("alert_near_zone")), x.get("dinamita") or 0), reverse=True)
+    full_tk = list(dict.fromkeys(x["ticker"] for x in promising))[:12]
+    pcache = {tk: light_res[tk].get("_price_data") for tk in full_tk if light_res.get(tk)}
+    full_res = _run(full_tk, False, SCAN_BUDGET_S - (time.time() - t0) - 1, pcache)
+    for x in alive:
+        if x["ticker"] in full_res:
+            _evaluate(x, full_res[x["ticker"]])
+
+    for x in alive:
+        if x.get("dinamita") is None:
+            continue
         # MADURANDO exige combustible: tocar la zona sin volumen/flujo no dio ventaja en el backtest.
-        nz = c["alert_near_zone"]
-        if c["dinamita"] >= 4.5 or (nz and c["dinamita"] >= 3.0):
+        nz, dyn = x.get("alert_near_zone"), x["dinamita"]
+        if dyn >= 4.5 or (nz and dyn >= 3.0):
             x["life"] = "🧨 MADURANDO"
-            x["life_why"] = (f"en su zona ${nz['price']} y con combustible (dinamita {c['dinamita']})" if nz
-                             else f"combustible hoy (dinamita {c['dinamita']})")
+            x["life_why"] = (f"en su zona ${nz['price']} y con combustible (dinamita {dyn})" if nz
+                             else f"combustible hoy (dinamita {dyn})")
         elif nz:
             x["life"] = "📍 EN ZONA SIN CHISPA"
-            x["life_why"] = f"llegó a su zona ${nz['price']} pero sin combustible (dinamita {c['dinamita']}) — esperar"
+            x["life_why"] = f"llegó a su zona ${nz['price']} pero sin combustible (dinamita {dyn}) — esperar"
+    for x in items:
+        x.pop("_price_data", None)
 
     order = {"🧨 MADURANDO": 0, "📍 EN ZONA SIN CHISPA": 1, "🌱 CARGADA": 2, "🚂 YA CORRIÓ": 3, "❌ MUERTA": 4}
     items.sort(key=lambda x: (order.get(x["life"], 9), -x.get("repeats", 1), -(x.get("dinamita") or 0), x["day"]))
@@ -3630,7 +3658,8 @@ def active_alerts(sessions: int = 10) -> Dict[str, Any]:
     for x in items:
         counts[x["life"]] = counts.get(x["life"], 0) + 1
     return {"generado": datetime.now().isoformat(timespec="seconds"), "store": store.mode,
-            "days": days, "counts": counts, "segundos": round(time.time() - t0, 1), "items": items}
+            "days": days, "counts": counts, "segundos": round(time.time() - t0, 1),
+            "evaluadas_ligero": len(light_res), "evaluadas_completo": len(full_res), "items": items}
 
 
 @app.route("/api/alerts/active")
@@ -3874,6 +3903,7 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                  (f"\n\nAvisos de hoy: {sum(1 for k in st.kv_many(f'sent|{day}|') if k.endswith('|mad'))} madurando"
                   ) + f"\n{APP_URL}/alertas")
         res = {"ok": True, "et": now.strftime("%H:%M"), "alertas": len(d["items"]), "conteo": c,
+               "evaluadas": f"{d.get('evaluadas_ligero', 0)} ligero · {d.get('evaluadas_completo', 0)} completo",
                "enviados": sent, "errores": errors[:3], "segundos": d.get("segundos")}
         try:
             st.kv_set("monitor_last", json.dumps({**res, "cuando": now.isoformat(timespec="minutes"),
