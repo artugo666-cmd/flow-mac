@@ -3089,6 +3089,7 @@ th:first-child,td:first-child{{text-align:left;white-space:normal}} th{{color:#6
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip().strip('"').strip("'").strip()
 if DATABASE_URL.startswith("DATABASE_URL="):          # por si se pegó la línea completa del .env
     DATABASE_URL = DATABASE_URL.split("=", 1)[1].strip().strip('"').strip("'")
+DATABASE_URL = re.sub(r"\s+", "", DATABASE_URL).strip('"').strip("'")   # saltos de línea al copiar
 STORE_FILE = os.path.join(BASE_DIR, "alerts_store.json")
 
 
