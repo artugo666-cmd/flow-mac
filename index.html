@@ -1139,6 +1139,7 @@ function buildCard(d, idx, alert){
           (d.alert_operable?'<div class="af" style="border-color:var(--grn)">✅ <span>Operable ahora</span></div>':'')+
         '</div>'+
         ((d.dinamita_why||[]).length?'<div style="margin-top:6px"><b>Combustible:</b>'+li(d.dinamita_why)+'</div>':'')+
+        ((d.alert_warnings||[]).length?'<div style="margin-top:6px;color:var(--ora)"><b>⚠️ Ojo con el contrato de la alerta:</b>'+li(d.alert_warnings)+'</div>':'')+
         ((d.hedge_why||[]).length?'<div style="margin-top:6px"><b>¿Cobertura?</b>'+li(d.hedge_why)+'</div>':'')+
         ((d.alert_zones||[]).length?'<div style="margin-top:6px"><b>Zonas de la alerta:</b>'+li(d.alert_zones.map(function(z){
           return '$'+z.price+' '+z.label+' → '+(z.dist_pct>0?'+':'')+z.dist_pct+'% del precio'+(z.near?' 📍 EN ZONA':'');}))+'</div>':'')+

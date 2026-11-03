@@ -2953,14 +2953,22 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
             dyn += 0.4; dyn_why.append(f"SPY {spy_regime.lower()} el pivot — mercado a favor")
         elif spy_regime in ("SOBRE", "BAJO"):
             dyn -= 0.4; dyn_why.append(f"SPY {spy_regime.lower()} el pivot — mercado en contra")
-    # Lecciones del backtest (19-oct→2-nov, 71 alertas; muestra chica, se recalibra con más datos)
+    # Lecciones del backtest (19-oct→2-nov, 71 alertas; muestra chica).
+    # LEAP y strike lejano describen el CONTRATO de la ballena, no el combustible de la
+    # acción: van como advertencia aparte y solo restan poco (antes −1 cada uno → casi
+    # todas las alertas del grupo arrancaban en −2 y la dinamita nunca pasaba de ~1).
+    warnings: List[str] = []
     if horizon == "LEAP":
-        dyn -= 1.0; dyn_why.append("✗ LEAP: en el backtest solo 14% iba arriba a 5 sesiones — sirve como dirección, no como trade corto")
+        dyn -= 0.4
+        warnings.append("Contrato LEAP: posicionamiento de meses. En el backtest solo 14% iba arriba a 5 sesiones. "
+                        "Si entras, usa un vencimiento de 3–8 semanas, no el de la alerta")
     if otm is not None and otm > 10:
-        dyn -= 1.0; dyn_why.append(f"✗ strike {otm:.0f}% OTM: en el backtest los >10% OTM perdieron (R −0.32)")
+        dyn -= 0.4
+        warnings.append(f"Strike de la alerta {otm:.0f}% fuera del dinero: esa opción necesita un movimiento enorme. "
+                        "Si entras, usa un strike cercano al precio")
     rvp = item.get("rel_volume_prev")
     if rvp is not None and rvp >= 1.5:
-        dyn -= 0.8; dyn_why.append(f"✗ ayer ya hubo volumen fuerte ({rvp:.1f}x): en el backtest esas alertas llegaron tarde (R −1.0)")
+        dyn -= 0.8; dyn_why.append(f"✗ ayer ya hubo volumen fuerte ({rvp:.1f}x): en el backtest esas alertas llegaron tarde")
     dyn = round(max(0.0, min(10.0, dyn)), 1)
 
     # ── Zonas de la alerta vs precio ──
@@ -2981,7 +2989,10 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
         label, color, tip = "🧨 DINAMITA", "g", "Tiene combustible para moverse ya — revisa la entrada"
     elif side == "PUT" and 40 <= hedge < 60:
         label, color, tip = "❓ PUT AMBIGUO", "y", "Puede ser cobertura o apuesta — no operar sin confirmación de precio"
-    elif near_zone and dyn < 4.5:
+    elif near_zone and dyn >= 3.0:
+        label, color, tip = "🎯 EN ZONA CON COMBUSTIBLE", "g", \
+            "Llegó al nivel de la alerta y tiene combustible — revisa la entrada y confirma en SensaMarket"
+    elif near_zone:
         label, color, tip = "📍 EN ZONA SIN CHISPA", "y", \
             "Llegó al nivel de la alerta pero sin volumen ni catalizador — esperar reacción del precio"
     elif zones and not near_zone and dyn < 6.5:
@@ -2995,20 +3006,20 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
         label, color, tip = "⚪ SIN CHISPA", "r", "Sin combustible hoy"
 
     operable = (label in ("🧨 DINAMITA",) and st == "EN_ZONA" and dir_ok) or \
-               (near_zone is not None and dyn >= 4.5)
+               (near_zone is not None and dyn >= 3.0 and st not in ("INVALIDADO", "EXTENDIDO"))
 
     return {
         "alert_label": label, "alert_color": color, "alert_tip": tip,
         "alert_horizon": horizon, "alert_dte": dte, "alert_otm_pct": otm,
         "hedge_prob": hedge if side == "PUT" else None, "hedge_why": hedge_why,
-        "dinamita": dyn, "dinamita_why": dyn_why,
+        "dinamita": dyn, "dinamita_why": dyn_why, "alert_warnings": warnings,
         "alert_zones": zones, "alert_near_zone": near_zone,
         "alert_operable": operable,
     }
 
 
 def _alert_rank_key(x: Dict) -> Tuple:
-    order = {"🧨 DINAMITA": 0, "🔥 CALENTANDO": 1, "📍 EN ZONA SIN CHISPA": 2, "👀 VIGILAR ZONA": 2, "🏦 POSICIONAL": 3,
+    order = {"🧨 DINAMITA": 0, "🎯 EN ZONA CON COMBUSTIBLE": 0, "🔥 CALENTANDO": 1, "📍 EN ZONA SIN CHISPA": 2, "👀 VIGILAR ZONA": 2, "🏦 POSICIONAL": 3,
              "🛡️ POSIBLE COBERTURA": 3, "🏦 LEAP": 4, "❓ PUT AMBIGUO": 5, "⚪ SIN CHISPA": 7}
     return (0 if x.get("alert_operable") else 1, order.get(x.get("alert_label"), 9),
             -(x.get("dinamita") or 0), -(x.get("alert", {}).get("premium") or 0))
@@ -3616,6 +3627,7 @@ def active_alerts(sessions: int = 10) -> Dict[str, Any]:
         it2 = {**it, "direction": x["dir"], "entry_plan": plan, "entry_state": plan.get("entry_state")}
         c = classify_alert(x, it2, [], None)
         x.update({"dinamita": c["dinamita"], "dinamita_why": c["dinamita_why"],
+                  "alert_warnings": c.get("alert_warnings", []),
                   "alert_near_zone": c["alert_near_zone"], "alert_zones": c["alert_zones"],
                   "entry_state": plan.get("entry_state"), "entry_decision": dec,
                   "entry_plan": plan, "spot": it.get("spot"), "full_data": not it.get("light", True)})
@@ -3825,6 +3837,8 @@ def _fmt_alert(x: Dict, head: str) -> str:
             L.append(f"✓ {_h(w)}")
         for w in cons[:3]:
             L.append(f"✗ {_h(w)}")
+    for w in (x.get("alert_warnings") or [])[:2]:
+        L.append(f"⚠️ {_h(w)}")
     if x.get("repeats", 1) > 1:
         L.append(f"🔁 El grupo la repitió {x['repeats']} días")
     if x.get("conflict"):
@@ -3906,8 +3920,21 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                "evaluadas": f"{d.get('evaluadas_ligero', 0)} ligero · {d.get('evaluadas_completo', 0)} completo",
                "enviados": sent, "errores": errors[:3], "segundos": d.get("segundos")}
         try:
+            top = sorted([x for x in d["items"] if x.get("dinamita") is not None],
+                         key=lambda x: x["dinamita"], reverse=True)
+            seen_t, top5 = set(), []
+            for x in top:
+                if (x["ticker"], x["dir"]) in seen_t:
+                    continue
+                seen_t.add((x["ticker"], x["dir"]))
+                top5.append({"ticker": f"{x['ticker']} {x['dir']}", "dinamita": x["dinamita"],
+                             "estado": x["life"], "por_que": [w for w in (x.get("dinamita_why") or [])][:4],
+                             "datos_completos": x.get("full_data", False)})
+                if len(top5) >= 5:
+                    break
             st.kv_set("monitor_last", json.dumps({**res, "cuando": now.isoformat(timespec="minutes"),
-                                                  "madurando": [f"{x['ticker']} {x['dir']} 🧨{x.get('dinamita')}" for x in mad]}))
+                                                  "madurando": [f"{x['ticker']} {x['dir']} 🧨{x.get('dinamita')}" for x in mad],
+                                                  "top_dinamita": top5}))
             if sent:
                 st.kv_set("monitor_last_sent", now.isoformat(timespec="minutes"))
         except Exception as e:
