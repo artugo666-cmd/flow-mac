@@ -46,35 +46,81 @@ SCAN_CACHE_S  = int(os.environ.get("FLOWSCAN_CACHE_S", "45"))
 # Sin esto regresan 401 en silencio → opciones, short float, earnings
 # y analistas quedaban en cero y el score corría a medias.
 # ══════════════════════════════════════════════════════════════
+# curl_cffi imita la huella TLS de Chrome. Yahoo responde 429 a getcrumb cuando
+# detecta la huella de `requests` desde IPs de nube (Render) — es el mismo bloqueo
+# que obligó a yfinance a migrar a curl_cffi en 2025.
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except Exception:  # pragma: no cover
+    cffi_requests = None
+    HAS_CFFI = False
+
+
 class _YahooSession:
+    """Una sesión HTTP por hilo (curl_cffi no comparte handles entre hilos con
+    seguridad) que comparten la misma cookie A3 + crumb."""
+
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50)
-        self.session.mount("https://", adapter)
+        self.local = threading.local()
+        self.cookies: Dict[str, str] = {}
+        self.gen = 0
         self.crumb: Optional[str] = None
         self.crumb_ts = 0.0
         self.attempt_ts = 0.0
         self.last_error: Optional[str] = None
+        self.backend = "curl_cffi" if HAS_CFFI else "requests"
+
+    def _new_session(self, with_cookies: bool = True):
+        if HAS_CFFI:
+            s = cffi_requests.Session(impersonate="chrome")
+        else:
+            s = requests.Session()
+            s.headers.update(HEADERS)
+            s.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=20))
+        if with_cookies:
+            for k, v in self.cookies.items():
+                s.cookies.set(k, v, domain=".yahoo.com")
+        return s
+
+    def _session(self):
+        s = getattr(self.local, "s", None)
+        if s is None or getattr(self.local, "gen", -1) != self.gen:
+            s = self._new_session()
+            self.local.s, self.local.gen = s, self.gen
+        return s
+
+    @staticmethod
+    def _cookie_dict(s) -> Dict[str, str]:
+        try:
+            return dict(s.cookies.get_dict())
+        except Exception:
+            try:
+                return {k: v for k, v in s.cookies.items()}
+            except Exception:
+                return {}
 
     def _refresh(self) -> None:
         self.attempt_ts = time.time()
         try:
+            s = self._new_session(with_cookies=False)
             try:
                 # fc.yahoo.com responde 404 pero deja la cookie A3 — es lo esperado
-                self.session.get("https://fc.yahoo.com", timeout=8)
-            except requests.RequestException:
+                s.get("https://fc.yahoo.com", timeout=8)
+            except Exception:
                 pass
-            r = self.session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8)
+            r = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8)
             txt = (r.text or "").strip()
             if r.status_code == 200 and txt and "<" not in txt and len(txt) < 40:
+                self.cookies = self._cookie_dict(s)
+                self.gen += 1
                 self.crumb, self.crumb_ts, self.last_error = txt, time.time(), None
             else:
-                self.crumb, self.last_error = None, f"getcrumb HTTP {r.status_code}"
+                self.crumb, self.last_error = None, f"getcrumb HTTP {r.status_code} ({self.backend})"
         except Exception as e:
-            self.crumb, self.last_error = None, str(e)
-        print(f"Yahoo crumb: {'OK' if self.crumb else 'FALLÓ — ' + str(self.last_error)}")
+            self.crumb, self.last_error = None, f"{e} ({self.backend})"
+        print(f"Yahoo crumb [{self.backend}]: {'OK' if self.crumb else 'FALLÓ — ' + str(self.last_error)}")
 
     def get_crumb(self, force: bool = False) -> Optional[str]:
         with self.lock:
@@ -90,12 +136,12 @@ class _YahooSession:
             c = self.get_crumb()
             if c:
                 params["crumb"] = c
-        r = self.session.get(url, params=params, timeout=timeout)
+        r = self._session().get(url, params=params, timeout=timeout)
         if needs_crumb and r.status_code in (401, 403):
             c = self.get_crumb(force=True)
             if c:
                 params["crumb"] = c
-                r = self.session.get(url, params=params, timeout=timeout)
+                r = self._session().get(url, params=params, timeout=timeout)
         return r
 
 
@@ -1898,7 +1944,7 @@ def health():
         "scoring": "4-factor: Flujo + Catalizador + Momentum + Timing",
         "entry": "estructural: VWAP / rango de apertura / ATR",
         "rvol": "normalizado por hora del día",
-        "yahoo_crumb": bool(YF.crumb),
+        "yahoo_crumb": bool(YF.crumb), "http_backend": YF.backend,
         "time": datetime.now().isoformat(timespec="seconds"),
     })
 
@@ -2216,7 +2262,7 @@ def api_watchlist_scan():
 def api_debug():
     out = {}
     crumb = YF.get_crumb()
-    out["yahoo_crumb"] = {"ok": bool(crumb), "error": YF.last_error}
+    out["yahoo_crumb"] = {"ok": bool(crumb), "error": YF.last_error, "backend": YF.backend}
     pd   = get_price_data("NVDA")
     out["price"]    = {"ok": bool(pd.get("price")), "price": pd.get("price"),
                        "rel_vol_hora": pd.get("rel_volume"), "rel_vol_dia_completo": pd.get("rel_volume_raw"),
