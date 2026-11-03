@@ -3451,7 +3451,11 @@ def tg_send(text: str) -> Tuple[bool, str]:
 def api_telegram_test():
     ok, msg = tg_send("✅ <b>FlowScan conectado</b>\nDesde aquí te llegarán los avisos del vigilante.\n"
                       f"Alertas activas: {APP_URL}/alertas")
-    return jsonify({"ok": ok, "detalle": msg, "almacen": get_store().mode, "chat": bool(_tg_chat_id())})
+    st = get_store()
+    return jsonify({"ok": ok, "detalle": msg, "almacen": st.mode, "chat": bool(_tg_chat_id()),
+                    "db_configurada": bool(DATABASE_URL),
+                    "db_host": (DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else None),
+                    "db_error": st.error, "version": "5.2"})
 
 
 # ══════════════════════════════════════════════════════════════
