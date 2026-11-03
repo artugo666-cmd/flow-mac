@@ -1,0 +1,132 @@
+Con los buenos días para nuestra comunidad !! Espero que tod@s estén pasando un muy buen fin de semana !!! HAPPY HALLOWEEN !!!
+
+NUESTRO LIVE DE FIN DE SEMANA LO VAMOS A REALIZAR MAÑANA DOMINNGO 01 DE NOVIEMBRE DESDE LAS 2:30 P.M. .......VAYA MASACRE AYER EN LOS MERCADOS..!! WE HAVE A LOT TO TALK ABOUT !!!
+
+En la semana del Lúnes 19 al Viernes 23 de Octubre, se publicaron 50 alertas inusuales de opciones, de las cuales 35 arrojaron resultados positivos al cierre de sesión de bolsa de ayer. Esto deja un porcentaje de acierto de: 70 % !!! Varias de estas alertas arrojaron resultados porcentuales muy altos, como fue el caso de: SOFI, CRWD, AMZN, BE, VRT COIN, y ni hablar de LMT y PANW . De modo que nuestras alertas inusuales de opciones siguen arrojando resultados muy positivos, y muy por arriba de 50% .......Muchas gracias a nuestro compañero Freddy García por compartitme nuevamente esta información y muchas gracias también a nuestro compañeros Albert Rodriguez por su colaboración en el seguimiento de nuestras alertas inusuales de opciones.
+
+Nuestras alertas son medidas porcentualmente, desde el precio de apertura de sesión de bolsa en la cual fueron notificadas, hasta el precio más alto ó mas bajo ( si se trata de una alerta de puts) alcanzado, concluyendo la medición porcentual, al cierre de sesión de bolsa del Viernes de la semana siguiente a la notificación de la alerta.
+
+A continuación la relación detalldas de las alertas que arrojaron resultados positivos inmediatos, la semana pasada:
+
+Lunes, 19 oct 26:
+
+
+1. VRT 710 mil [ CALL ] Vencen: Jan-15-27, Strike: 230,  GOLAZO DE ALERTA !! Sube: 19.03% (40.73 USD), Tiempo: 9 Sesiones [Abre: 214.00 → Sube: 254.73 el (29oct26)].
+
+
+2. COIN 690 mil [ PUT ] Vencen: Feb-19-27, Strike: 160, GOLAZO DE ALERTA !!  Retrocede: -22.03% (-38.69 USD), Tiempo: 10 Sesiones [Abre: 175.58 → Baja: 136.89 el (30oct26)].
+
+
+3. NBIS 1 Millon [ CALL ] Vencen: Nov-20-26, Strike: 180,  Sube: 3.52% (6.23 USD), Tiempo: 8 Sesiones [Abre: 176.51 → Sube: 182.74 el (28oct26)].
+
+
+4. LRCX 1.8 Millones [ CALL ] Vencen: Dec-15-26, Strike: 390,  Sube: 1.72% (4.75 USD), Tiempo: 1 Sesiones [Abre: 275.16 → Sube: 279.92 el (19oct26)].
+
+
+
+5. PANW 970 mil [ CALL ] Vencen: Dec-17-27, Strike: 430,  Sube: 14.29% (50.88 USD), Tiempo: 8 Sesiones [Abre: 356.00 → Sube: 406.88 el (28oct26)].
+
+
+Martes, 20 oct 26:
+
+NOTA: TODAS LAS ALERTAS DEL MARTES 20 DE OCTUBRE FUERON EXITOSAS.
+
+
+1. AKAM 800 mil [ CALL ] Vencen: Dec-18-26, Strike: 130,  Sube: 13.16% (11.63 USD), Tiempo: 7 Sesiones [Abre: 88.31 → Sube: 99.94 el (28oct26)].
+
+
+2. WMT 1 Millon [ CALL ] Vencen: Dec-17-27, Strike: 115,  Sube: 3.4% (4.1 USD), Tiempo: 9 Sesiones [Abre: 120.41 → Sube: 124.51 el (30oct26)].
+
+
+3. SKHY 710 mil [ PUT ] Vencen: Dec-18-26, Strike: 125,  Retrocede: -4.94% (-6.81 USD), Tiempo: 3 Sesiones [Abre: 137.60 → Baja: 130.79 el (22oct26)].
+
+
+4. BE 795 mil [ CALL ] Vencen: Dec-18-26, Strike: 230,  GOLAZO DE ALERTA !! Sube: 9.63% (21.21 USD), Tiempo: 2 Sesiones [Abre: 220.16 → Sube: 241.37 el (21oct26)].
+
+
+5. DUOL 725 mil [ PUT ] Vencen: Feb-19-27, Strike: 140,  Retrocede: -7.94% (-11.28 USD), Tiempo: 9 Sesiones [Abre: 141.98 → Baja: 130.70 el (30oct26)].
+
+
+6. SOFI 1.3 Millones [ CALL ] Vencen: Jun-17-27, Strike: 20, GOLAZO DE ALERTA !!  Sube: 24.15% (3.43 USD), Tiempo: 8 Sesiones [Abre: 14.20 → Sube: 17.63 el (29oct26)].
+
+
+7. MAGS 1.4 Millones [ PUT ] Vencen: Nov-20-26, Strike: 70,  Retrocede: -6.07% (-4.39 USD), Tiempo: 9 Sesiones [Abre: 72.23 → Baja: 67.84 el (30oct26)].
+
+
+8. PEP 690 mil [ CALL ] Vencen: Jan-15-27, Strike: 150,  Sube: 3.14% (4.24 USD), Tiempo: 3 Sesiones [Abre: 134.76 → Sube: 139.00 el (22oct26)].
+
+
+9. SMH 1.2 Millones [ CALL ] Vencen: Jun-17-27, Strike: 580,  Sube: 5.37% (29.15 USD), Tiempo: 7 Sesiones [Abre: 541.85 → Sube: 571.00 el (28oct26)].
+
+
+10. SCHW 810 mil [ PUT ] Vencen: Nov-20-26, Strike: 80,  Retrocede: -2.48% (-2.22 USD), Tiempo: 9 Sesiones [Abre: 89.60 → Baja: 87.37 el (30oct26)].
+
+Miércoles, 21 oct 26:
+
+
+1. SPCX 1.5 Millones [ CALL ] Vencen: Aug-20-27, Strike: 155,  Sube: 3.5% (5.62 USD), Tiempo: 1 Sesiones [Abre: 160.56 → Sube: 166.18 el (21oct26)].
+
+
+2. AMZN 930 mil [ PUT ] Vencen: Nov-20-26, Strike: 250,  GOLAZO DE ALERTA !! Retrocede: -12.69% (-33.35 USD), Tiempo: 8 Sesiones [Abre: 262.71 → Baja: 229.36 el (30oct26)].
+
+
+
+3. KLAC 650 mil [ CALL ] Vencen: Nov-20-26, Strike: 175,  Sube: 4.83% (7.9 USD), Tiempo: 7 Sesiones [Abre: 163.41 → Sube: 171.31 el (29oct26)].
+
+
+4. SPXS 550 mil [ CALL ] Vencen: Nov-27-26, Strike: 24,  Sube: 8.42% (2.03 USD), Tiempo: 8 Sesiones [Abre: 24.10 → Sube: 26.13 el (30oct26)].
+
+
+5. HD 870 mil [ PUT ] Vencen: Jan-21-28, Strike: 290,  Retrocede: -1.65% (-5.24 USD), Tiempo: 1 Sesiones [Abre: 316.39 → Baja: 311.15 el (21oct26)].
+
+
+6. CVNA 520 mil [ PUT ] Vencen: Nov-20-26, Strike: 58,  Retrocede: -9.19% (-5.66 USD), Tiempo: 4 Sesiones [Abre: 61.58 → Baja: 55.92 el (26oct26)].
+
+Jueves, 22 oct 26:
+
+
+1. MRK 1 Millon [ CALL ] Vencen: Mar-19-27, Strike: 200,  Sube: 1.96% (2.97 USD), Tiempo: 1 Sesiones [Abre: 151.05 → Sube: 154.02 el (22oct26)].
+
+
+2. LMT 510 mil [ CALL ] Vencen: Oct-30-26, Strike: 607.5,  GOLAZO DE ALERTA !! Sube: 13.37% (77.49 USD), Tiempo: 7 Sesiones [Abre: 579.51 → Sube: 657.00 el (30oct26)]..
+
+
+3. TSM 1.4 Millones [ CALL ] Vencen: Jan-15-27, Strike: 430,  Sube: 5.12% (21.49 USD), Tiempo: 5 Sesiones [Abre: 419.39 → Sube: 440.88 el (28oct26)].
+
+
+4. CRCL 790 mil [ PUT ] Vencen: Dec-18-26, Strike: 80,  Retrocede: -17.14% (-14.69 USD), Tiempo: 7 Sesiones [Abre: 85.69 → Baja: 71.00 el (30oct26)].
+
+
+5. IONQ 750 mil [ PUT ] Vencen: Dec-18-26, Strike: 25,  Retrocede: -7.72% (-2.39 USD), Tiempo: 7 Sesiones [Abre: 30.94 → Baja: 28.55 el (30oct26)].
+
+
+6. USO 920 mil [ CALL ] Vencen: Jan-15-27, Strike: 175,  Sube: 5.21% (8.51 USD), Tiempo: 7 Sesiones [Abre: 163.30 → Sube: 171.82 el (30oct26)].
+
+
+7. ANET 595 mil [ PUT ] Vencen: Jan-15-27, Strike: 160,  Retrocede: -6.52% (-11.64 USD), Tiempo: 7 Sesiones [Abre: 178.50 → Baja: 166.86 el (30oct26)].
+
+
+8. NFLX 2.5 Millones [ CALL ] Vencen: Jan-15-27, Strike: 80,  Sube: 4.16% (2.7 USD), Tiempo: 2 Sesiones [Abre: 65.11 → Sube: 67.82 el (23oct26)].
+
+Viernes, 23 oct 26:
+
+
+1. CRWD 595 mil [ CALL ] Vencen: Feb-19-27, Strike: 280, GOLAZO DE ALERTA !!  Sube: 13.79% (33 USD), Tiempo: 4 Sesiones [Abre: 239.29 → Sube: 272.29 el (28oct26)].
+
+
+2. MSTR 1.3 Millones [ PUT ] Vencen: Nov-27-26, Strike: 135,  Retrocede: -14.1% (-20.37 USD), Tiempo: 6 Sesiones [Abre: 144.43 → Baja: 124.06 el (30oct26)].
+
+
+3. DIS 810 mil [ PUT ] Vencen: Dec-18-26, Strike: 95,  Retrocede: -3.1% (-3.49 USD), Tiempo: 4 Sesiones [Abre: 112.24 → Baja: 108.75 el (28oct26)].
+
+
+
+4. TSLA 990 mil [ PUT ] Vencen: Nov-20-26, Strike: 370,  Retrocede: -2.12% (-7.93 USD), Tiempo: 1 Sesiones [Abre: 373.20 → Baja: 365.27 el (23oct26)].
+
+
+
+5. VIX 1.3 Millones [ CALL ] Vencen: Dec-16-26, Strike: 28,  Sube: 21.59% (4.25 pts), Tiempo: 6 Sesiones [Abre: 19.68 → Sube: 23.93 el (30oct26)].
+
+
+6. CBRS 610 mil [ CALL ] Vencen: Dec-18-26, Strike: 120,  Sube: 10.3% (11.27 USD), Tiempo: 4 Sesiones [Abre: 109.33 → Sube: 120.60 el (28oct26)].
+
