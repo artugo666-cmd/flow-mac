@@ -3,3 +3,4 @@ flask-cors
 requests
 gunicorn
 curl_cffi
+psycopg[binary]

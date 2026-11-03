@@ -2139,6 +2139,7 @@ def health():
         "entry": "estructural: VWAP / rango de apertura / ATR",
         "rvol": "normalizado por hora del día",
         "yahoo_crumb": bool(YF.crumb), "http_backend": YF.backend,
+        "almacen_alertas": "postgres" if DATABASE_URL else "archivo",
         "time": datetime.now().isoformat(timespec="seconds"),
     })
 
@@ -2464,6 +2465,26 @@ def _parse_expiry(line: str) -> Optional[datetime]:
     return d
 
 
+def message_date(raw: str) -> Optional[str]:
+    """Fecha que trae el propio mensaje: 'Resumen del viernes 30 de octubre' / 'NOVEMBER 2, 2026'."""
+    today = datetime.now(NY_TZ).date()
+    m = re.search(r"resumen del\s+\w+\s+(\d{1,2})\s+de\s+([a-záéíóú]+)(?:\s+(?:de\s+)?(\d{4}))?", raw or "", re.I)
+    e = None if m else re.search(r"\b(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+(\d{1,2}),\s*(\d{4})", raw or "", re.I)
+    try:
+        if m:
+            mon = _MESES.get(m.group(2).lower()[:3]); day = int(m.group(1))
+            year = int(m.group(3)) if m.group(3) else today.year
+            d = datetime(year, mon, day).date()
+            if not m.group(3) and d > today + timedelta(days=3):
+                d = datetime(year - 1, mon, day).date()
+            return d.isoformat()
+        if e:
+            return datetime(int(e.group(3)), _MESES.get(e.group(1).lower()[:3]), int(e.group(2))).date().isoformat()
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 def parse_alert_message(raw: str, include_index: bool = False) -> Dict[str, Any]:
     """Parser del mensaje diario del grupo, tal cual se recibe.
     Soporta los dos formatos que publican en el grupo:
@@ -2749,6 +2770,15 @@ def api_alerts():
         regime_pct = round((spy - parsed["pivot_spy"]) / parsed["pivot_spy"] * 100, 2)
         regime = "SOBRE" if regime_pct > 0.1 else "BAJO" if regime_pct < -0.1 else "EN"
 
+    # Guardar en el almacén (seguimiento de 10 sesiones)
+    saved = 0
+    try:
+        msg_day = message_date(payload.get("raw") or "") or _today_et()
+        saved = get_store().add(min(msg_day, _today_et()), parsed["alerts"], source="app")
+        _ACTIVE_CACHE["data"] = None
+    except Exception as e:
+        print(f"store add error: {e}")
+
     alerts = parsed["alerts"][:20]
     ex = ThreadPoolExecutor(max_workers=min(6, len(alerts)))
     futs = {ex.submit(analyze_ticker, a["ticker"], market, a["raw"]): a for a in alerts}
@@ -2787,6 +2817,7 @@ def api_alerts():
         "hot_desks": parsed["hot_desks"],
         "summary": summary, "counts": counts, "operables": ops,
         "failed": failed, "segundos": round(time.time() - t0, 1),
+        "guardadas": saved, "almacen": get_store().mode,
         "items": items,
     })
 
@@ -3044,6 +3075,297 @@ th:first-child,td:first-child{{text-align:left;white-space:normal}} th{{color:#6
 <p>Zonas de las alertas: {z['zonas']} · tocadas {z['tocadas']} · después de tocarlas, mediana a favor {cell(z['mfe_despues_de_tocar_med'],'%')} · ≥5% en {cell(z['ge5_despues_de_tocar'],'%')}</p>
 <h1>Detalle</h1>
 <div class="t"><table><tr><th>Fecha</th><th>Tk</th><th>Lado</th><th>DTE</th><th>OTM</th><th>A favor</th><th>En contra</th><th>5 ses.</th><th>R</th><th>Filtro</th></tr>{det}</table></div>
+</body></html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# ══════════════════════════════════════════════════════════════
+# ALMACÉN DE ALERTAS
+# Con DATABASE_URL (Postgres, p.ej. Neon gratis) → permanente.
+# Sin ella → archivo local (Render lo borra al reiniciar), pero siempre se
+# vuelve a sembrar con data/alertas_historial.txt del repo.
+# ══════════════════════════════════════════════════════════════
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+STORE_FILE = os.path.join(BASE_DIR, "alerts_store.json")
+
+
+def _alert_key(day: str, a: Dict) -> str:
+    return f"{day}|{a['ticker']}|{a['dir']}|{a.get('strike')}|{a.get('expiry')}"
+
+
+class AlertStore:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pg = None
+        self.mode = "archivo"
+        self.error: Optional[str] = None
+        if DATABASE_URL:
+            try:
+                import psycopg  # noqa: F401  (verifica que el driver exista)
+                self.pg = DATABASE_URL
+                with self._conn() as c:
+                    c.execute("""CREATE TABLE IF NOT EXISTS alerts (
+                        k TEXT PRIMARY KEY, day DATE NOT NULL, ticker TEXT NOT NULL, dir TEXT NOT NULL,
+                        premium DOUBLE PRECISION, strike DOUBLE PRECISION, expiry DATE,
+                        levels JSONB, note TEXT, raw TEXT, source TEXT, created TIMESTAMPTZ DEFAULT now())""")
+                self.mode = "postgres"
+            except Exception as e:
+                self.pg, self.error = None, f"Postgres no disponible: {e}"
+                print(self.error)
+        self.mem: Dict[str, Dict] = {}
+        if not self.pg and os.path.exists(STORE_FILE):
+            try:
+                self.mem = json.load(open(STORE_FILE, encoding="utf-8"))
+            except Exception:
+                self.mem = {}
+        self._seed_from_history()
+
+    def _conn(self):
+        import psycopg
+        return psycopg.connect(self.pg, autocommit=True, connect_timeout=8)
+
+    def _seed_from_history(self) -> None:
+        try:
+            n = 0
+            for day, txt in _load_history():
+                p = parse_alert_message(txt, include_index=True)
+                n += self.add(day, p["alerts"], source="historial", persist=False)
+            self._flush()
+            print(f"AlertStore[{self.mode}]: historial sembrado ({n} nuevas)")
+        except Exception as e:
+            print(f"AlertStore seed error: {e}")
+
+    def _flush(self) -> None:
+        if self.pg:
+            return
+        try:
+            with open(STORE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.mem, f)
+        except Exception as e:
+            print(f"AlertStore flush error: {e}")
+
+    def add(self, day: str, alerts: List[Dict], source: str = "app", persist: bool = True) -> int:
+        new = 0
+        with self.lock:
+            if self.pg:
+                with self._conn() as c:
+                    for a in alerts:
+                        cur = c.execute(
+                            """INSERT INTO alerts (k, day, ticker, dir, premium, strike, expiry, levels, note, raw, source)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (k) DO NOTHING""",
+                            (_alert_key(day, a), day, a["ticker"], a["dir"], a.get("premium"), a.get("strike"),
+                             a.get("expiry"), json.dumps(a.get("levels") or []), a.get("note"), a.get("raw"), source))
+                        new += cur.rowcount or 0
+            else:
+                for a in alerts:
+                    k = _alert_key(day, a)
+                    if k not in self.mem:
+                        self.mem[k] = {**a, "day": day, "source": source}
+                        new += 1
+                if persist:
+                    self._flush()
+        return new
+
+    def since(self, first_day: str) -> List[Dict]:
+        if self.pg:
+            with self._conn() as c:
+                cur = c.execute("""SELECT day, ticker, dir, premium, strike, expiry, levels, note, raw, source
+                                   FROM alerts WHERE day >= %s ORDER BY day, ticker""", (first_day,))
+                out = []
+                for r in cur.fetchall():
+                    out.append({"day": r[0].isoformat(), "ticker": r[1], "dir": r[2], "premium": r[3], "strike": r[4],
+                                "expiry": r[5].isoformat() if r[5] else None,
+                                "levels": r[6] if isinstance(r[6], list) else json.loads(r[6] or "[]"),
+                                "note": r[7], "raw": r[8], "source": r[9]})
+                return out
+        return sorted((v for v in self.mem.values() if v["day"] >= first_day), key=lambda x: (x["day"], x["ticker"]))
+
+    def days(self) -> List[str]:
+        if self.pg:
+            with self._conn() as c:
+                return [r[0].isoformat() for r in c.execute("SELECT DISTINCT day FROM alerts ORDER BY day").fetchall()]
+        return sorted({v["day"] for v in self.mem.values()})
+
+
+_STORE: Optional[AlertStore] = None
+_STORE_LOCK = threading.Lock()
+
+
+def get_store() -> AlertStore:
+    global _STORE
+    with _STORE_LOCK:
+        if _STORE is None:
+            _STORE = AlertStore()
+        return _STORE
+
+
+def _today_et() -> str:
+    return datetime.now(NY_TZ).strftime("%Y-%m-%d")
+
+
+# ══════════════════════════════════════════════════════════════
+# ALERTAS ACTIVAS — últimas 10 sesiones con su "estado de vida"
+#   🌱 CARGADA     sigue cerca de donde se alertó: puede madurar
+#   🧨 MADURANDO   cargada + hoy tiene combustible o llegó a su zona
+#   🚂 YA CORRIÓ   ya avanzó ≥2 ATR a favor desde el origen: no perseguir
+#   ❌ MUERTA      ≥2 ATR en contra, o vence en ≤7 días
+# ══════════════════════════════════════════════════════════════
+_ACTIVE_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _life(a: Dict, bars: List[Dict]) -> Optional[Dict]:
+    idx = next((i for i, b in enumerate(bars) if b["d"] >= a["day"]), None)
+    if idx is None or idx < 15:
+        return None
+    pre, since = bars[:idx], bars[idx:]
+    o = since[0]["o"]; last = since[-1]["c"]
+    sgn = 1 if a["dir"] == "CALL" else -1
+    trs = [max(pre[i]["h"] - pre[i]["l"], abs(pre[i]["h"] - pre[i - 1]["c"]), abs(pre[i]["l"] - pre[i - 1]["c"]))
+           for i in range(len(pre) - 14, len(pre))]
+    atr = sum(trs) / len(trs)
+    cur_atr = sgn * (last - o) / atr if atr else 0
+    hi = max(b["h"] for b in since); lo = min(b["l"] for b in since)
+    mfe = ((hi - o) if sgn > 0 else (o - lo)) / o * 100
+    dte = (datetime.strptime(a["expiry"], "%Y-%m-%d").date() - datetime.now(NY_TZ).date()).days if a.get("expiry") else None
+    if dte is not None and dte <= 7:
+        life = "❌ MUERTA"; why = f"vence en {dte} días"
+    elif cur_atr <= -2:
+        life = "❌ MUERTA"; why = f"{abs(cur_atr):.1f} ATR en contra desde el origen"
+    elif cur_atr >= 2:
+        life = "🚂 YA CORRIÓ"; why = f"{cur_atr:.1f} ATR a favor desde el origen — no perseguir"
+    else:
+        life = "🌱 CARGADA"; why = f"{cur_atr:+.1f} ATR desde el origen"
+    return {"origin": round(o, 2), "last": round(last, 2), "move_pct": round(sgn * (last - o) / o * 100, 1),
+            "move_atr": round(cur_atr, 2), "mfe_pct": round(mfe, 1), "sessions": len(since),
+            "life": life, "life_why": why, "dte_now": dte}
+
+
+def active_alerts(sessions: int = 10) -> Dict[str, Any]:
+    t0 = time.time()
+    store = get_store()
+    days = [d for d in store.days() if d <= _today_et()][-sessions:]
+    if not days:
+        return {"items": [], "days": [], "store": store.mode}
+    alerts = store.since(days[0])
+    tickers = sorted({a["ticker"] for a in alerts})
+
+    bars: Dict[str, List[Dict]] = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        futs = {ex.submit(_daily_bars, tk, "6mo"): tk for tk in tickers}
+        done, _ = wait(futs, timeout=SCAN_BUDGET_S * 0.45)
+        for f in done:
+            try:
+                bars[futs[f]] = f.result()
+            except Exception as e:
+                print(f"active bars {futs[f]}: {e}")
+
+    # Repetidas y conflictos
+    by_tk: Dict[str, List[Dict]] = {}
+    for a in alerts:
+        by_tk.setdefault(a["ticker"], []).append(a)
+
+    items = []
+    for a in alerts:
+        lf = _life(a, bars.get(a["ticker"]) or [])
+        if not lf:
+            continue
+        same = [x for x in by_tk[a["ticker"]] if x["dir"] == a["dir"]]
+        opp = [x for x in by_tk[a["ticker"]] if x["dir"] != a["dir"]]
+        items.append({**a, **lf,
+                      "repeats": len({x["day"] for x in same}),
+                      "conflict": sorted({f"{x['day'][5:]} {x['dir']}" for x in opp})})
+
+    # Las cargadas se evalúan hoy (precio/estructura) para ver si maduran
+    alive = [x for x in items if x["life"] == "🌱 CARGADA"]
+    alive_tk = sorted({x["ticker"] for x in alive})[:40]
+    remaining = SCAN_BUDGET_S - (time.time() - t0) - 1
+    analyzed: Dict[str, Dict] = {}
+    if alive_tk and remaining > 2:
+        ex = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+        futs = {ex.submit(analyze_ticker, tk, {}, "", True): tk for tk in alive_tk}
+        done, _ = wait(futs, timeout=remaining)
+        for f in done:
+            try:
+                r = f.result()
+                if "error" not in r:
+                    r.pop("_price_data", None)
+                    analyzed[futs[f]] = r
+            except Exception as e:
+                print(f"active analyze {futs[f]}: {e}")
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    for x in items:
+        it = analyzed.get(x["ticker"])
+        if x["life"] != "🌱 CARGADA" or not it:
+            continue
+        c = classify_alert(x, it, [], None)
+        x.update({"dinamita": c["dinamita"], "dinamita_why": c["dinamita_why"],
+                  "alert_near_zone": c["alert_near_zone"], "alert_zones": c["alert_zones"],
+                  "entry_state": it.get("entry_state"), "entry_decision": it.get("entry_decision"),
+                  "spot": it.get("spot")})
+        if c["alert_near_zone"] or c["dinamita"] >= 4.5:
+            x["life"] = "🧨 MADURANDO"
+            x["life_why"] = ("llegó a su zona $" + str(c["alert_near_zone"]["price"])) if c["alert_near_zone"] \
+                else f"combustible hoy (dinamita {c['dinamita']})"
+
+    order = {"🧨 MADURANDO": 0, "🌱 CARGADA": 1, "🚂 YA CORRIÓ": 2, "❌ MUERTA": 3}
+    items.sort(key=lambda x: (order.get(x["life"], 9), -x.get("repeats", 1), -(x.get("dinamita") or 0), x["day"]))
+    counts: Dict[str, int] = {}
+    for x in items:
+        counts[x["life"]] = counts.get(x["life"], 0) + 1
+    return {"generado": datetime.now().isoformat(timespec="seconds"), "store": store.mode,
+            "days": days, "counts": counts, "segundos": round(time.time() - t0, 1), "items": items}
+
+
+@app.route("/api/alerts/active")
+def api_alerts_active():
+    if _ACTIVE_CACHE["data"] and request.args.get("fresh") != "1" and time.time() - _ACTIVE_CACHE["ts"] < 180:
+        return jsonify(_ACTIVE_CACHE["data"])
+    d = active_alerts()
+    _ACTIVE_CACHE.update({"ts": time.time(), "data": d})
+    return jsonify(d)
+
+
+@app.route("/alertas")
+def page_alertas():
+    """Vista para celular: alertas de las últimas 10 sesiones con su estado de vida."""
+    d = _ACTIVE_CACHE["data"] if _ACTIVE_CACHE["data"] and time.time() - _ACTIVE_CACHE["ts"] < 180 else None
+    if not d:
+        d = active_alerts(); _ACTIVE_CACHE.update({"ts": time.time(), "data": d})
+    def esc(t): return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    cards = []
+    for x in d["items"]:
+        extra = []
+        if x.get("repeats", 1) > 1:
+            extra.append(f"🔁 repetida {x['repeats']} días")
+        if x.get("conflict"):
+            extra.append("⚔️ conflicto: " + ", ".join(x["conflict"]))
+        if x.get("entry_decision"):
+            extra.append(esc(x["entry_decision"]))
+        why = "".join(f"<div>· {esc(w)}</div>" for w in (x.get("dinamita_why") or [])[:4])
+        zones = " · ".join(f"${z['price']} {esc(z['label'])}" for z in (x.get("levels") or []))
+        cards.append(
+            f"<div class='c'><div class='h'><b>{x['ticker']}</b> <span class='{x['dir'].lower()}'>{x['dir']}</span>"
+            f" <span class='l'>{x['life']}</span></div>"
+            f"<div class='m'>Alerta {x['day'][5:]} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}"
+            f" · origen ${x['origin']} → ${x['last']} ({x['move_pct']:+}%) · {x['sessions']} ses.</div>"
+            f"<div class='m'>{esc(x['life_why'])}{' · 🧨 ' + str(x['dinamita']) if x.get('dinamita') is not None else ''}</div>"
+            + (f"<div class='m'>Zonas: {zones}</div>" if zones else "")
+            + (f"<div class='m'>{' · '.join(extra)}</div>" if extra else "")
+            + (f"<div class='w'>{why}</div>" if why else "") + "</div>")
+    counts = " · ".join(f"{k} {v}" for k, v in d.get("counts", {}).items())
+    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Alertas activas</title><style>
+body{{background:#07080a;color:#dde2f0;font:14px/1.45 system-ui,sans-serif;margin:0;padding:14px}}
+h1{{font-size:18px;margin:0 0 4px}} p{{color:#6b748f;margin:4px 0 12px}}
+.c{{background:#0d0f14;border:1px solid #1d2235;border-radius:8px;padding:10px 12px;margin-bottom:10px}}
+.h{{font-size:16px;margin-bottom:4px}} .call{{color:#0dff8c}} .put{{color:#ff3d5a}} .l{{float:right;font-size:13px}}
+.m{{color:#9aa3bd;font-size:12px}} .w{{color:#6b748f;font-size:12px;margin-top:4px}}
+a{{color:#4d9fff}}
+</style></head><body>
+<h1>Alertas activas — últimas {len(d.get('days', []))} sesiones</h1>
+<p>{counts}<br>Almacén: {d.get('store')} · {d.get('generado')} · <a href="/">← FlowScan</a></p>
+{''.join(cards) or '<p>Sin alertas guardadas.</p>'}
 </body></html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
