@@ -3086,7 +3086,9 @@ th:first-child,td:first-child{{text-align:left;white-space:normal}} th{{color:#6
 # Sin ella → archivo local (Render lo borra al reiniciar), pero siempre se
 # vuelve a sembrar con data/alertas_historial.txt del repo.
 # ══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip().strip('"').strip("'").strip()
+if DATABASE_URL.startswith("DATABASE_URL="):          # por si se pegó la línea completa del .env
+    DATABASE_URL = DATABASE_URL.split("=", 1)[1].strip().strip('"').strip("'")
 STORE_FILE = os.path.join(BASE_DIR, "alerts_store.json")
 
 
@@ -3403,7 +3405,7 @@ a{{color:#4d9fff}}
 # TELEGRAM_BOT_TOKEN en Render. El chat se detecta solo: basta con que
 # el usuario le haya escrito "hola" al bot una vez.
 # ══════════════════════════════════════════════════════════════
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
 MONITOR_KEY = os.environ.get("MONITOR_KEY", "").strip()
 APP_URL = os.environ.get("APP_URL", "https://flow-mac.onrender.com").rstrip("/")
 
