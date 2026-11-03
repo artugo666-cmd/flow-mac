@@ -3977,6 +3977,9 @@ def signals_report() -> Dict[str, Any]:
             sigs.append(json.loads(v))
         except Exception:
             pass
+    # Señales mandadas con la regla vieja (zona sin combustible, dinamita <3) no cuentan
+    sigs = [s for s in sigs if not (s.get("source") == "telegram" and s.get("dinamita") is not None
+                                    and s["dinamita"] < 3)]
     sigs.sort(key=lambda s: (s["day"], s["ts"]))
     tickers = sorted({s["ticker"] for s in sigs})
     bars: Dict[str, List[Dict]] = {}
