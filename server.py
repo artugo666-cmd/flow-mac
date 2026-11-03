@@ -1450,6 +1450,22 @@ def compute_entry_plan(p: Dict, direction: str, opts: Dict = None) -> Dict[str, 
     }
 
 
+def _plan_action(plan: Dict) -> str:
+    """Qué hacer con el precio, sin calificar el setup (no hay score de la alerta aquí)."""
+    st = plan.get("entry_state")
+    z = f"${plan.get('entry_zone_lo', 0):.2f}–${plan.get('entry_zone_hi', 0):.2f}"
+    verb = "recupera" if plan.get("direction", "CALL") == "CALL" else "pierde"
+    return {
+        "EN_ZONA": f"Precio en zona de entrada {z}",
+        "ESPERA_PULLBACK": f"Esperar retroceso a {z}",
+        "ESPERA_RUPTURA": f"Entrar solo si {verb} VWAP ${plan.get('entry_level', 0):.2f}",
+        "EXTENDIDO": f"Extendido — no perseguir; solo en {z}",
+        "INVALIDADO": "Estructura rota en contra de la alerta",
+        "ESPERA_RANGO": "Primeros 15 min — esperar rango de apertura",
+        "MERCADO_CERRADO": "Mercado cerrado",
+    }.get(st, "")
+
+
 def entry_decision(score: float, plan: Dict) -> Tuple[str, str]:
     """Texto de decisión = score (calidad del setup) × estado de entrada (momento)."""
     st = plan.get("entry_state")
@@ -3591,19 +3607,24 @@ def active_alerts(sessions: int = 10) -> Dict[str, Any]:
         # antes un PUT en una acción que subía recibía zona/stop de CALL.
         pd_ = it.get("_price_data") or {}
         plan = compute_entry_plan(pd_, x["dir"], {}) if pd_.get("price") else (it.get("entry_plan") or {})
-        dec, dcol = entry_decision(7.0, plan) if plan else (it.get("entry_decision"), "y")
+        dec = _plan_action(plan) if plan else (it.get("entry_decision") or "")
         it2 = {**it, "direction": x["dir"], "entry_plan": plan, "entry_state": plan.get("entry_state")}
         c = classify_alert(x, it2, [], None)
         x.update({"dinamita": c["dinamita"], "dinamita_why": c["dinamita_why"],
                   "alert_near_zone": c["alert_near_zone"], "alert_zones": c["alert_zones"],
                   "entry_state": plan.get("entry_state"), "entry_decision": dec,
                   "entry_plan": plan, "spot": it.get("spot")})
-        if c["alert_near_zone"] or c["dinamita"] >= 4.5:
+        # MADURANDO exige combustible: tocar la zona sin volumen/flujo no dio ventaja en el backtest.
+        nz = c["alert_near_zone"]
+        if c["dinamita"] >= 4.5 or (nz and c["dinamita"] >= 3.0):
             x["life"] = "🧨 MADURANDO"
-            x["life_why"] = ("llegó a su zona $" + str(c["alert_near_zone"]["price"])) if c["alert_near_zone"] \
-                else f"combustible hoy (dinamita {c['dinamita']})"
+            x["life_why"] = (f"en su zona ${nz['price']} y con combustible (dinamita {c['dinamita']})" if nz
+                             else f"combustible hoy (dinamita {c['dinamita']})")
+        elif nz:
+            x["life"] = "📍 EN ZONA SIN CHISPA"
+            x["life_why"] = f"llegó a su zona ${nz['price']} pero sin combustible (dinamita {c['dinamita']}) — esperar"
 
-    order = {"🧨 MADURANDO": 0, "🌱 CARGADA": 1, "🚂 YA CORRIÓ": 2, "❌ MUERTA": 3}
+    order = {"🧨 MADURANDO": 0, "📍 EN ZONA SIN CHISPA": 1, "🌱 CARGADA": 2, "🚂 YA CORRIÓ": 3, "❌ MUERTA": 4}
     items.sort(key=lambda x: (order.get(x["life"], 9), -x.get("repeats", 1), -(x.get("dinamita") or 0), x["day"]))
     counts: Dict[str, int] = {}
     for x in items:
@@ -3737,22 +3758,49 @@ def _h(t: Any) -> str:
 
 
 def _fmt_alert(x: Dict, head: str) -> str:
-    lines = [f"{head} <b>{x['ticker']} {x['dir']}</b>  (alerta {x['day'][5:]}, strike {x.get('strike') or '—'}, vence {x.get('expiry') or '—'})"]
-    lines.append(f"{_h(x['life_why'])}")
+    """Mensaje de Telegram que se entiende solo: qué es, qué hacer, por qué, riesgos."""
+    plan = x.get("entry_plan") or {}
+    dyn = x.get("dinamita")
+    why = x.get("dinamita_why") or []
+    pros = [w for w in why if not w.startswith("✗")]
+    cons = [w.lstrip("✗ ").strip() for w in why if w.startswith("✗")]
+    st = plan.get("entry_state")
+    horizon = ""
+    if x.get("expiry"):
+        dte = (datetime.strptime(x["expiry"], "%Y-%m-%d").date() - datetime.now(NY_TZ).date()).days
+        horizon = "LEAP (largo plazo)" if dte > 180 else "posicional" if dte > 45 else "corto plazo"
+        horizon += f", {dte} días"
+
+    L = [f"{head}  <b>{x['ticker']} {x['dir']}</b>"]
+    L.append(f"Alerta del grupo del {x['day'][8:]}/{x['day'][5:7]} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}"
+             + (f" ({horizon})" if horizon else ""))
     if x.get("spot"):
-        lines.append(f"Precio ${x['spot']:.2f} · origen ${x['origin']} ({x['move_pct']:+}%)")
-    if x.get("entry_decision"):
-        lines.append(_h(x["entry_decision"]))
-    if x.get("dinamita") is not None:
-        lines.append(f"🧨 Dinamita {x['dinamita']}")
-    for w in (x.get("dinamita_why") or [])[:3]:
-        lines.append(f"· {_h(w)}")
+        L.append(f"Precio ahora <b>${x['spot']:.2f}</b> ({x['move_pct']:+}% desde que se alertó)")
+
+    # Qué hacer
+    L.append("")
+    if st == "EN_ZONA":
+        L.append(f"<b>QUÉ HACER:</b> está en zona de entrada ${plan.get('entry_zone_lo')}–${plan.get('entry_zone_hi')}.")
+        L.append(f"Stop ${plan.get('entry_stop')} · T1 ${plan.get('entry_t1')} · T2 ${plan.get('entry_t2')}")
+        L.append("Antes de entrar: semáforo de SensaMarket (≥60% del lado de la alerta).")
+    elif x.get("entry_decision"):
+        L.append(f"<b>QUÉ HACER:</b> {_h(x['entry_decision'])}. Todavía no entres.")
+        if plan.get("entry_stop"):
+            L.append(f"Si se da: stop ${plan.get('entry_stop')} · T1 ${plan.get('entry_t1')}")
+
+    # Por qué
+    if dyn is not None:
+        L.append("")
+        L.append(f"<b>Dinamita {dyn}/10</b> (combustible para moverse hoy; ≥6.5 fuerte, <3 nada)")
+        for w in pros[:4]:
+            L.append(f"✓ {_h(w)}")
+        for w in cons[:3]:
+            L.append(f"✗ {_h(w)}")
     if x.get("repeats", 1) > 1:
-        lines.append(f"🔁 Repetida {x['repeats']} días")
+        L.append(f"🔁 El grupo la repitió {x['repeats']} días")
     if x.get("conflict"):
-        lines.append("⚔️ Conflicto: " + ", ".join(x["conflict"]))
-    lines.append("👉 Confirma en SensaMarket (mismo lado · sweeps/ask · vencimientos cortos) antes de entrar")
-    return "\n".join(lines)
+        L.append("⚔️ Ojo, también alertaron el lado contrario: " + ", ".join(x["conflict"]))
+    return "\n".join(L)
 
 
 def monitor_tick(force: bool = False) -> Dict[str, Any]:
@@ -3794,16 +3842,17 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
             if len(sent) >= cap:
                 continue
             if now_life == "🧨 MADURANDO":
-                if send(f"sent|{day}|{ak}|mad", _fmt_alert(x, "🧨 MADURANDO")):
+                # un aviso por ticker+lado al día, aunque el grupo lo haya alertado varios días
+                if send(f"sent|{day}|{x['ticker']}|{x['dir']}|mad", _fmt_alert(x, "🧨 MADURANDO")):
                     try:
                         record_signal("telegram", x["ticker"], x["dir"], x.get("spot"), x.get("entry_plan") or {},
                                       x.get("dinamita"), x.get("life_why", ""), x["day"])
                     except Exception as e:
                         print(f"record_signal error: {e}")
             elif before == "🧨 MADURANDO" and now_life == "❌ MUERTA":
-                send(f"sent|{day}|{ak}|dead", _fmt_alert(x, "❌ SE INVALIDÓ — si entraste, respeta tu stop:"))
+                send(f"sent|{day}|{x['ticker']}|{x['dir']}|dead", _fmt_alert(x, "❌ SE INVALIDÓ — si entraste, respeta tu stop:"))
             elif before == "🧨 MADURANDO" and now_life == "🚂 YA CORRIÓ":
-                send(f"sent|{day}|{ak}|ran", _fmt_alert(x, "🚂 YA CORRIÓ — si entraste, toma parcial o sube el stop:"))
+                send(f"sent|{day}|{x['ticker']}|{x['dir']}|ran", _fmt_alert(x, "🚂 YA CORRIÓ — si entraste, toma parcial o sube el stop:"))
 
         c = d.get("counts", {})
         resumen = " · ".join(f"{k} {v}" for k, v in c.items())
