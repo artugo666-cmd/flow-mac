@@ -720,7 +720,7 @@ def get_news_score(ticker: str) -> Dict[str, Any]:
     return out
 
 
-def _chain_yahoo(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]]]:
+def _chain_yahoo(ticker: str) -> Tuple[float, List[Tuple[int, List[Dict], List[Dict]]]]:
     """Cadena de Yahoo (requiere crumb). Regresa (precio, [(calls, puts)] de las 3 expiraciones más cercanas)."""
     if not YF.get_crumb():      # sin crumb es 401 seguro: no gastar el request
         return 0.0, []
@@ -733,7 +733,8 @@ def _chain_yahoo(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]
     price = float(chain[0].get("quote", {}).get("regularMarketPrice") or 0)
     dates = chain[0].get("expirationDates", [])
     exps = []
-    for i, exp_ts in enumerate(dates[:3]):
+    today = datetime.now(NY_TZ).date()
+    for i, exp_ts in enumerate(dates[:4]):
         if i == 0:
             res2 = chain   # la primera respuesta ya trae la expiración más cercana
         else:
@@ -745,14 +746,15 @@ def _chain_yahoo(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]
         if not res2:
             continue
         opt = (res2[0].get("options") or [{}])[0]
-        exps.append((opt.get("calls", []), opt.get("puts", [])))
+        dte = (datetime.utcfromtimestamp(int(exp_ts)).date() - today).days
+        exps.append((dte, opt.get("calls", []), opt.get("puts", [])))
     return price, exps
 
 
 _OCC_RE = re.compile(r"^(.*)(\d{6})([CP])(\d{8})$")
 
 
-def _chain_cboe(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]]]:
+def _chain_cboe(ticker: str) -> Tuple[float, List[Tuple[int, List[Dict], List[Dict]]]]:
     """Respaldo: cadena retrasada (~15 min) del CDN público de CBOE. Sin crumb ni API key.
     Cada contrato viene como símbolo OCC (NVDA251121C00200000) con volume y open_interest."""
     r = YF._session().get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json", timeout=12)
@@ -770,12 +772,13 @@ def _chain_cboe(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]]
                "openInterest": int(o.get("open_interest") or 0), "gamma": o.get("gamma")}
         calls, puts = by_exp.setdefault(exp, ([], []))
         (calls if cp == "C" else puts).append(rec)
-    today = datetime.now(NY_TZ).strftime("%y%m%d")
-    keys = sorted(k for k in by_exp if k >= today)[:3]
-    return price, [by_exp[k] for k in keys]
+    today_d = datetime.now(NY_TZ).date()
+    today = today_d.strftime("%y%m%d")
+    keys = sorted(k for k in by_exp if k >= today)[:4]
+    return price, [((datetime.strptime(k, "%y%m%d").date() - today_d).days, *by_exp[k]) for k in keys]
 
 
-def _fetch_chain(ticker: str) -> Tuple[float, List[Tuple[List[Dict], List[Dict]]], str]:
+def _fetch_chain(ticker: str) -> Tuple[float, List[Tuple[int, List[Dict], List[Dict]]], str]:
     try:
         price, exps = _chain_yahoo(ticker)
         if price and exps:
@@ -840,9 +843,16 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
         atm_lo = current_price * 0.95
         atm_hi = current_price * 1.05
 
-        c0, p0 = expirations[0]
+        _, c0, p0 = expirations[0]
         first_strikes: List[float] = sorted({float(c.get("strike") or 0) for c in c0 + p0 if c.get("strike")})
-        for calls, puts in expirations:
+        # Contratos nuevos: se ignoran vencimientos de ≤2 días (churn de day-trading en
+        # semanales: en NVDA siempre dan vol/OI enorme y no son posiciones nuevas).
+        # Si TODOS son ≤2 días, se usan igual.
+        use_all = all(e[0] <= 2 for e in expirations)
+        near_lo, near_hi = current_price * 0.90, current_price * 1.10
+        agg = {"CALL": [0, 0], "PUT": [0, 0]}     # [vol, oi] a ±10% en vencimientos válidos
+        for dte, calls, puts in expirations:
+            counts = use_all or dte > 2
             for c in calls:
                 vol = int(c.get("volume", 0) or 0)
                 oi  = int(c.get("openInterest", 0) or 0)
@@ -851,14 +861,16 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
                 if sk > 0:
                     prev = call_oi_strike.get(sk, {"oi": 0, "vol": 0})
                     call_oi_strike[sk] = {"oi": prev["oi"]+oi, "vol": prev["vol"]+vol}
-                if _voi_ok(sk, vol, oi, current_price):
+                if counts and near_lo <= sk <= near_hi:
+                    agg["CALL"][0] += vol; agg["CALL"][1] += oi
+                if counts and _voi_ok(sk, vol, oi, current_price):
                     ratio = min(vol / oi, 20.0)
                     if ratio > best_call_voi:
                         best_call_voi = round(ratio, 2)
                     if atm_lo <= sk <= atm_hi and ratio > atm_cv:
                         atm_cv = round(ratio, 2)
                     if ratio >= 1.5:
-                        top_strikes.append({"type":"CALL","strike":sk,"vol":vol,"oi":oi,"ratio":round(ratio,2)})
+                        top_strikes.append({"type":"CALL","strike":sk,"dte":dte,"vol":vol,"oi":oi,"ratio":round(ratio,2)})
 
             for p in puts:
                 vol = int(p.get("volume", 0) or 0)
@@ -868,16 +880,24 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
                 if sk > 0:
                     prev = put_oi_strike.get(sk, {"oi": 0, "vol": 0})
                     put_oi_strike[sk] = {"oi": prev["oi"]+oi, "vol": prev["vol"]+vol}
-                if _voi_ok(sk, vol, oi, current_price):
+                if counts and near_lo <= sk <= near_hi:
+                    agg["PUT"][0] += vol; agg["PUT"][1] += oi
+                if counts and _voi_ok(sk, vol, oi, current_price):
                     ratio = min(vol / oi, 20.0)
                     if ratio > best_put_voi:
                         best_put_voi = round(ratio, 2)
                     if atm_lo <= sk <= atm_hi and ratio > atm_pv:
                         atm_pv = round(ratio, 2)
                     if ratio >= 1.5:
-                        top_strikes.append({"type":"PUT","strike":sk,"vol":vol,"oi":oi,"ratio":round(ratio,2)})
+                        top_strikes.append({"type":"PUT","strike":sk,"dte":dte,"vol":vol,"oi":oi,"ratio":round(ratio,2)})
 
-        best_voi = max(best_call_voi, best_put_voi)
+        def _r(vo):
+            return round(vo[0] / vo[1], 2) if vo[1] >= 500 else 0.0
+        agg_call, agg_put = _r(agg["CALL"]), _r(agg["PUT"])
+        tot_v = agg["CALL"][0] + agg["PUT"][0]; tot_oi = agg["CALL"][1] + agg["PUT"][1]
+        # vol/OI agregado cerca del dinero: métrica principal (estable entre tickers)
+        best_voi = round(tot_v / tot_oi, 2) if tot_oi >= 500 else 0.0
+        best_strike_voi = max(best_call_voi, best_put_voi)
         pc_ratio = round(total_pv / total_cv, 2) if total_cv > 0 else 1.0
         dominant = "CALL" if total_cv > total_pv * 1.3 else "PUT" if total_pv > total_cv * 1.3 else "NEUTRAL"
         top_strikes.sort(key=lambda x: x["ratio"], reverse=True)
@@ -902,12 +922,13 @@ def get_options_data(ticker: str) -> Dict[str, Any]:
         atm_oi_conc  = round(atm_call_oi / total_coi, 3) if total_coi > 0 else 0.0
 
         out.update({
-            "vol_oi": best_voi, "call_vol_oi": best_call_voi, "put_vol_oi": best_put_voi,
+            "vol_oi": best_voi, "call_vol_oi": agg_call, "put_vol_oi": agg_put,
+            "vol_oi_strike_max": best_strike_voi,
             "atm_call_vol_oi": atm_cv, "atm_put_vol_oi": atm_pv,
             "total_call_vol": total_cv, "total_put_vol": total_pv,
             "total_call_oi": total_coi, "total_put_oi": total_poi,
             "pc_ratio": pc_ratio, "dominant": dominant,
-            "is_unusual": best_voi >= 1.5, "is_sweep": best_voi >= 5.0,
+            "is_unusual": best_voi >= 1.2, "is_sweep": best_voi >= 2.5,
             "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
             "atm_oi_concentration": atm_oi_conc,
             "top_strikes": top_strikes[:5],
@@ -1531,14 +1552,16 @@ def compute_score(
         pts_A = 2.4  # sweep institucional sin alerta
     elif has_alert:
         pts_A = 2.0  # alerta manual (Discord/Telegram)
-    elif has_opts and vol_oi >= 5.0:
-        pts_A = 2.2  # flujo muy inusual
-    elif has_opts and vol_oi >= 3.0:
-        pts_A = 2.0
-    elif has_opts and vol_oi >= 1.5:
-        pts_A = 1.6
+    # vol/OI = agregado cerca del dinero, sin semanales de ≤2 días.
+    # Referencia: <0.5 normal · 0.8 elevado · 1.2 inusual · 1.8 muy inusual · 2.5 concentración fuerte
+    elif has_opts and vol_oi >= 1.8:
+        pts_A = 2.1  # flujo nuevo muy inusual
+    elif has_opts and vol_oi >= 1.2:
+        pts_A = 1.7
     elif has_opts and vol_oi >= 0.8:
-        pts_A = 1.0
+        pts_A = 1.2
+    elif has_opts and vol_oi >= 0.5:
+        pts_A = 0.9
     elif has_opts:
         pts_A = 0.6  # tiene opciones pero flujo normal
     # Sin opciones — vol masivo + movimiento fuerte = institucional silencioso
@@ -1823,12 +1846,12 @@ def compute_score(
         momentum = "LATERAL"
 
     if has_opts:
-        vol_label = f"Vol/OI {vol_oi:.1f}x"
+        vol_label = f"Vol/OI {vol_oi:.2f}x"
         if is_sweep:
-            vol_label += " 🚨 SWEEP INSTITUCIONAL"
-        elif vol_oi >= 3.0:
+            vol_label += " 🚨 FLUJO NUEVO CONCENTRADO"
+        elif vol_oi >= 1.8:
             vol_label += " 🔥 MUY INUSUAL"
-        elif vol_oi >= 1.5:
+        elif vol_oi >= 1.2:
             vol_label += " ⚡ INUSUAL"
         vol_label += f" | P/C {pc_ratio:.2f} | {dominant}"
     else:
@@ -1840,8 +1863,8 @@ def compute_score(
     if has_alert:
         why.append(f"🔔 Alerta: {alert_context}")
     if is_sweep:
-        why.append(f"🚨 SWEEP INSTITUCIONAL — Vol/OI {vol_oi:.1f}x, lado {dominant}")
-    elif has_opts and vol_oi >= 1.5:
+        why.append(f"🚨 Flujo nuevo concentrado — Vol/OI {vol_oi:.2f}x cerca del dinero, lado {dominant}")
+    elif has_opts and vol_oi >= 1.2:
         why.append(f"⚡ Flujo inusual opciones: Vol/OI {vol_oi:.1f}x — {dominant} dominante (P/C {pc_ratio:.2f})")
     for gt in opts.get("gamma_triggers", [])[:2]:
         why.append(gt)
@@ -2039,9 +2062,9 @@ def analyze_ticker(ticker: str, market: Dict = None, alert_context: str = "",
         "options_source":  opts_data.get("options_source"),
         "fund_source":     fund_data.get("fund_source"),
         "opt_signal": (
-            "🚨 SWEEP" if opts_data.get("is_sweep")
-            else "🔥 MUY INUSUAL" if opts_data.get("vol_oi", 0) >= 3.0
-            else "⚡ INUSUAL" if opts_data.get("vol_oi", 0) >= 1.5
+            "🚨 CONCENTRADO" if opts_data.get("is_sweep")
+            else "🔥 MUY INUSUAL" if opts_data.get("vol_oi", 0) >= 1.8
+            else "⚡ INUSUAL" if opts_data.get("vol_oi", 0) >= 1.2
             else "Normal" if opts_data.get("has_options") else "Sin datos"
         ),
         # Gamma
@@ -2582,10 +2605,16 @@ def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optio
         dyn += 0.5; dyn_why.append(f"volumen {rvol:.1f}x")
 
     voi = float(item.get("opt_vol_oi") or 0)
-    if voi >= 3:
-        dyn += 2.0; dyn_why.append(f"contratos nuevos: vol/OI {voi:.1f}x en vencimientos cercanos")
-    elif voi >= 1.5:
-        dyn += 1.2; dyn_why.append(f"contratos nuevos: vol/OI {voi:.1f}x")
+    if voi >= 1.8:
+        dyn += 2.0; dyn_why.append(f"contratos nuevos: vol/OI {voi:.2f}x cerca del dinero")
+    elif voi >= 1.2:
+        dyn += 1.2; dyn_why.append(f"contratos nuevos: vol/OI {voi:.2f}x")
+    elif voi >= 0.8:
+        dyn += 0.5; dyn_why.append(f"opciones activas: vol/OI {voi:.2f}x")
+    ts = [t for t in (item.get("opt_top_strikes") or []) if t.get("type") == side and t.get("vol", 0) >= 2000]
+    if ts and ts[0]["ratio"] >= 3:
+        t = ts[0]
+        dyn += 0.8; dyn_why.append(f"strike ${t['strike']:g} ({t.get('dte','?')}d): {t['vol']:,} vs OI {t['oi']:,} — contratos nuevos concentrados")
     dom = item.get("opt_dominant")
     if dom in ("CALL", "PUT") and dom == side and voi >= 1:
         dyn += 0.4; dyn_why.append(f"flujo cercano del mismo lado ({dom})")
@@ -2810,7 +2839,8 @@ def api_debug():
                            "short_pct": fund.get("short_pct"), "sector": fund.get("sector"),
                            "earnings_date": fund.get("earnings_date"), "target": fund.get("target_price")}
     opts = get_options_data("NVDA")
-    out["options"]  = {"ok": opts.get("has_options"), "vol_oi": opts.get("vol_oi"), "gamma": opts.get("gamma_score"),
+    out["options"]  = {"ok": opts.get("has_options"), "vol_oi_cerca_dinero": opts.get("vol_oi"),
+                       "vol_oi_max_strike": opts.get("vol_oi_strike_max"), "gamma": opts.get("gamma_score"),
                        "strikes": len(opts.get("strikes") or []), "source": opts.get("options_source"),
                        "call_wall": opts.get("call_wall"), "put_wall": opts.get("put_wall")}
     news = get_news_score("NVDA")

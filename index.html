@@ -1087,7 +1087,7 @@ function buildCard(d, idx, alert){
   // Opciones
   var hasOpts=d.has_options;
   var volOI=parseFloat(d.opt_vol_oi||0);
-  var voiCol=volOI>=5?'r':volOI>=3?'o':volOI>=1.5?'y':'';
+  var voiCol=volOI>=2.5?'r':volOI>=1.8?'o':volOI>=1.2?'y':'';
   var isSweep=d.opt_is_sweep;
   var gammaScore=parseInt(d.gamma_score||0);
   var callWall=d.opt_call_wall;
@@ -1153,7 +1153,7 @@ function buildCard(d, idx, alert){
     var pwDist=putWall&&price?((price-putWall)/price*100).toFixed(1):'—';
     optsHtml='<div class="sec"><div class="sec-title" style="color:var(--blu)">Flujo de Opciones (Vol/OI)</div>'+
       '<div class="dg">'+
-        '<div class="dc"><div class="dl">Vol/OI Ratio</div><div class="dv b '+(volOI>=3?'r':volOI>=1.5?'y':'')+'">'+volOI.toFixed(2)+'x'+(isSweep?' 🚨 SWEEP':volOI>=3?' 🔥':'')+'</div></div>'+
+        '<div class="dc"><div class="dl">Vol/OI cerca del dinero</div><div class="dv b '+(volOI>=1.8?'r':volOI>=1.2?'y':'')+'">'+volOI.toFixed(2)+'x'+(isSweep?' 🚨 CONCENTRADO':volOI>=1.8?' 🔥':'')+'</div></div>'+
         '<div class="dc"><div class="dl">Lado dominante</div><div class="dv" style="color:'+(d.opt_dominant==='CALL'?'var(--grn)':d.opt_dominant==='PUT'?'var(--red)':'var(--m2)')+'">'+( d.opt_dominant||'NEUTRAL')+'</div></div>'+
         '<div class="dc"><div class="dl">P/C Ratio</div><div class="dv '+(pcRatio<0.7?'g':pcRatio>1.3?'r':'y')+'">'+pcRatio.toFixed(2)+'</div></div>'+
         (callWall?'<div class="dc"><div class="dl">Call Wall</div><div class="dv g">$'+callWall.toFixed(0)+' ('+cwDist+'% lejos)</div></div>':'')+
