@@ -507,7 +507,9 @@ function parseDiscordText(raw) {
     jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12
   };
 
-  var lines = clean.split('\n');
+  var lines = clean.split('\n').map(function(l){
+    return l.replace(/[*_`~]/g,'').replace(/^[^\w$(]+/,'').trim();
+  });
   var seen = {};
 
   lines.forEach(function(line){
@@ -520,8 +522,10 @@ function parseDiscordText(raw) {
     var ticker = tkM[1];
 
     // Excluir ETFs/índices
-    var excl = {SPY:1,QQQ:1,IWM:1,SPX:1,DIA:1,VIX:1,TLT:1,GLD:1,SLV:1,XLF:1,XLE:1,XLK:1};
+    var excl = {SPY:1,QQQ:1,IWM:1,SPX:1,DIA:1,VIX:1,TLT:1,GLD:1,SLV:1,XLF:1,XLE:1,XLK:1,TOTAL:1,UNUSUAL:1,HOTTEST:1};
     if(excl[ticker]) return;
+    if(/contract|contrato/i.test(line)) return;          // mesas calientes, no alertas
+    if(!/\b(calls?|puts?)\b/i.test(line)) return;
     if(seen[ticker]) return; // solo primera mención
 
     // ── Monto: "510 mil dólares" / "1.2 millones" / "1 millones" ──
@@ -595,10 +599,8 @@ function runDiscord() {
 
   var parsed = parseDiscordText(raw);
 
-  if(!parsed.alerts.length){
-    showErr('discord','No encontré alertas inusuales. Verifica que el formato incluya ticker + monto + calls/puts + strike.');
-    return;
-  }
+  // El servidor es quien parsea de verdad (soporta todos los formatos del grupo).
+  // El parser local solo arma la tabla preliminar; si no ve nada, seguimos igual.
 
   // Mostrar pivot si se detectó
   if(parsed.pivot_spy){
@@ -632,6 +634,11 @@ function runDiscord() {
   })
   .then(function(r){return r.json();})
   .then(function(d){
+    if(d.error && !(d.items||[]).length){
+      showErr('discord', d.error);
+      pgEl.className='pg'; btn.disabled=false; busy=false; resEl.innerHTML='';
+      return;
+    }
     if(d.market){window._market=d.market;renderPulse(d.market);updatePivotBar();}
     var resultItems=[];
     (d.items||[]).forEach(function(item,i){

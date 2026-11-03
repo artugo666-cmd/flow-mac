@@ -2504,8 +2504,31 @@ def parse_alert_message(raw: str, include_index: bool = False) -> Dict[str, Any]
         if m:
             out[field] = [float(x) for x in re.findall(r"\d{3,5}(?:\.\d+)?", m.group(1))]
 
+    # Normalización (formato Huderax con Markdown de Discord):
+    #   "🔹 *FSLR* 🟢  $500K CALLS · …"  y en la línea siguiente "↳ watch $500"
+    lines_in: List[str] = []
+    for ln in raw.splitlines():
+        t = re.sub(r"[*_`~]", "", ln).strip()
+        t = re.sub(r"^[^\w$(]+", "", t).strip()            # viñetas/emojis al inicio
+        if not t:
+            continue
+        if re.match(r"^(watch|watchlist|vigilar|zona)\b", t, re.I) and lines_in:
+            body = re.sub(r"^(watch(list)?|vigilar|zona)\s*:?", "", t, flags=re.I)
+            parts = []
+            for seg in re.split(r"[·;,]", body):
+                m2 = re.search(r"\$\s*(\d+(?:\.\d+)?)", seg) or re.search(r"\b(\d+(?:\.\d+)?)\b", seg)
+                if not m2:
+                    continue
+                lab = (seg[:m2.start()] + " " + seg[m2.end():]).replace("$", "")
+                lab = re.sub(r"\s+", " ", lab).strip(" :-") or "zona interés"
+                parts.append(f"{m2.group(1)} {lab}")
+            if parts:
+                lines_in[-1] += " (" + ", ".join(parts) + ")"
+            continue
+        lines_in.append(t)
+
     seen = set()
-    for line in raw.splitlines():
+    for line in lines_in:
         line = line.strip().strip("-•*·").strip()
         tk = re.match(r"^\$?([A-Z]{1,6})\b", line)
         if not tk:

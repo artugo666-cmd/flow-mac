@@ -234,3 +234,42 @@ GS 🔴 $880K PUTS · $830 STRIKE · DEC 18, 2026
 MRVL 🔴 $610K PUTS · $130 STRIKE · DEC 18, 2026
 TSLA 🔴 $1.1M PUTS · $375 STRIKE · JUN 17, 2027
 TOTAL ALERTS: 10
+
+=== 2026-11-03 ===
+UNUSUAL OPTIONS ACTIVITY — NOVEMBER 3, 2026
+
+🔥 HOTTEST FLOW — PREVIOUS SESSION
+*TSLA*  3.3M CONTRACTS · 53%
+*NVDA*  3M CONTRACTS · 58%
+*MU*    1.5M CONTRACTS · 55%
+
+🔹 *FSLR* 🟢  $500K CALLS · $220 STRIKE · JAN 15, 2027
+
+🔹 *MSFT* 🟢  $1.5M CALLS · $520 STRIKE · DEC 18, 2026
+   ↳ watch $500
+
+🔹 *AMZN* 🟢  $610K CALLS · $290 STRIKE · DEC 11, 2026
+   ↳ watch $248
+
+🔹 *RIVN* 🟢  $1.1M CALLS · $17 STRIKE · DEC 17, 2027
+   ↳ watch $13.20 if it consolidates · possible gap at $14.40
+
+🔹 *SKHY* 🟢  $750K CALLS · $170 STRIKE · JAN 15, 2027
+   ↳ watch $154 if it consolidates
+
+🔹 *CMG* 🔴  $500K PUTS · $32 STRIKE · DEC 18, 2026
+   ↳ watch $33
+
+🔹 *DHI* 🔴  $410K PUTS · $150 STRIKE · DEC 18, 2026
+   ↳ watch $146
+
+🔹 *SPCX* 🔴  $890K PUTS · $120 STRIKE · DEC 18, 2026
+   ↳ watch $141
+
+🔹 *NVDA* 🔴  $1.2M PUTS · $185 STRIKE · NOV 13, 2026
+   ↳ watchlist:
+
+🔹 *MSTR* 🔴  $2.1M PUTS · $130 STRIKE · MAR 19, 2027
+   ↳ watch $134 if it fails to reclaim
+
+TOTAL ALERTS: 10
