@@ -2799,6 +2799,12 @@ def api_alerts():
         it.pop("_price_data", None)
         it["alert"] = a
         it.update(classify_alert(a, it, parsed["hot_desks"], regime))
+        if it.get("alert_operable"):
+            try:
+                record_signal("app", it["ticker"], a["dir"], it.get("spot"), it.get("entry_plan") or {},
+                              it.get("dinamita"), it.get("alert_label", ""), a.get("day"))
+            except Exception as e:
+                print(f"record_signal error: {e}")
         items.append(it)
 
     items.sort(key=_alert_rank_key)
@@ -3324,8 +3330,7 @@ def active_alerts(sessions: int = 10) -> Dict[str, Any]:
             try:
                 r = f.result()
                 if "error" not in r:
-                    r.pop("_price_data", None)
-                    analyzed[futs[f]] = r
+                    analyzed[futs[f]] = r      # conserva _price_data para recalcular por dirección
             except Exception as e:
                 print(f"active analyze {futs[f]}: {e}")
         ex.shutdown(wait=False, cancel_futures=True)
@@ -3334,11 +3339,17 @@ def active_alerts(sessions: int = 10) -> Dict[str, Any]:
         it = analyzed.get(x["ticker"])
         if x["life"] != "🌱 CARGADA" or not it:
             continue
-        c = classify_alert(x, it, [], None)
+        # Plan de entrada en la dirección DE LA ALERTA (no la del movimiento del día):
+        # antes un PUT en una acción que subía recibía zona/stop de CALL.
+        pd_ = it.get("_price_data") or {}
+        plan = compute_entry_plan(pd_, x["dir"], {}) if pd_.get("price") else (it.get("entry_plan") or {})
+        dec, dcol = entry_decision(7.0, plan) if plan else (it.get("entry_decision"), "y")
+        it2 = {**it, "direction": x["dir"], "entry_plan": plan, "entry_state": plan.get("entry_state")}
+        c = classify_alert(x, it2, [], None)
         x.update({"dinamita": c["dinamita"], "dinamita_why": c["dinamita_why"],
                   "alert_near_zone": c["alert_near_zone"], "alert_zones": c["alert_zones"],
-                  "entry_state": it.get("entry_state"), "entry_decision": it.get("entry_decision"),
-                  "spot": it.get("spot")})
+                  "entry_state": plan.get("entry_state"), "entry_decision": dec,
+                  "entry_plan": plan, "spot": it.get("spot")})
         if c["alert_near_zone"] or c["dinamita"] >= 4.5:
             x["life"] = "🧨 MADURANDO"
             x["life_why"] = ("llegó a su zona $" + str(c["alert_near_zone"]["price"])) if c["alert_near_zone"] \
@@ -3511,15 +3522,16 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
         prev = st.kv_many("life|")
         sent, errors = [], []
 
-        def send(key: str, text: str):
+        def send(key: str, text: str) -> bool:
             if st.kv_get(key):
-                return
+                return False
             ok, msg = tg_send(text)
             if ok:
                 st.kv_set(key, now.isoformat(timespec="minutes"))
                 sent.append(key)
-            else:
-                errors.append(msg)
+                return True
+            errors.append(msg)
+            return False
 
         live = mins >= 9 * 60 + 45            # antes de 9:45 no se avisan entradas (rango de apertura)
         cap = 6                               # máximo de avisos individuales por ronda (anti-spam)
@@ -3534,7 +3546,12 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
             if len(sent) >= cap:
                 continue
             if now_life == "🧨 MADURANDO":
-                send(f"sent|{day}|{ak}|mad", _fmt_alert(x, "🧨 MADURANDO"))
+                if send(f"sent|{day}|{ak}|mad", _fmt_alert(x, "🧨 MADURANDO")):
+                    try:
+                        record_signal("telegram", x["ticker"], x["dir"], x.get("spot"), x.get("entry_plan") or {},
+                                      x.get("dinamita"), x.get("life_why", ""), x["day"])
+                    except Exception as e:
+                        print(f"record_signal error: {e}")
             elif before == "🧨 MADURANDO" and now_life == "❌ MUERTA":
                 send(f"sent|{day}|{ak}|dead", _fmt_alert(x, "❌ SE INVALIDÓ — si entraste, respeta tu stop:"))
             elif before == "🧨 MADURANDO" and now_life == "🚂 YA CORRIÓ":
@@ -3554,7 +3571,9 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                  ("\n🔁 Cargadas repetidas: " + ", ".join(f"{x['ticker']} {x['dir']} ×{x['repeats']}" for x in car) if car else "") +
                  f"\n\n{APP_URL}/alertas")
         if mins >= 16 * 60 + 5:
+            n_sig = len(st.kv_many(f"sig|{day}|"))
             send(f"sent|{day}|close", "🌙 <b>Cierre</b>\n" + resumen +
+                 f"\n📒 Señales registradas hoy: {n_sig} · seguimiento: {APP_URL}/senales" +
                  (f"\n\nAvisos de hoy: {sum(1 for k in st.kv_many(f'sent|{day}|') if k.endswith('|mad'))} madurando"
                   ) + f"\n{APP_URL}/alertas")
         return {"ok": True, "et": now.strftime("%H:%M"), "alertas": len(d["items"]), "conteo": c,
@@ -3572,6 +3591,167 @@ def api_monitor_tick():
     except Exception as e:
         print(f"monitor error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════════════════════
+# REGISTRO DE SEÑALES (paper trading)
+# Cada aviso de entrada (Telegram 🧨 o ✅ OPERABLE al pegar alertas) se guarda
+# con su precio, zona, stop y objetivos. Después se mide qué pasó, sesión por sesión.
+# ══════════════════════════════════════════════════════════════
+_SIG_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def record_signal(source: str, ticker: str, side: str, price: float, plan: Dict,
+                  dinamita: Optional[float], label: str, alert_day: Optional[str], note: str = "") -> bool:
+    """Guarda la señal una sola vez por día/ticker/lado. Regresa True si es nueva."""
+    if not price or not plan:
+        return False
+    now = datetime.now(NY_TZ)
+    day = now.strftime("%Y-%m-%d")
+    k = f"sig|{day}|{ticker}|{side}"
+    st = get_store()
+    if st.kv_get(k):
+        return False
+    rec = {"day": day, "ts": now.isoformat(timespec="minutes"), "source": source, "ticker": ticker, "dir": side,
+           "price": round(float(price), 2), "state": plan.get("entry_state"),
+           "zone_lo": plan.get("entry_zone_lo"), "zone_hi": plan.get("entry_zone_hi"),
+           "stop": plan.get("entry_stop"), "t1": plan.get("entry_t1"), "t2": plan.get("entry_t2"),
+           "dinamita": dinamita, "label": label, "alert_day": alert_day, "note": note}
+    st.kv_set(k, json.dumps(rec))
+    _SIG_CACHE["data"] = None
+    return True
+
+
+def _eval_signal(sg: Dict, bars: List[Dict], last_price: Optional[float]) -> Dict:
+    """Recorre las sesiones POSTERIORES al día de la señal (la sesión de la señal no se
+    cuenta porque no se sabe qué pasó antes o después de la hora del aviso)."""
+    sgn = 1 if sg["dir"] == "CALL" else -1
+    entry, stop, t1, t2 = sg["price"], sg.get("stop"), sg.get("t1"), sg.get("t2")
+    risk = abs(entry - stop) if stop else None
+    after = [b for b in bars if b["d"] > sg["day"]]
+    status, exit_px, exit_day, t1_hit = "⏳ abierta", None, None, False
+    for i, b in enumerate(after[:10]):
+        hit_stop = stop is not None and ((b["l"] <= stop) if sgn > 0 else (b["h"] >= stop))
+        hit_t1 = t1 is not None and ((b["h"] >= t1) if sgn > 0 else (b["l"] <= t1))
+        hit_t2 = t2 is not None and ((b["h"] >= t2) if sgn > 0 else (b["l"] <= t2))
+        if hit_stop and not t1_hit:
+            status, exit_px, exit_day = "❌ stop", stop, i + 1; break
+        if hit_t2:
+            t1_hit = True                       # para llegar a T2 pasó por T1: mitad vendida ahí
+            status, exit_px, exit_day = "🏆 T2", t2, i + 1; break
+        if hit_t1 and not t1_hit:
+            t1_hit = True
+            status = "✅ T1"
+            # después de T1 el stop sube a la entrada
+            stop = entry
+            if hit_stop:
+                exit_px, exit_day = entry, i + 1; break
+        elif t1_hit and hit_stop:
+            exit_px, exit_day = entry, i + 1; break
+    if exit_px is None and len(after) >= 10:
+        exit_px, exit_day = after[9]["c"], 10
+        status = status if t1_hit else "⏱️ tiempo"
+    cur = last_price or (after[-1]["c"] if after else entry)
+    hi = max([b["h"] for b in after] + [cur]); lo = min([b["l"] for b in after] + [cur])
+    mfe = ((hi - entry) if sgn > 0 else (entry - lo)) / entry * 100
+    mae = ((entry - lo) if sgn > 0 else (hi - entry)) / entry * 100
+
+    # R: mitad en T1 + resto en la salida (si tocó T1); si no, todo en la salida
+    r_mult = None
+    if risk and exit_px is not None:
+        r_exit = sgn * (exit_px - entry) / risk
+        r_t1 = sgn * (sg["t1"] - entry) / risk if (t1_hit and sg.get("t1")) else None
+        r_mult = round((r_t1 + r_exit) / 2, 2) if r_t1 is not None else round(r_exit, 2)
+    elif risk:
+        r_mult = round(sgn * (cur - entry) / risk, 2)   # abierta: R flotante
+
+    return {**sg, "sessions": len(after), "now": round(cur, 2),
+            "move_pct": round(sgn * (cur - entry) / entry * 100, 1),
+            "mfe_pct": round(mfe, 1), "mae_pct": round(mae, 1),
+            "status": status, "closed": exit_px is not None, "exit": round(exit_px, 2) if exit_px else None,
+            "exit_day": exit_day, "r": r_mult}
+
+
+def signals_report() -> Dict[str, Any]:
+    st = get_store()
+    sigs = []
+    for k, v in st.kv_many("sig|").items():
+        try:
+            sigs.append(json.loads(v))
+        except Exception:
+            pass
+    sigs.sort(key=lambda s: (s["day"], s["ts"]))
+    tickers = sorted({s["ticker"] for s in sigs})
+    bars: Dict[str, List[Dict]] = {}
+    if tickers:
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futs = {ex.submit(_daily_bars, tk, "3mo"): tk for tk in tickers}
+            done, _ = wait(futs, timeout=SCAN_BUDGET_S)
+            for f in done:
+                try:
+                    bars[futs[f]] = f.result()
+                except Exception as e:
+                    print(f"signals bars {futs[f]}: {e}")
+    rows = []
+    for s in sigs:
+        b = bars.get(s["ticker"]) or []
+        rows.append(_eval_signal(s, b, b[-1]["c"] if b else None))
+
+    def stats(rs: List[Dict]) -> Dict[str, Any]:
+        closed = [r for r in rs if r["closed"]]
+        rr = [r["r"] for r in closed if r["r"] is not None]
+        return {"n": len(rs), "cerradas": len(closed),
+                "t1_o_mas": sum(1 for r in closed if r["status"] in ("✅ T1", "🏆 T2")),
+                "stops": sum(1 for r in closed if r["status"] == "❌ stop"),
+                "acierto_pct": round(sum(1 for x in rr if x > 0) / len(rr) * 100) if rr else None,
+                "r_prom": round(sum(rr) / len(rr), 2) if rr else None,
+                "r_total": round(sum(rr), 2) if rr else None}
+    return {"generado": datetime.now().isoformat(timespec="seconds"),
+            "todas": stats(rows),
+            "en_zona": stats([r for r in rows if r.get("state") == "EN_ZONA"]),
+            "otras": stats([r for r in rows if r.get("state") != "EN_ZONA"]),
+            "filas": list(reversed(rows))}
+
+
+@app.route("/api/signals")
+def api_signals():
+    if _SIG_CACHE["data"] and request.args.get("fresh") != "1" and time.time() - _SIG_CACHE["ts"] < 300:
+        return jsonify(_SIG_CACHE["data"])
+    d = signals_report()
+    _SIG_CACHE.update({"ts": time.time(), "data": d})
+    return jsonify(d)
+
+
+@app.route("/senales")
+def page_senales():
+    d = _SIG_CACHE["data"] if _SIG_CACHE["data"] and time.time() - _SIG_CACHE["ts"] < 300 else None
+    if not d:
+        d = signals_report(); _SIG_CACHE.update({"ts": time.time(), "data": d})
+    def cell(v, suf=""): return "—" if v is None else f"{v}{suf}"
+    def srow(name, s):
+        return (f"<tr><td>{name}</td><td>{s['n']}</td><td>{s['cerradas']}</td><td>{s['t1_o_mas']}</td>"
+                f"<td>{s['stops']}</td><td>{cell(s['acierto_pct'],'%')}</td><td>{cell(s['r_prom'])}</td><td>{cell(s['r_total'])}</td></tr>")
+    det = "".join(
+        f"<tr><td>{r['day'][5:]} {r['ts'][11:16]}</td><td><b>{r['ticker']}</b></td><td class='{r['dir'].lower()}'>{r['dir']}</td>"
+        f"<td>${r['price']}</td><td>${cell(r.get('stop'))}</td><td>${cell(r.get('t1'))}</td><td>${r['now']}</td>"
+        f"<td>{r['move_pct']:+}%</td><td>{r['status']}</td><td>{cell(r['r'])}</td><td>{cell(r.get('state'))}</td></tr>"
+        for r in d["filas"])
+    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Señales FlowScan</title><style>
+body{{background:#07080a;color:#dde2f0;font:13px/1.4 system-ui,sans-serif;margin:0;padding:14px}}
+h1{{font-size:18px;margin:0 0 4px}} p{{color:#6b748f;margin:4px 0 12px}}
+.t{{overflow-x:auto;margin-bottom:18px}} table{{border-collapse:collapse;width:100%;font-size:12px}}
+th,td{{padding:6px 8px;border-bottom:1px solid #1d2235;text-align:right;white-space:nowrap}}
+th:first-child,td:first-child{{text-align:left}} th{{color:#6b748f;font-weight:600}}
+.call{{color:#0dff8c}} .put{{color:#ff3d5a}} a{{color:#4d9fff}}
+</style></head><body>
+<h1>Señales de entrada — registro</h1>
+<p>Cada aviso de entrada se guarda con su precio y se sigue 10 sesiones: stop, T1 (mitad + stop a la entrada), T2 o salida por tiempo. R = ganancia en múltiplos del riesgo. · {d['generado']} · <a href="/">← FlowScan</a></p>
+<div class="t"><table><tr><th>Grupo</th><th>Señales</th><th>Cerradas</th><th>T1/T2</th><th>Stops</th><th>Acierto</th><th>R prom.</th><th>R total</th></tr>
+{srow('Todas', d['todas'])}{srow('Avisadas EN ZONA', d['en_zona'])}{srow('Otras (zona de alerta / combustible)', d['otras'])}</table></div>
+<div class="t"><table><tr><th>Fecha</th><th>Tk</th><th>Lado</th><th>Entrada</th><th>Stop</th><th>T1</th><th>Ahora</th><th>Mov.</th><th>Estado</th><th>R</th><th>Aviso</th></tr>{det or '<tr><td colspan=11>Todavía no hay señales. Se registran solas desde el próximo aviso.</td></tr>'}</table></div>
+</body></html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ══════════════════════════════════════════════════════════════
