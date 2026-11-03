@@ -619,54 +619,44 @@ function runDiscord() {
 
   setDiscordProg(5,'Parseando '+parsed.alerts.length+' alertas...','');
 
-  var done=0;
-  var resultItems=[];
-
-  parsed.alerts.forEach(function(alert,i){
-    setTimeout(function(){
-      setDiscordProg(
-        Math.round((i+0.5)/parsed.alerts.length*90),
-        'Analizando '+alert.ticker+' ('+fmtMonto(alert.montoUSD)+')',
-        alert.dir+' strike $'+alert.strike+' vence '+alert.expiry
-      );
-
-      fetch(BASE+'/api/analyze',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({
-          tickers:   alert.ticker,
-          alert_raw: alert.raw,
-          direction: alert.dir,
-          strike:    alert.strike,
-          expiry:    alert.expiry,
-          zona:      alert.zona,
-          premium:   alert.montoStr,
-          comment:   alert.coment
-        })
-      })
-      .then(function(r){return r.json();})
-      .then(function(d){
-        if(d.market){window._market=d.market;renderPulse(d.market);updatePivotBar();}
-        var item = (d.items||[])[0];
-        if(item){
-          item._alert = alert;
-          item._monto = alert.montoUSD;
-          item._rank_idx = i;
-          resultItems.push(item);
-          // Actualizar fila en tabla
-          updateRankRow(table, alert.ticker, item, parsed.alerts.length);
-        }
-      })
-      .catch(function(e){
-        markRankRowError(table, alert.ticker);
-      })
-      .finally(function(){
-        done++;
-        if(done>=parsed.alerts.length){
-          finishDiscord(resEl, resultItems, parsed, table, pgEl, btn);
-        }
-      });
-    }, i*700);
+  setDiscordProg(25,'Clasificando '+parsed.alerts.length+' alertas: LEAP · cobertura · dinamita','Una sola consulta al servidor');
+  fetch(BASE+'/api/alerts',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({raw:raw})
+  })
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.market){window._market=d.market;renderPulse(d.market);updatePivotBar();}
+    var resultItems=[];
+    (d.items||[]).forEach(function(item,i){
+      var a=item.alert||{};
+      var lv=(a.levels||[]);
+      item._alert={ticker:item.ticker, raw:a.raw||'', dir:a.dir, montoUSD:a.premium||0,
+                   strike:a.strike||'', expiry:a.expiry||'', zona:lv.length?lv[0].price:'',
+                   coment:lv.map(function(l){return '$'+l.price+' '+l.label;}).join(' · ')+(a.note?(lv.length?' · ':'')+a.note:'')};
+      item._monto=a.premium||0;
+      item._order=i;
+      resultItems.push(item);
+      if(!table.querySelector('#rkrow-'+item.ticker)){
+        // el backend encontró una alerta que el parser del navegador no vio
+        var extra=document.createElement('div'); extra.className='rank-row'; extra.id='rkrow-'+item.ticker;
+        extra.innerHTML='<span class="rk-pos"></span><span class="rk-tick">'+item.ticker+'</span><span class="rk-dir '+(a.dir==='CALL'?'call':'put')+'">'+a.dir+'</span><span class="rk-monto">'+fmtMonto(a.premium)+'</span><span class="rk-reason"></span><span class="rk-badge"><span class="rk-score"></span></span>';
+        table.querySelector('.rank-table').appendChild(extra);
+      }
+      updateRankRow(table, item.ticker, item, d.items.length);
+    });
+    (d.failed||[]).forEach(function(tk){markRankRowError(table, tk);});
+    // Filas que el parser del navegador creyó alerta pero el servidor no (p.ej. mesas calientes)
+    var got={}; resultItems.forEach(function(x){got[x.ticker]=1;}); (d.failed||[]).forEach(function(t){got[t]=1;});
+    parsed.alerts.forEach(function(a){ if(!got[a.ticker]){ var r=table.querySelector('#rkrow-'+a.ticker); if(r) r.remove(); } });
+    window._alertsSummary=d.summary||'';
+    finishDiscord(resEl, resultItems, parsed, table, pgEl, btn);
+  })
+  .catch(function(e){
+    parsed.alerts.forEach(function(a){markRankRowError(table, a.ticker);});
+    showErr('discord','Error al clasificar alertas: '+e);
+    pgEl.className='pg'; btn.disabled=false; busy=false;
   });
 }
 
@@ -680,7 +670,7 @@ function fmtMonto(v){
 function buildRankSkeleton(parsed){
   var wrap = document.createElement('div');
   wrap.id = 'rank-table-wrap';
-  var heads = ['#','TICKER','TIPO','MONTO','ANÁLISIS RÁPIDO','SCORE'];
+  var heads = ['#','TICKER','TIPO','MONTO','CLASIFICACIÓN','DINAMITA'];
   var headRow = '<div class="rank-row rk-head">'+heads.map(function(h){return '<span>'+h+'</span>';}).join('')+'</div>';
   var rows = parsed.alerts.map(function(a,i){
     return '<div class="rank-row" id="rkrow-'+a.ticker+'" onclick="scrollToCard(\''+a.ticker+'\')">'+
@@ -760,6 +750,25 @@ function updateRankRow(table, ticker, item, total){
   var reasonStr = reasons.slice(0,3).join(' · ');
   if(!reasonStr) reasonStr = item.catalyst||'—';
 
+  if(item.alert_label){
+    var lc = item.alert_color==='g'?'var(--grn)':item.alert_color==='r'?'var(--red)':item.alert_color==='b'?'var(--blu)':'var(--yel)';
+    var hz = item.alert_horizon+(item.alert_dte!=null?' '+item.alert_dte+'d':'');
+    var otmTxt = item.alert_otm_pct!=null?(Math.abs(item.alert_otm_pct).toFixed(1)+'% '+(item.alert_otm_pct>=0?'OTM':'ITM')):'';
+    var zn = item.alert_near_zone?'📍 EN ZONA $'+item.alert_near_zone.price:(item.alert_zones&&item.alert_zones.length?'Zona $'+item.alert_zones[0].price+' ('+(item.alert_zones[0].dist_pct>0?'+':'')+item.alert_zones[0].dist_pct+'%)':'');
+    var hedge = item.hedge_prob!=null?'Cobertura '+item.hedge_prob+'%':'';
+    var top = (item.dinamita_why||[])[0]||'';
+    row.querySelector('.rk-reason').innerHTML =
+      '<b style="color:'+lc+'">'+item.alert_label+(item.alert_operable?' · ✅ OPERABLE':'')+'</b><br>'+
+      [hz,otmTxt,zn,hedge].filter(Boolean).join(' · ')+
+      (top?'<br><span style="color:var(--m1)">'+top+'</span>':'')+earnHtml;
+    var dn = parseFloat(item.dinamita||0);
+    var dcol = dn>=6.5?'var(--grn)':dn>=4.5?'var(--yel)':'var(--m1)';
+    row.querySelector('.rk-badge').innerHTML =
+      '<span class="rk-score" style="color:'+dcol+'">🧨'+dn.toFixed(1)+'</span>'+
+      '<div class="rk-sem" style="color:'+scCol+'">Score '+sc.toFixed(1)+'</div>';
+    return;
+  }
+
   row.querySelector('.rk-reason').innerHTML = reasonStr + earnHtml;
   row.querySelector('.rk-score').textContent = sc.toFixed(1);
   row.querySelector('.rk-score').style.color = scCol;
@@ -776,7 +785,10 @@ function markRankRowError(table, ticker){
 
 function finishDiscord(resEl, items, parsed, table, pgEl, btn){
   // Re-rankear por score (no por monto)
-  var byScore = items.slice().sort(function(a,b){return b.score-a.score;});
+  var byScore = items.slice().sort(function(a,b){
+    if(a._order!=null && b._order!=null) return a._order-b._order;   // ranking del servidor (operable → dinamita)
+    return b.score-a.score;
+  });
 
   // Re-numerar filas por score
   byScore.forEach(function(item,i){
@@ -794,6 +806,12 @@ function finishDiscord(resEl, items, parsed, table, pgEl, btn){
   // Summary
   var sumEl = buildSummary(byScore,'⚡ Discord Flow — '+byScore.length+' alertas analizadas');
   resEl.insertBefore(sumEl, table);
+  if(window._alertsSummary){
+    var cls=document.createElement('div');
+    cls.className='alert-origin';
+    cls.innerHTML='<b>🧭 Clasificación:</b> '+window._alertsSummary;
+    resEl.insertBefore(cls, table);
+  }
 
   // Cards detalle
   var stit = document.createElement('div');
@@ -1090,6 +1108,24 @@ function buildCard(d, idx, alert){
     alertHtml='<div class="alert-origin"><b>⚡ Alerta original:</b> '+alert.raw.substring(0,120)+(alert.raw.length>120?'...':'')+
       (fields?'<div class="alert-fields" style="margin-top:6px">'+fields+'</div>':'')+
     '</div>';
+    if(d.alert_label){
+      var lc2 = d.alert_color==='g'?'var(--grn)':d.alert_color==='r'?'var(--red)':d.alert_color==='b'?'var(--blu)':'var(--yel)';
+      var li=function(arr){return (arr||[]).map(function(x){return '<div>· '+x+'</div>';}).join('');};
+      alertHtml+='<div class="alert-origin" style="border-color:'+lc2+'">'+
+        '<b style="color:'+lc2+'">'+d.alert_label+'</b> — '+d.alert_tip+
+        '<div class="alert-fields" style="margin-top:6px">'+
+          '<div class="af">⏳ <span>'+d.alert_horizon+(d.alert_dte!=null?' · '+d.alert_dte+' días':'')+'</span></div>'+
+          (d.alert_otm_pct!=null?'<div class="af">🎯 <span>'+Math.abs(d.alert_otm_pct).toFixed(1)+'% '+(d.alert_otm_pct>=0?'OTM':'ITM')+'</span></div>':'')+
+          '<div class="af">🧨 <span>Dinamita '+(+d.dinamita).toFixed(1)+'/10</span></div>'+
+          (d.hedge_prob!=null?'<div class="af">🛡️ <span>Cobertura '+d.hedge_prob+'%</span></div>':'')+
+          (d.alert_operable?'<div class="af" style="border-color:var(--grn)">✅ <span>Operable ahora</span></div>':'')+
+        '</div>'+
+        ((d.dinamita_why||[]).length?'<div style="margin-top:6px"><b>Combustible:</b>'+li(d.dinamita_why)+'</div>':'')+
+        ((d.hedge_why||[]).length?'<div style="margin-top:6px"><b>¿Cobertura?</b>'+li(d.hedge_why)+'</div>':'')+
+        ((d.alert_zones||[]).length?'<div style="margin-top:6px"><b>Zonas de la alerta:</b>'+li(d.alert_zones.map(function(z){
+          return '$'+z.price+' '+z.label+' → '+(z.dist_pct>0?'+':'')+z.dist_pct+'% del precio'+(z.near?' 📍 EN ZONA':'');}))+'</div>':'')+
+      '</div>';
+    }
   }
 
   // EARNINGS BOX

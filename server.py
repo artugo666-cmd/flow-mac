@@ -2347,6 +2347,374 @@ def api_gamma(ticker: str):
 
 
 # ══════════════════════════════════════════════════════════════
+# ALERTAS DEL GRUPO — parser del mensaje completo + clasificador
+#   LEAP / POSICIONAL  → posicionamiento de meses: sesgo, no entrada de día
+#   COBERTURA          → puts protegiendo una posición larga: no es apuesta bajista
+#   DINAMITA           → tiene combustible para moverse YA
+# ══════════════════════════════════════════════════════════════
+
+_MESES = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8,
+          "sep": 9, "set": 9, "oct": 10, "nov": 11, "dic": 12,
+          "jan": 1, "apr": 4, "aug": 8, "dec": 12}
+
+_ALERT_EXCLUDE = {"SPY", "QQQ", "IWM", "SPX", "DIA", "VIX", "NDX", "RUT"}
+
+
+def _num(s: str) -> Optional[float]:
+    """'1.9' / '1,9' / '1,250.5' → float."""
+    s = s.strip()
+    if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
+        s = s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_money(line: str) -> float:
+    m = re.search(r"([\d.,]+)\s*(millones|millón|millon|mil|mdd|[MK])\b\s*(?:de\s+)?(?:d[oó]lares|usd)?", line, re.I)
+    if not m:
+        m = re.search(r"\$\s*([\d.,]+)\s*([MK])?", line, re.I)
+    if not m:
+        return 0.0
+    n = _num(m.group(1)) or 0.0
+    u = (m.group(2) or "").lower()
+    if u.startswith("mill") or u in ("m", "mdd"):
+        return n * 1e6
+    if u in ("mil", "k"):
+        return n * 1e3
+    return n
+
+
+def _parse_expiry(line: str) -> Optional[datetime]:
+    m = re.search(r"vence[n]?\s+(?:el\s+)?(\d{1,2})\s+(?:de\s+)?([a-záéíóú]+)(?:\s+(?:de\s+)?(\d{4}))?", line, re.I)
+    if not m:
+        return None
+    day, mes, year = int(m.group(1)), m.group(2).lower()[:3], m.group(3)
+    month = _MESES.get(mes)
+    if not month:
+        return None
+    today = datetime.now(NY_TZ).date()
+    try:
+        if year:
+            d = datetime(int(year), month, day)
+        else:
+            d = datetime(today.year, month, day)
+            if d.date() < today - timedelta(days=3):
+                d = datetime(today.year + 1, month, day)
+    except ValueError:
+        return None
+    return d
+
+
+def parse_alert_message(raw: str) -> Dict[str, Any]:
+    """Parser del mensaje diario del grupo, tal cual se recibe."""
+    out: Dict[str, Any] = {"pivot_spy": None, "spy_levels": [], "spx_levels": [],
+                           "hot_desks": [], "alerts": []}
+    raw = (raw or "").replace(" ", " ").replace("⁠", "")
+
+    piv = re.search(r"(\d{3,5}(?:\.\d+)?)\s*PIVOT", raw, re.I) or re.search(r"PIVOT\s*[:·]?\s*(\d{3,5}(?:\.\d+)?)", raw, re.I)
+    if piv:
+        out["pivot_spy"] = float(piv.group(1))
+    for key, field in (("SPY", "spy_levels"), ("SPX", "spx_levels")):
+        m = re.search(key + r"\s*:\s*([^\n]+)", raw)
+        if m:
+            out[field] = [float(x) for x in re.findall(r"\d{3,5}(?:\.\d+)?", m.group(1))]
+
+    seen = set()
+    for line in raw.splitlines():
+        line = line.strip().strip("-•*·").strip()
+        tk = re.match(r"^\$?([A-Z]{1,6})\b", line)
+        if not tk:
+            continue
+        ticker = tk.group(1)
+        if ticker in _ALERT_EXCLUDE or ticker in ("ÁREAS", "AREAS", "SPY", "SPX"):
+            continue
+        low = line.lower()
+
+        # Mesas calientes: "GOOG 939 mil de contratos 61 % calls"
+        if "contrato" in low and "%" in line:
+            dm = re.search(r"([\d.,]+)\s*(millones|millón|millon|mil|[MK])?\s*(?:de\s+)?contratos?\s*(\d+(?:[.,]\d+)?)\s*%\s*(calls?|puts?)", line, re.I)
+            if dm:
+                n = _num(dm.group(1)) or 0
+                u = (dm.group(2) or "").lower()
+                n = n * 1e6 if u.startswith("mill") or u == "m" else n * 1e3 if u in ("mil", "k") else n
+                pct = _num(dm.group(3)) or 0
+                out["hot_desks"].append({"ticker": ticker, "contracts": int(n),
+                                         "pct": pct, "dir": "CALL" if "call" in dm.group(4).lower() else "PUT"})
+            continue
+
+        # Alerta: requiere calls/puts + monto o strike
+        side = re.search(r"\b(calls?|puts?)\b", line, re.I)
+        if not side or ticker in seen:
+            continue
+        premium = _parse_money(line)
+        sk = re.search(r"strike\s*\$?\s*([\d.,]+)", line, re.I)
+        strike = _num(sk.group(1)) if sk else None
+        if not premium and not strike:
+            continue
+        exp = _parse_expiry(line)
+
+        # Niveles entre paréntesis: "(54 zona interés en caso de romperse)", "(429 posible gap, 411 posible soporte)"
+        levels = []
+        for grp in re.findall(r"\(([^)]*)\)", line):
+            for part in grp.split(","):
+                lm = re.match(r"\s*\$?([\d.]+)\s*(.*)", part)
+                if lm:
+                    levels.append({"price": float(lm.group(1)), "label": lm.group(2).strip() or "zona"})
+        tail = re.sub(r"\([^)]*\)", "", line)
+        note = ""
+        nm = re.search(r"\s-\s*([a-záéíóú ]+)$", tail, re.I) or re.search(r"\s-([a-záéíóú]+)\s*$", tail, re.I)
+        if nm:
+            note = nm.group(1).strip()
+
+        seen.add(ticker)
+        out["alerts"].append({
+            "ticker": ticker, "raw": line,
+            "dir": "CALL" if "call" in side.group(1).lower() else "PUT",
+            "premium": premium, "strike": strike,
+            "expiry": exp.strftime("%Y-%m-%d") if exp else None,
+            "levels": levels, "note": note,
+        })
+    out["alerts"].sort(key=lambda a: a["premium"], reverse=True)
+    return out
+
+
+def classify_alert(alert: Dict, item: Dict, desks: List[Dict], spy_regime: Optional[str]) -> Dict[str, Any]:
+    """
+    Separa el TIPO de flujo de la OPORTUNIDAD de entrada.
+      horizonte : DTE de la alerta
+      cobertura : probabilidad 0–100 de que un put sea protección y no apuesta
+      dinamita  : 0–10, combustible para moverse YA (independiente del monto de la alerta)
+    """
+    side = alert["dir"]
+    spot = float(item.get("spot") or 0)
+    plan = item.get("entry_plan") or {}
+    atr_u = float(plan.get("entry_vol_unit") or 0) or (spot * 0.03)
+    today = datetime.now(NY_TZ).date()
+
+    # ── Horizonte ──
+    dte = None
+    if alert.get("expiry"):
+        dte = (datetime.strptime(alert["expiry"], "%Y-%m-%d").date() - today).days
+    if dte is None:
+        horizon = "SIN FECHA"
+    elif dte <= 7:
+        horizon = "SEMANAL"
+    elif dte <= 45:
+        horizon = "SWING"
+    elif dte <= 180:
+        horizon = "POSICIONAL"
+    else:
+        horizon = "LEAP"
+
+    # ── Moneyness ──
+    otm = None
+    if alert.get("strike") and spot:
+        otm = round(((alert["strike"] - spot) if side == "CALL" else (spot - alert["strike"])) / spot * 100, 1)
+
+    # ── Cobertura (solo puts) ──
+    hedge, hedge_why = 0, []
+    if side == "PUT":
+        hedge = 25
+        trend_up = bool(item.get("above_sma50")) and bool(item.get("above_sma200"))
+        if trend_up:
+            hedge += 25; hedge_why.append("✓ acción en tendencia alcista (sobre MA50 y MA200) — se protegen ganancias")
+        if otm is not None and 3 <= otm <= 20:
+            hedge += 15; hedge_why.append(f"✓ put {otm:.0f}% OTM — rango típico de protección")
+        elif otm is not None and otm < -2:
+            hedge -= 15; hedge_why.append(f"✗ put {abs(otm):.0f}% ITM — más típico de apuesta o short sintético")
+        if dte is not None and 14 <= dte <= 120:
+            hedge += 10; hedge_why.append(f"✓ {dte} días — plazo típico de cobertura")
+        beta = item.get("beta")
+        try:
+            if beta not in (None, "N/A") and float(beta) < 1.2:
+                hedge += 10; hedge_why.append(f"✓ beta {float(beta):.2f} — acción defensiva/de cartera")
+        except (TypeError, ValueError):
+            pass
+        ns = item.get("news_score") or 0
+        chg = _num(str(item.get("change_pct", "0")).replace("%", "").replace("+", "")) or 0
+        if ns <= -2:
+            hedge -= 30; hedge_why.append("✗ noticia negativa reciente — más probable apuesta direccional")
+        if not item.get("above_sma50") and not item.get("above_sma20"):
+            hedge -= 25; hedge_why.append("✗ ya en tendencia bajista — huele a apuesta, no a protección")
+        if chg <= -3:
+            hedge -= 15; hedge_why.append(f"✗ cayendo {chg:.1f}% hoy — flujo direccional")
+        ed = item.get("earnings_days")
+        if ed is not None and 0 <= ed <= (dte or 0):
+            hedge += 5; hedge_why.append("✓ cubre earnings — protección clásica antes del reporte")
+        hedge = max(0, min(100, hedge))
+
+    # ── Dinamita (0–10): ¿puede moverse YA? ──
+    dyn, dyn_why = 0.0, []
+    rvol = float(item.get("rel_volume") or 1)
+    if rvol >= 4:
+        dyn += 2.0; dyn_why.append(f"volumen {rvol:.1f}x para la hora")
+    elif rvol >= 2:
+        dyn += 1.2; dyn_why.append(f"volumen {rvol:.1f}x para la hora")
+    elif rvol >= 1.4:
+        dyn += 0.5; dyn_why.append(f"volumen {rvol:.1f}x")
+
+    voi = float(item.get("opt_vol_oi") or 0)
+    if voi >= 3:
+        dyn += 2.0; dyn_why.append(f"contratos nuevos: vol/OI {voi:.1f}x en vencimientos cercanos")
+    elif voi >= 1.5:
+        dyn += 1.2; dyn_why.append(f"contratos nuevos: vol/OI {voi:.1f}x")
+    dom = item.get("opt_dominant")
+    if dom in ("CALL", "PUT") and dom == side and voi >= 1:
+        dyn += 0.4; dyn_why.append(f"flujo cercano del mismo lado ({dom})")
+
+    ns, na = item.get("news_score") or 0, item.get("news_age_hours")
+    if abs(ns) >= 2 and na is not None and na <= 24:
+        dyn += 1.5; dyn_why.append(f"noticia de impacto hace {na:.0f}h")
+    ed = item.get("earnings_days")
+    if ed is not None and 0 <= ed <= 10:
+        dyn += 1.2; dyn_why.append(f"earnings en {ed:.0f} día(s)")
+    if item.get("analyst_action"):
+        dyn += 0.6; dyn_why.append("acción de analista reciente")
+
+    chg = abs(_num(str(item.get("change_pct", "0")).replace("%", "").replace("+", "")) or 0)
+    hi, lo = float(item.get("high") or 0), float(item.get("low") or 0)
+    if atr_u and hi > lo and (hi - lo) / atr_u >= 1.0 and chg >= 2:
+        dyn += 1.0; dyn_why.append("rango de hoy ≥ ATR — expansión de volatilidad")
+
+    st = item.get("entry_state")
+    dir_ok = item.get("direction") == side
+    if dir_ok and st == "EN_ZONA":
+        dyn += 1.2; dyn_why.append("estructura a favor y en zona")
+    elif dir_ok and st == "ESPERA_PULLBACK":
+        dyn += 0.6; dyn_why.append("estructura a favor, esperando retroceso")
+    elif st in ("INVALIDADO",):
+        dyn -= 1.0; dyn_why.append("estructura en contra")
+
+    if (item.get("gamma_score") or 0) >= 5 and side == "CALL":
+        dyn += 0.6; dyn_why.append("presión gamma cerca del precio")
+    if (item.get("short_pct") or 0) >= 15 and side == "CALL":
+        dyn += 0.5; dyn_why.append(f"short float {item.get('short_pct'):.0f}%")
+    desk = next((d for d in desks if d["ticker"] == alert["ticker"]), None)
+    if desk:
+        dyn += 0.6; dyn_why.append(f"mesa caliente: {desk['contracts']:,} contratos, {desk['pct']:.0f}% {desk['dir'].lower()}s")
+    if spy_regime:
+        if (spy_regime == "SOBRE" and side == "CALL") or (spy_regime == "BAJO" and side == "PUT"):
+            dyn += 0.4; dyn_why.append(f"SPY {spy_regime.lower()} el pivot — mercado a favor")
+        elif spy_regime in ("SOBRE", "BAJO"):
+            dyn -= 0.4; dyn_why.append(f"SPY {spy_regime.lower()} el pivot — mercado en contra")
+    dyn = round(max(0.0, min(10.0, dyn)), 1)
+
+    # ── Zonas de la alerta vs precio ──
+    zones = []
+    for lv in alert.get("levels") or []:
+        d_atr = (lv["price"] - spot) / atr_u if atr_u and spot else None
+        zones.append({**lv, "dist_pct": round((lv["price"] - spot) / spot * 100, 1) if spot else None,
+                      "dist_atr": round(d_atr, 2) if d_atr is not None else None,
+                      "near": d_atr is not None and abs(d_atr) <= 0.5})
+    near_zone = next((z for z in zones if z["near"]), None)
+
+    # ── Etiqueta principal ──
+    if side == "PUT" and hedge >= 60:
+        label, color, tip = "🛡️ COBERTURA", "b", "Probable protección de una posición larga — no la tomes como señal bajista"
+    elif dyn >= 6.5:
+        label, color, tip = "🧨 DINAMITA", "g", "Tiene combustible para moverse ya — revisa la entrada"
+    elif side == "PUT" and 40 <= hedge < 60:
+        label, color, tip = "❓ PUT AMBIGUO", "y", "Puede ser cobertura o apuesta — no operar sin confirmación de precio"
+    elif near_zone and dyn < 4.5:
+        label, color, tip = "📍 EN ZONA SIN CHISPA", "y", \
+            "Llegó al nivel de la alerta pero sin volumen ni catalizador — esperar reacción del precio"
+    elif zones and not near_zone and dyn < 6.5:
+        label, color, tip = "👀 VIGILAR ZONA", "y", "Esperar a que el precio llegue al nivel de la alerta"
+    elif horizon in ("LEAP", "POSICIONAL") and dyn < 5:
+        label, color, tip = ("🏦 LEAP" if horizon == "LEAP" else "🏦 POSICIONAL"), "y", \
+            "Posicionamiento de semanas/meses — úsalo como sesgo, no como entrada de día"
+    elif dyn >= 4.5:
+        label, color, tip = "🔥 CALENTANDO", "y", "Señales parciales — falta confirmación"
+    else:
+        label, color, tip = "⚪ SIN CHISPA", "r", "Sin combustible hoy"
+
+    operable = (label in ("🧨 DINAMITA",) and st == "EN_ZONA" and dir_ok) or \
+               (near_zone is not None and dyn >= 4.5 and hedge < 60)
+
+    return {
+        "alert_label": label, "alert_color": color, "alert_tip": tip,
+        "alert_horizon": horizon, "alert_dte": dte, "alert_otm_pct": otm,
+        "hedge_prob": hedge if side == "PUT" else None, "hedge_why": hedge_why,
+        "dinamita": dyn, "dinamita_why": dyn_why,
+        "alert_zones": zones, "alert_near_zone": near_zone,
+        "alert_operable": operable,
+    }
+
+
+def _alert_rank_key(x: Dict) -> Tuple:
+    order = {"🧨 DINAMITA": 0, "🔥 CALENTANDO": 1, "📍 EN ZONA SIN CHISPA": 2, "👀 VIGILAR ZONA": 2, "🏦 POSICIONAL": 3,
+             "🏦 LEAP": 4, "❓ PUT AMBIGUO": 5, "🛡️ COBERTURA": 6, "⚪ SIN CHISPA": 7}
+    return (0 if x.get("alert_operable") else 1, order.get(x.get("alert_label"), 9),
+            -(x.get("dinamita") or 0), -(x.get("alert", {}).get("premium") or 0))
+
+
+@app.route("/api/alerts", methods=["POST"])
+def api_alerts():
+    """
+    Recibe el mensaje completo del grupo (áreas de interés + mesas calientes + alertas)
+    y regresa cada alerta clasificada (LEAP / cobertura / dinamita) y rankeada.
+    """
+    t0 = time.time()
+    payload = request.get_json(force=True, silent=True) or {}
+    parsed = parse_alert_message(payload.get("raw") or "")
+    if not parsed["alerts"]:
+        return jsonify({"error": "No encontré alertas (ticker + calls/puts + monto o strike).",
+                        "parsed": parsed, "items": []}), 400
+
+    market = get_market_pulse()
+    spy = (market.get("SPY") or {}).get("price")
+    regime, regime_pct = None, None
+    if parsed["pivot_spy"] and spy:
+        regime_pct = round((spy - parsed["pivot_spy"]) / parsed["pivot_spy"] * 100, 2)
+        regime = "SOBRE" if regime_pct > 0.1 else "BAJO" if regime_pct < -0.1 else "EN"
+
+    alerts = parsed["alerts"][:20]
+    ex = ThreadPoolExecutor(max_workers=min(6, len(alerts)))
+    futs = {ex.submit(analyze_ticker, a["ticker"], market, a["raw"]): a for a in alerts}
+    done, pending = wait(futs, timeout=max(SCAN_BUDGET_S - (time.time() - t0), 5))
+    ex.shutdown(wait=False, cancel_futures=True)
+
+    items, failed = [], [futs[f]["ticker"] for f in pending]
+    for f in done:
+        a = futs[f]
+        try:
+            it = f.result()
+        except Exception as e:
+            print(f"alert {a['ticker']} error: {e}")
+            failed.append(a["ticker"]); continue
+        if "error" in it:
+            failed.append(a["ticker"]); continue
+        it.pop("_price_data", None)
+        it["alert"] = a
+        it.update(classify_alert(a, it, parsed["hot_desks"], regime))
+        items.append(it)
+
+    items.sort(key=_alert_rank_key)
+    counts: Dict[str, int] = {}
+    for it in items:
+        counts[it["alert_label"]] = counts.get(it["alert_label"], 0) + 1
+    ops = [it["ticker"] for it in items if it.get("alert_operable")]
+    summary = (f"{len(items)} alertas · " + " · ".join(f"{k} {v}" for k, v in counts.items()) +
+               (f" · Operables ahora: {', '.join(ops)}" if ops else " · Ninguna operable en este momento"))
+
+    return jsonify({
+        "source": "discord_alerts",
+        "market": market,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "pivot_spy": parsed["pivot_spy"], "spy_levels": parsed["spy_levels"], "spx_levels": parsed["spx_levels"],
+        "spy_regime": regime, "spy_vs_pivot_pct": regime_pct,
+        "hot_desks": parsed["hot_desks"],
+        "summary": summary, "counts": counts, "operables": ops,
+        "failed": failed, "segundos": round(time.time() - t0, 1),
+        "items": items,
+    })
+
+
+# ══════════════════════════════════════════════════════════════
 # WATCHLIST — solo para monitoreo personal, no afecta el scan
 # ══════════════════════════════════════════════════════════════
 
