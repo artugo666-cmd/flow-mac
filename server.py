@@ -3102,7 +3102,13 @@ def api_alerts():
             txt = ["📥 <b>ALERTAS RECIBIDAS</b> — ¿cargaron el día del flujo?", ""]
             txt += ["<b>Cargaron</b> (vigilo la entrada desde las 9:40):"] + [
                 f"✓ {c['ticker']} {c['dir']} {fmt_p(c.get('premium'))} · vol {c['carga']['rvol_dia']}x · {c['carga']['cambio_dia_pct']:+}% · {c['carga']['cumple']}/4"
+                + (f" · OI {c['carga']['contrato']['oi']:,} ✓" if (c['carga'].get('contrato') or {}).get('sigue_abierta') else "")
                 for c in si] if si else ["Ninguna cargó con fuerza."]
+            cerradas = [c for c in no if (c["carga"].get("contrato") or {}).get("sigue_abierta") is False]
+            if cerradas:
+                txt += ["", "<b>La ballena ya cerró</b> (OI menor que los contratos de la alerta): " +
+                        ", ".join(f"{c['ticker']} {c['dir']}" for c in cerradas[:15])]
+            no = [c for c in no if c not in cerradas]
             if no:
                 txt += ["", "<b>No cargaron:</b> " + ", ".join(f"{c['ticker']} {c['dir']}" for c in no[:15])]
             key = f"sent|{_today_et()}|recibidas|{hashlib.md5((payload.get('raw') or '').encode()).hexdigest()[:10]}"
@@ -4196,7 +4202,8 @@ def _fmt_apertura(x: Dict, m: Dict) -> str:
         "",
         f"Stop ${m['stop']} (mínimo de la apertura) · T1 ${t1} · T2 ${t2}",
         "⚠️ Entrada SIN confirmación de volumen: es la más arriesgada. Tamaño chico.",
-        f"Flujo del grupo · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}"])
+        f"Flujo del grupo · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}",
+        *[_h(w) for w in ((x.get("_contrato") or {}).get("por_que") or [])]])
 
 
 def _fmt_agot(x: Dict, m: Dict, dentro: bool) -> str:
@@ -4244,7 +4251,15 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
         cands = []                                   # (prioridad, señal): gana la más temprana que siga fresca
         reglas = [("mov", 4, detect_movimiento), ("gap", 3, detect_gap)]
         fd = _sesion_previa(data, list(data["days"].keys())[-1]) if data["days"] else None
-        if fd and x["day"] == fd:                    # el flujo fue la sesión anterior: aplican carga y apertura
+        oi_info = {}
+        try:
+            raw_ = get_store().kv_get(f"oi_ok|{x['day']}|{x['ticker']}|{x['dir']}")
+            oi_info = json.loads(raw_) if raw_ else {}
+        except Exception:
+            pass
+        x["_contrato"] = oi_info
+        cerrada = oi_info.get("ok") and oi_info.get("sigue_abierta") is False
+        if fd and x["day"] == fd and not cerrada:    # flujo de la sesión anterior y la ballena sigue dentro
             reglas += [("carga", 2, detect_entrada_carga), ("apertura", 1, detect_apertura)]
         for tipo, pr, fn in reglas:
             try:
@@ -4393,7 +4408,94 @@ def _fmt_entrada(x: Dict, m: Dict) -> str:
         "",
         f"Stop ${m['stop']} · T1 ${t1} · T2 ${t2}",
         f"Flujo del grupo{prem_s} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}",
+        *[_h(w) for w in ((x.get("_contrato") or {}).get("por_que") or [])],
         "Confirma en SensaMarket antes de entrar."])
+
+
+# ══════════════════════════════════════════════════════════════
+# 📑 CONTRATO DE LA ALERTA — ¿la ballena dejó la posición abierta?
+# Cadena retrasada de CBOE (gratis). El open interest se actualiza en la noche: cuando llega
+# la alerta (un día después del flujo) el OI ya refleja lo que pasó ese día.
+#   · Contratos estimados de la alerta = prima / (precio del contrato × 100)
+#   · OI ≥ 80% de esos contratos → la posición sigue abierta (la ballena se quedó)
+#   · OI menor → se cerró o fue day-trade: no hay convicción, no se dan entradas por carga/apertura
+#   · Volumen de hoy en ese strike ≥ 50% del OI → siguen entrando contratos
+#   · Foto diaria del OI para medir cuánto sube o baja de un día a otro
+# ══════════════════════════════════════════════════════════════
+_CBOE_CACHE: Dict[str, Tuple[float, Dict]] = {}
+
+
+def _cboe_json(ticker: str) -> Dict[str, Any]:
+    c = _CBOE_CACHE.get(ticker)
+    if c and time.time() - c[0] < 300:
+        return c[1]
+    r = YF._session().get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json", timeout=12)
+    r.raise_for_status()
+    d = (r.json() or {}).get("data", {}) or {}
+    _CBOE_CACHE[ticker] = (time.time(), d)
+    return d
+
+
+def contrato_alerta(ticker: str, side: str, strike: Optional[float], expiry: Optional[str],
+                    premium: Optional[float] = None, d: Optional[Dict] = None) -> Dict[str, Any]:
+    if not strike:
+        return {"ok": False, "why": "la alerta no trae strike"}
+    d = d if d is not None else _cboe_json(ticker)
+    cp = "C" if side == "CALL" else "P"
+    rows = []
+    for o in d.get("options", []) or []:
+        m = _OCC_RE.match(str(o.get("option", "")))
+        if not m or m.group(1) != ticker or m.group(3) != cp:
+            continue
+        rows.append((m.group(2), int(m.group(4)) / 1000.0, o))
+    if not rows:
+        return {"ok": False, "why": "CBOE no trae cadena para este ticker"}
+    exp6 = datetime.strptime(expiry, "%Y-%m-%d").strftime("%y%m%d") if expiry else None
+    same_exp = [r for r in rows if r[0] == exp6] if exp6 else []
+    pool = same_exp or rows
+    e, sk, o = min(pool, key=lambda r: (abs(r[1] - float(strike)), abs(int(r[0]) - int(exp6 or r[0]))))
+    oi, vol = int(o.get("open_interest") or 0), int(o.get("volume") or 0)
+    bid, ask, last = float(o.get("bid") or 0), float(o.get("ask") or 0), float(o.get("last_trade_price") or 0)
+    px = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+    est = int(premium / (px * 100)) if premium and px > 0 else None
+    exacto = bool(same_exp) and abs(sk - float(strike)) < 0.01
+    # foto diaria del OI y cambio contra la foto anterior
+    occ = f"{ticker}{e}{cp}{int(round(sk * 1000)):08d}"
+    hoy = _today_et(); cambio = None
+    try:
+        st = get_store()
+        fotos = st.kv_many(f"oi|{occ}|")
+        st.kv_set(f"oi|{occ}|{hoy}", str(oi))
+        prev = sorted((k.split("|")[-1], v) for k, v in fotos.items() if k.split("|")[-1] < hoy)
+        if prev:
+            cambio = oi - int(prev[-1][1])
+    except Exception as ex:
+        print(f"oi foto {occ}: {ex}")
+    abierta = (oi >= 0.8 * est) if est else None
+    cargando = vol >= 500 and oi > 0 and vol >= 0.5 * oi
+    why = []
+    if est:
+        why.append(f"{'✓' if abierta else '✗'} OI {oi:,} vs ~{est:,} contratos de la alerta"
+                   + (" — la posición sigue abierta" if abierta else " — probablemente se cerró o fue day-trade"))
+    else:
+        why.append(f"OI {oi:,} (sin prima para estimar los contratos de la alerta)")
+    if cambio is not None:
+        why.append(f"{'✓' if cambio > 0 else '✗' if cambio < 0 else '='} OI {cambio:+,} desde la foto anterior")
+    why.append(f"{'✓' if cargando else '·'} volumen de hoy {vol:,}" + (" — siguen entrando contratos" if cargando else ""))
+    return {"ok": True, "contrato": occ, "exacto": exacto, "strike": sk, "vence": f"20{e[:2]}-{e[2:4]}-{e[4:]}",
+            "oi": oi, "volumen_hoy": vol, "precio_contrato": round(px, 2), "contratos_alerta_est": est,
+            "sigue_abierta": abierta, "siguen_entrando": cargando, "cambio_oi": cambio, "por_que": why}
+
+
+@app.route("/api/contrato")
+def api_contrato():
+    """📑 Ej.: /api/contrato?ticker=AAPL&dir=CALL&strike=330&expiry=2027-03-17&premium=1300000"""
+    tk = (request.args.get("ticker") or "").upper().strip(); side = (request.args.get("dir") or "CALL").upper()
+    try:
+        return jsonify({"ticker": tk, "dir": side, **contrato_alerta(tk, side, _num(request.args.get("strike") or "") if request.args.get("strike") else None,
+                        request.args.get("expiry"), _num(request.args.get("premium") or "") if request.args.get("premium") else None)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 def resumen_cargas(alerts: List[Dict], dia_msg: str, budget: float = 15) -> List[Dict]:
@@ -4411,6 +4513,18 @@ def resumen_cargas(alerts: List[Dict], dia_msg: str, budget: float = 15) -> List
             # antes de abrir hoy no hay velas de hoy: el flujo es la última sesión; con el mercado abierto, la anterior
             fd = keys[-1] if dia_msg > keys[-1] else _sesion_previa(data, dia_msg)
             c = analizar_carga(data, a["dir"], fd)
+            try:
+                k_ = contrato_alerta(a["ticker"], a["dir"], a.get("strike"), a.get("expiry"), a.get("premium"))
+            except Exception as e:
+                k_ = {"ok": False, "why": str(e)}
+            c["contrato"] = k_
+            if k_.get("ok") and k_.get("sigue_abierta") is False:
+                c["cargo"] = False           # la ballena ya cerró: sin convicción no hay entrada por carga/apertura
+                c["por_que"] = c["por_que"] + ["✗ el contrato de la alerta ya no está abierto"]
+            try:
+                get_store().kv_set(f"oi_ok|{fd}|{a['ticker']}|{a['dir']}", json.dumps(k_))
+            except Exception:
+                pass
             out.append({**a, "carga": c})
         except Exception as e:
             print(f"carga {a['ticker']}: {e}")
