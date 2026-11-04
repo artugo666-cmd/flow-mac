@@ -3062,6 +3062,7 @@ def api_alerts():
     # Guardar en el almacén (seguimiento de 10 sesiones)
     saved = 0
     msg_day = _today_et()
+    flow_day = msg_day
     try:
         msg_day = min(message_date(payload.get("raw") or "") or _today_et(), _today_et())
         # El flujo del grupo es de la sesión ANTERIOR al mensaje: se guarda con esa fecha
@@ -3093,6 +3094,11 @@ def api_alerts():
         it.pop("_price_data", None)
         it["alert"] = a
         it.update(classify_alert(a, it, parsed["hot_desks"], regime))
+        if a["dir"] == "PUT" and it.get("hedge_prob") is not None:
+            try:
+                get_store().kv_set(f"hedge|{flow_day}|{a['ticker']}|PUT", str(it["hedge_prob"]))
+            except Exception:
+                pass
         if it.get("alert_operable"):
             try:
                 record_signal("app", it["ticker"], a["dir"], it.get("spot"), it.get("entry_plan") or {},
@@ -4232,14 +4238,60 @@ def _fmt_agot(x: Dict, m: Dict, dentro: bool) -> str:
         "Si la siguiente vela rompe el " + ("máximo" if sgn > 0 else "mínimo") + " con volumen, el agotamiento se cancela."])
 
 
+# ══════════════════════════════════════════════════════════════
+# GRUPO DE CONTROL — el scan como segunda fuente
+# Cada 30 min (9:45–15:00) corre el scan en segundo plano y guarda sus mejores 15 (sin alerta del grupo)
+# como "picks". El vigilante les aplica MOVIMIENTO y GAP (CARGA/APERTURA no: no hay flujo de ayer) y
+# REGISTRA sus señales con fuente "scan" SIN mandar Telegram (SCAN_TELEGRAM=1 para recibirlas).
+# Así se compara, con las mismas reglas y la misma medición: alerta del grupo vs scan sin alerta.
+# ══════════════════════════════════════════════════════════════
+SCAN_TELEGRAM = os.environ.get("SCAN_TELEGRAM", "0") == "1"
+_SCANCTL_LOCK = threading.Lock()
+
+
+def _scan_control_run(day: str, excluir: set) -> None:
+    if not _SCANCTL_LOCK.acquire(blocking=False):
+        return
+    try:
+        market = get_market_pulse()
+        cands = discover_candidates()
+        pool = [c["ticker"] for c in cands if c["ticker"] not in excluir][:45]
+        items, _ = run_batch(pool, market, 45, SCAN_WORKERS, light=True)
+        items.sort(key=lambda x: x.get("score", 0), reverse=True)
+        st = get_store(); now = datetime.now(NY_TZ).isoformat(timespec="minutes")
+        for it in items[:15]:
+            side = it.get("direction") if it.get("direction") in ("CALL", "PUT") else "CALL"
+            k = f"scanpick|{day}|{it['ticker']}|{side}"
+            if not st.kv_get(k):
+                st.kv_set(k, json.dumps({"ticker": it["ticker"], "dir": side, "day": day, "source": "scan",
+                                         "score": it.get("score"), "ts": now, "life": "🌱 CARGADA"}))
+        st.kv_set("scanctl_last", str(time.time()))
+    except Exception as e:
+        print(f"scan control error: {e}")
+    finally:
+        _SCANCTL_LOCK.release()
+
+
+def scan_picks(day: str, maximo: int = 25) -> List[Dict]:
+    picks = []
+    for v in get_store().kv_many(f"scanpick|{day}|").values():
+        try:
+            picks.append(json.loads(v))
+        except Exception:
+            pass
+    picks.sort(key=lambda p: p.get("ts", ""), reverse=True)
+    return picks[:maximo]
+
+
 def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]]:
     """Revisa en paralelo todas las alertas vivas (no muertas) y regresa las que disparan AHORA."""
     seen, pares = set(), []
-    for x in sorted(items, key=lambda x: x["day"], reverse=True):
+    # primero las alertas del grupo (la más reciente por ticker/lado), luego los picks del scan
+    for x in sorted(items, key=lambda x: (0 if x.get("source") != "scan" else 1, -int(x["day"].replace("-", "")))):
         if x["life"] == "❌ MUERTA" or (x["ticker"], x["dir"]) in seen:
             continue
         seen.add((x["ticker"], x["dir"])); pares.append(x)
-    pares = pares[:70]
+    pares = pares[:90]
     out: List[Tuple[Dict, Dict]] = []
     agot: List[Tuple[Dict, Dict]] = []
     scan_movimientos.agotamientos = agot
@@ -4272,7 +4324,17 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
             pass
         x["_contrato"] = oi_info
         cerrada = oi_info.get("ok") and oi_info.get("sigue_abierta") is False
-        if fd and x["day"] == fd and not cerrada:    # flujo de la sesión anterior y la ballena sigue dentro
+        # Cobertura: un put que probablemente es protección no da entrada por la alerta
+        cobertura = False
+        if x["dir"] == "PUT":
+            try:
+                cobertura = float(get_store().kv_get(f"hedge|{x['day']}|{x['ticker']}|PUT") or 0) >= 60
+            except Exception:
+                pass
+        # Conflicto: el grupo alertó el lado contrario desde el día del flujo
+        conflicto = bool(fd) and any(c[:5] >= (fd or "")[5:] for c in (x.get("conflict") or []))
+        x["_bloqueo"] = "cobertura" if cobertura else "conflicto" if conflicto else ("ballena cerró" if cerrada else "")
+        if fd and x["day"] == fd and not (cerrada or cobertura or conflicto):    # flujo de ayer, ballena dentro, sin cobertura ni conflicto
             reglas += [("carga", 2, detect_entrada_carga), ("apertura", 1, detect_apertura)]
         for tipo, pr, fn in reglas:
             try:
@@ -4716,16 +4778,34 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                 continue
             # Telegram ya no avisa MADURANDO/CARGADA: solo el 🚀 MOVIMIENTO (abajo), vela por vela.
         movs, agots = [], []
+        # Grupo de control: scan en segundo plano cada 30 min (no bloquea la ronda)
+        try:
+            last_sc = float(st.kv_get("scanctl_last") or 0)
+            if 9 * 60 + 45 <= mins <= 15 * 60 and time.time() - last_sc >= 1800:
+                st.kv_set("scanctl_last", str(time.time()))
+                threading.Thread(target=_scan_control_run, args=(day, {x["ticker"] for x in d["items"]}), daemon=True).start()
+        except Exception as e:
+            errors.append(f"scan control: {e}")
         if mins >= 9 * 60 + 35:          # la regla de APERTURA puede disparar al cierre de la vela de 9:30
             try:
-                movs = scan_movimientos(d["items"], max(6.0, SCAN_BUDGET_S * 0.6))
+                movs = scan_movimientos(d["items"] + scan_picks(day), max(6.0, SCAN_BUDGET_S * 0.6))
                 agots = list(getattr(scan_movimientos, "agotamientos", []))
             except Exception as e:
                 errors.append(f"movimiento: {e}")
         for x, m in movs:
+            tipo = m.get("_tipo") or "mov"; es_gap = tipo == "gap"
+            if x.get("source") == "scan" and not SCAN_TELEGRAM:
+                # grupo de control: se registra para medir, no se manda
+                sgn = 1 if x["dir"] == "CALL" else -1; risk = abs(m["precio"] - m["stop"])
+                try:
+                    record_signal("scan", x["ticker"], x["dir"], m["precio"],
+                                  {"entry_state": tipo.upper(), "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
+                                   "entry_t2": round(m["precio"] + sgn * 2 * risk, 2)}, None, "control " + tipo + " " + m["vela"], x["day"])
+                except Exception as e:
+                    print(f"record_signal scan: {e}")
+                continue
             if len(sent) >= cap:
                 break
-            tipo = m.get("_tipo") or "mov"; es_gap = tipo == "gap"
             fmt = {"gap": _fmt_gap, "carga": _fmt_entrada, "apertura": _fmt_apertura}.get(tipo, _fmt_mov)
             # un solo aviso de entrada por ticker y lado al día, sea cual sea la regla
             if any(st.kv_get(f"sent|{day}|{x['ticker']}|{x['dir']}|{t}") for t in ("mov", "gap", "carga", "apertura")):
@@ -4905,6 +4985,62 @@ def _eval_signal(sg: Dict, bars: List[Dict], last_price: Optional[float]) -> Dic
             "exit_day": exit_day, "r": r_mult}
 
 
+INTRADIA = ("APERTURA", "CARGA", "GAP", "MOV", "MOVIMIENTO")
+
+
+def _eval_intradia(sg: Dict, data: Dict[str, Any]) -> Optional[Dict]:
+    """Mide una señal intradía con velas de 5 min DESDE LA HORA DEL AVISO (la sesión del aviso sí cuenta).
+    Manejo simulado: mitad en T1 y el resto con stop en la entrada; lo que quede se cierra a las 16:00.
+    Reporta máximo a favor/en contra en R y el R a 30, 60 y 120 min y al cierre."""
+    bars = (data.get("days") or {}).get(sg["day"]) or []
+    hm0 = (sg.get("ts") or "T09:30")[11:16]
+    after = [b for b in bars if b.get("hm", "") >= hm0]
+    if not after:
+        return None
+    sgn = 1 if sg["dir"] == "CALL" else -1
+    entry, stop0, t1, t2 = sg["price"], sg.get("stop"), sg.get("t1"), sg.get("t2")
+    risk = abs(entry - stop0) if stop0 else None
+    if not risk:
+        return None
+    R = lambda px: round(sgn * (px - entry) / risk, 2)
+    stop, t1_hit, status, exit_px, exit_hm = stop0, False, "⏱️ cierre", None, None
+    for b in after:
+        fav, adv = (b["h"], b["l"]) if sgn > 0 else (b["l"], b["h"])
+        hit_stop = sgn * (adv - stop) <= 0
+        if hit_stop and not t1_hit:
+            status, exit_px, exit_hm = "❌ stop", stop, b["hm"]; break
+        if t2 and sgn * (fav - t2) >= 0:
+            t1_hit = True; status, exit_px, exit_hm = "🏆 T2", t2, b["hm"]; break
+        if t1 and not t1_hit and sgn * (fav - t1) >= 0:
+            t1_hit, status, stop = True, "✅ T1", entry
+            continue
+        if t1_hit and hit_stop:
+            exit_px, exit_hm = entry, b["hm"]; break
+    cierre = after[-1]["c"]
+    termino = len(bars) >= 78 or sg["day"] < _today_et()
+    if exit_px is None and termino:
+        exit_px, exit_hm = cierre, after[-1]["hm"]
+    if exit_px is not None:
+        r_exit = R(exit_px)
+        r_mult = round((R(t1) + r_exit) / 2, 2) if (t1_hit and t1) else r_exit
+    else:
+        r_mult = R(cierre)
+    hi = max(b["h"] for b in after); lo = min(b["l"] for b in after)
+    mfe = R(hi if sgn > 0 else lo); mae = R(lo if sgn > 0 else hi)
+
+    def r_en(mins: int) -> Optional[float]:
+        t = (datetime.strptime(hm0, "%H:%M") + timedelta(minutes=mins)).strftime("%H:%M")
+        bb = [b for b in after if b["hm"] <= t]
+        return R(bb[-1]["c"]) if bb and (bb[-1]["hm"] >= (datetime.strptime(t, "%H:%M") - timedelta(minutes=5)).strftime("%H:%M")) else None
+    return {**sg, "regla": sg.get("state"), "hora": hm0, "status": status, "closed": exit_px is not None,
+            "exit": round(exit_px, 2) if exit_px is not None else None, "salida": exit_hm, "r": r_mult,
+            "max_a_favor_r": mfe, "max_en_contra_r": mae, "r_30m": r_en(30), "r_60m": r_en(60), "r_120m": r_en(120),
+            "r_cierre": R(cierre), "now": round(cierre, 2), "move_pct": round(sgn * (cierre - entry) / entry * 100, 1),
+            "mfe_pct": round((hi - entry) / entry * 100 * sgn if sgn > 0 else (entry - lo) / entry * 100, 1),
+            "mae_pct": round((entry - lo) / entry * 100 if sgn > 0 else (hi - entry) / entry * 100, 1),
+            "sessions": 0, "exit_day": 0, "intradia": True}
+
+
 def signals_report() -> Dict[str, Any]:
     st = get_store()
     sigs = []
@@ -4928,8 +5064,31 @@ def signals_report() -> Dict[str, Any]:
                     bars[futs[f]] = f.result()
                 except Exception as e:
                     print(f"signals bars {futs[f]}: {e}")
+    # Señales intradía: velas de 5 min desde la hora del aviso. Las de días ya cerrados se guardan
+    # (Yahoo solo da 10 días de velas de 5 min).
+    intr = [s for s in sigs if s.get("state") in INTRADIA]
+    m5: Dict[str, Dict] = {}
+    need = sorted({s["ticker"] for s in intr if not st.kv_get(f"evi|{s['day']}|{s['ticker']}|{s['dir']}")})
+    if need:
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futs = {ex.submit(_m5_days, tk): tk for tk in need}
+            done, _ = wait(futs, timeout=SCAN_BUDGET_S)
+            for f in done:
+                try:
+                    m5[futs[f]] = f.result()
+                except Exception as e:
+                    print(f"signals m5 {futs[f]}: {e}")
     rows = []
     for s in sigs:
+        if s.get("state") in INTRADIA:
+            kk = f"evi|{s['day']}|{s['ticker']}|{s['dir']}"
+            cached = st.kv_get(kk)
+            ev = json.loads(cached) if cached else (_eval_intradia(s, m5[s["ticker"]]) if s["ticker"] in m5 else None)
+            if ev and not cached and s["day"] < _today_et() and ev.get("closed"):
+                st.kv_set(kk, json.dumps(ev))
+            if ev:
+                rows.append(ev)
+            continue
         b = bars.get(s["ticker"]) or []
         rows.append(_eval_signal(s, b, b[-1]["c"] if b else None))
 
@@ -4941,10 +5100,16 @@ def signals_report() -> Dict[str, Any]:
                 "stops": sum(1 for r in closed if r["status"] == "❌ stop"),
                 "acierto_pct": round(sum(1 for x in rr if x > 0) / len(rr) * 100) if rr else None,
                 "r_prom": round(sum(rr) / len(rr), 2) if rr else None,
-                "r_total": round(sum(rr), 2) if rr else None}
+                "r_total": round(sum(rr), 2) if rr else None,
+                "max_a_favor_r_prom": (lambda xs: round(sum(xs) / len(xs), 2) if xs else None)([r["max_a_favor_r"] for r in rs if r.get("max_a_favor_r") is not None]),
+                "max_en_contra_r_prom": (lambda xs: round(sum(xs) / len(xs), 2) if xs else None)([r["max_en_contra_r"] for r in rs if r.get("max_en_contra_r") is not None]),
+                "r_60m_prom": (lambda xs: round(sum(xs) / len(xs), 2) if xs else None)([r["r_60m"] for r in rs if r.get("r_60m") is not None])}
     return {"generado": datetime.now().isoformat(timespec="seconds"),
             "todas": stats(rows),
             "en_zona": stats([r for r in rows if r.get("state") == "EN_ZONA"]),
+            "por_regla": {rg: stats([r for r in rows if r.get("state") == rg]) for rg in ("APERTURA", "CARGA", "GAP", "MOV")
+                          if any(r.get("state") == rg for r in rows)},
+            "por_fuente": {fu: stats([r for r in rows if r.get("source") == fu]) for fu in sorted({r.get("source") or "?" for r in rows})},
             "otras": stats([r for r in rows if r.get("state") != "EN_ZONA"]),
             "filas": list(reversed(rows))}
 
@@ -4966,11 +5131,14 @@ def page_senales():
     def cell(v, suf=""): return "—" if v is None else f"{v}{suf}"
     def srow(name, s):
         return (f"<tr><td>{name}</td><td>{s['n']}</td><td>{s['cerradas']}</td><td>{s['t1_o_mas']}</td>"
-                f"<td>{s['stops']}</td><td>{cell(s['acierto_pct'],'%')}</td><td>{cell(s['r_prom'])}</td><td>{cell(s['r_total'])}</td></tr>")
+                f"<td>{s['stops']}</td><td>{cell(s['acierto_pct'],'%')}</td><td>{cell(s['r_prom'])}</td><td>{cell(s['r_total'])}</td>"
+                f"<td>{cell(s.get('max_a_favor_r_prom'))}</td><td>{cell(s.get('max_en_contra_r_prom'))}</td><td>{cell(s.get('r_60m_prom'))}</td></tr>")
+    nom_regla = {"APERTURA": "🔔 Apertura", "CARGA": "✅ Carga", "GAP": "🚀 Gap", "MOV": "🚀 Movimiento"}
+    nom_fuente = {"telegram": "Alertas del grupo (Telegram)", "scan": "Control: scan sin alerta", "app": "Al pegar (pantalla)"}
     det = "".join(
         f"<tr><td>{r['day'][5:]} {r['ts'][11:16]}</td><td><b>{r['ticker']}</b></td><td class='{r['dir'].lower()}'>{r['dir']}</td>"
         f"<td>${r['price']}</td><td>${cell(r.get('stop'))}</td><td>${cell(r.get('t1'))}</td><td>${r['now']}</td>"
-        f"<td>{r['move_pct']:+}%</td><td>{r['status']}</td><td>{cell(r['r'])}</td><td>{cell(r.get('state'))}</td></tr>"
+        f"<td>{r['move_pct']:+}%</td><td>{r['status']}</td><td>{cell(r['r'])}</td><td>{cell(r.get('state'))}{' · control' if r.get('source') == 'scan' else ''}</td></tr>"
         for r in d["filas"])
     html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Señales FlowScan</title><style>
@@ -4982,9 +5150,13 @@ th:first-child,td:first-child{{text-align:left}} th{{color:#6b748f;font-weight:6
 .call{{color:#0dff8c}} .put{{color:#ff3d5a}} a{{color:#4d9fff}}
 </style></head><body>
 <h1>Señales de entrada — registro</h1>
-<p>Cada aviso de entrada se guarda con su precio y se sigue 10 sesiones: stop, T1 (mitad + stop a la entrada), T2 o salida por tiempo. R = ganancia en múltiplos del riesgo. · {d['generado']} · <a href="/">← FlowScan</a></p>
-<div class="t"><table><tr><th>Grupo</th><th>Señales</th><th>Cerradas</th><th>T1/T2</th><th>Stops</th><th>Acierto</th><th>R prom.</th><th>R total</th></tr>
-{srow('Todas', d['todas'])}{srow('Avisadas EN ZONA', d['en_zona'])}{srow('Otras (zona de alerta / combustible)', d['otras'])}</table></div>
+<p>Las señales intradía (apertura, carga, gap, movimiento) se miden con velas de 5 min desde la hora del aviso: stop, T1 (mitad + stop a la entrada), T2 o cierre a las 16:00. Las demás se siguen 10 sesiones con velas diarias. R = ganancia en múltiplos del riesgo. · {d['generado']} · <a href="/">← FlowScan</a></p>
+<div class="t"><table><tr><th>Grupo</th><th>Señales</th><th>Cerradas</th><th>T1/T2</th><th>Stops</th><th>Acierto</th><th>R prom.</th><th>R total</th><th>Máx. a favor (R)</th><th>Máx. en contra (R)</th><th>R a 60 min</th></tr>
+{srow('Todas', d['todas'])}
+<tr><th colspan=11 style="text-align:left;padding-top:12px">Por regla</th></tr>
+{"".join(srow(nom_regla.get(k, k), v) for k, v in (d.get('por_regla') or {}).items())}
+<tr><th colspan=11 style="text-align:left;padding-top:12px">Por fuente — ¿la alerta del grupo agrega algo?</th></tr>
+{"".join(srow(nom_fuente.get(k, k), v) for k, v in (d.get('por_fuente') or {}).items())}</table></div>
 <div class="t"><table><tr><th>Fecha</th><th>Tk</th><th>Lado</th><th>Entrada</th><th>Stop</th><th>T1</th><th>Ahora</th><th>Mov.</th><th>Estado</th><th>R</th><th>Aviso</th></tr>{det or '<tr><td colspan=11>Todavía no hay señales. Se registran solas desde el próximo aviso.</td></tr>'}</table></div>
 </body></html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
