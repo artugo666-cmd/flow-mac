@@ -4199,42 +4199,39 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
     futs = {ex.submit(_m5_days, x["ticker"]): x for x in pares}
     done, _ = wait(futs, timeout=budget)
     now_t = time.time()
+    def fresco(vela: str) -> bool:
+        # solo si disparó hace ≤15 min: si ya pasó más, se perdió y no se avisa tarde
+        hm = datetime.now(NY_TZ).strftime("%H:%M")
+        return (datetime.strptime(hm, "%H:%M") - datetime.strptime(vela, "%H:%M")).total_seconds() <= 15 * 60
+
     for f in done:
         x = futs[f]
         try:
-            m = detect_movimiento(f.result(), x["dir"])
-        except Exception as e:
-            print(f"movimiento {x['ticker']}: {e}")
-            continue
-        try:
-            g = detect_gap(f.result(), x["dir"])
-        except Exception as e:
-            g = {}; print(f"gap {x['ticker']}: {e}")
-        if g.get("ok"):
-            m = {**g, "_tipo": "gap"}
-        try:
             data = f.result()
-            fd = _sesion_previa(data, list(data["days"].keys())[-1]) if data["days"] else None
-            if fd and x["day"] == fd:
-                e_ = detect_entrada_carga(data, x["dir"])
-                if e_.get("ok"):
-                    m = {**e_, "_tipo": "carga"}     # la entrada por carga va antes que movimiento y gap
-                ap = detect_apertura(data, x["dir"])
-                if ap.get("ok"):
-                    m = {**ap, "_tipo": "apertura"}  # y la de apertura antes que todas: es la más temprana
-            ag = detect_agotamiento(data, x["dir"])
-            if ag.get("ok"):
-                hm_ = datetime.now(NY_TZ).strftime("%H:%M")
-                if (datetime.strptime(hm_, "%H:%M") - datetime.strptime(ag["vela"], "%H:%M")).total_seconds() <= 15 * 60:
-                    agot.append((x, ag))
         except Exception as e:
-            print(f"carga {x['ticker']}: {e}")
-        if m.get("ok"):
-            # solo si disparó en las últimas 2 velas (≤10 min): si ya pasó más, se perdió y no se avisa tarde
-            hm = datetime.now(NY_TZ).strftime("%H:%M")
-            t_fire = datetime.strptime(m["vela"], "%H:%M"); t_now = datetime.strptime(hm, "%H:%M")
-            if (t_now - t_fire).total_seconds() <= 15 * 60:
-                out.append((x, m))
+            print(f"velas {x['ticker']}: {e}")
+            continue
+        cands = []                                   # (prioridad, señal): gana la más temprana que siga fresca
+        reglas = [("mov", 4, detect_movimiento), ("gap", 3, detect_gap)]
+        fd = _sesion_previa(data, list(data["days"].keys())[-1]) if data["days"] else None
+        if fd and x["day"] == fd:                    # el flujo fue la sesión anterior: aplican carga y apertura
+            reglas += [("carga", 2, detect_entrada_carga), ("apertura", 1, detect_apertura)]
+        for tipo, pr, fn in reglas:
+            try:
+                r = fn(data, x["dir"])
+            except Exception as e:
+                print(f"{tipo} {x['ticker']}: {e}")
+                continue
+            if r.get("ok") and fresco(r["vela"]):
+                cands.append((pr, {**r, "_tipo": tipo}))
+        if cands:
+            out.append((x, min(cands, key=lambda c: c[0])[1]))
+        try:
+            ag = detect_agotamiento(data, x["dir"])
+            if ag.get("ok") and fresco(ag["vela"]):
+                agot.append((x, ag))
+        except Exception as e:
+            print(f"agotamiento {x['ticker']}: {e}")
     ex.shutdown(wait=False, cancel_futures=True)
     return out
 
