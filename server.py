@@ -3786,6 +3786,190 @@ def api_telegram_test():
 
 
 # ══════════════════════════════════════════════════════════════
+# 🚀 MOVIMIENTO — detector vela por vela (5 minutos)
+# Una sola señal, sin estados intermedios. Se dispara cuando, en las últimas
+# 3 velas cerradas de 5 min, se cumplen TODAS:
+#   1) Escalones: 3 cierres seguidos a favor y mínimos (o máximos, en puts) escalonados
+#   2) Delta: el precio avanzó ≥ MOV_DELTA_ATR del ATR diario en esas 3 velas y está del lado bueno del VWAP
+#   3) Volumen creciendo: cada vela con ≥90% del volumen de la anterior, la última mayor que la primera,
+#      y las 3 juntas ≥ MOV_VOL_X veces lo que el ticker suele operar a esa misma hora
+#   4) Operación grande: al menos una de las 3 velas con ≥ MOV_BIG_X veces su volumen normal a esa hora
+#      y ≥ $1M operado (proxy de bloque: los datos gratuitos no traen el tamaño de cada transacción)
+#   5) No se ha ido: lleva ≤ MOV_MAX_ATR ATR desde el cierre anterior (incluye el gap)
+# ══════════════════════════════════════════════════════════════
+MOV_DELTA_ATR = float(os.environ.get("MOV_DELTA_ATR", "0.30"))
+MOV_VOL_X     = float(os.environ.get("MOV_VOL_X", "1.5"))
+MOV_BIG_X     = float(os.environ.get("MOV_BIG_X", "2.5"))
+MOV_MAX_ATR   = float(os.environ.get("MOV_MAX_ATR", "1.5"))
+_M5_CACHE: Dict[str, Tuple[float, Dict]] = {}
+_M5_DAILY: Dict[str, Tuple[float, List[Dict]]] = {}
+
+
+def _m5_days(ticker: str) -> Dict[str, Any]:
+    """Velas de 5 min de 10 sesiones agrupadas por día (hora de Nueva York) + ATR diario."""
+    c = _M5_CACHE.get(ticker)
+    if c and time.time() - c[0] < 60:
+        return c[1]
+    sym = _YF_SYMBOL.get(ticker, ticker)
+    r = yget(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", {"interval": "5m", "range": "10d"}, timeout=8)
+    r.raise_for_status()
+    res = (r.json().get("chart", {}).get("result") or [{}])[0]
+    off = int((res.get("meta") or {}).get("gmtoffset") or -18000)
+    days: "OrderedDict[str, List[Dict]]" = OrderedDict()
+    for b in _parse_bars(res):
+        loc = datetime.utcfromtimestamp(b["t"] + off)
+        mins = loc.hour * 60 + loc.minute
+        if 9 * 60 + 30 <= mins < 16 * 60:
+            b["hm"] = loc.strftime("%H:%M")
+            days.setdefault(loc.strftime("%Y-%m-%d"), []).append(b)
+    dc = _M5_DAILY.get(ticker)   # el diario solo se usa para ATR y cierre previo: basta bajarlo cada 6 h
+    if dc and time.time() - dc[0] < 6 * 3600:
+        daily = dc[1]
+    else:
+        daily = _daily_bars(ticker, "3mo"); _M5_DAILY[ticker] = (time.time(), daily)
+    out = {"days": days, "daily": daily}
+    _M5_CACHE[ticker] = (time.time(), out)
+    return out
+
+
+def detect_movimiento(data: Dict[str, Any], side: str, day: Optional[str] = None, live: bool = True) -> Dict[str, Any]:
+    """Recorre las velas del día y regresa la PRIMERA vela donde se cumplen las 5 condiciones.
+    Con day=None usa la última sesión. live=True ignora la vela que todavía se está formando."""
+    days = data["days"]
+    if not days:
+        return {"ok": False, "why": "sin velas de 5 min"}
+    day = day or list(days.keys())[-1]
+    bars = list(days.get(day) or [])
+    if live and bars and bars[-1]["t"] + 300 > time.time():
+        bars = bars[:-1]
+    prev_days = [v for k, v in days.items() if k < day and len(v) >= 70][-9:]
+    daily = [b for b in data["daily"] if b["d"] < day]
+    if len(daily) < 15 or len(bars) < 4:
+        return {"ok": False, "why": "pocas velas todavía", "velas": len(bars)}
+    trs = [max(daily[i]["h"] - daily[i]["l"], abs(daily[i]["h"] - daily[i - 1]["c"]), abs(daily[i]["l"] - daily[i - 1]["c"]))
+           for i in range(len(daily) - 14, len(daily))]
+    atr = sum(trs) / len(trs)
+    prev_close = daily[-1]["c"]
+    sgn = 1 if side == "CALL" else -1
+
+    def typ(i: int) -> float:
+        xs = sorted(d[i]["v"] for d in prev_days if i < len(d))
+        if xs:
+            return max(1.0, xs[len(xs) // 2])
+        earlier = [b["v"] for b in bars[:i]] or [bars[i]["v"]]
+        return max(1.0, sum(earlier) / len(earlier))
+
+    pv = vv = 0.0
+    vwaps = []
+    for b in bars:
+        pv += (b["h"] + b["l"] + b["c"]) / 3 * b["v"]; vv += b["v"]
+        vwaps.append(pv / vv if vv else b["c"])
+
+    best = None
+    for k in range(3, len(bars)):
+        b0, b1, b2, b3 = bars[k - 3], bars[k - 2], bars[k - 1], bars[k]
+        seq = (b1, b2, b3)
+        esc = all(sgn * (y["c"] - x["c"]) > 0 for x, y in ((b0, b1), (b1, b2), (b2, b3))) and \
+              (all(y["l"] > x["l"] for x, y in ((b1, b2), (b2, b3))) if sgn > 0 else all(y["h"] < x["h"] for x, y in ((b1, b2), (b2, b3))))
+        delta = sgn * (b3["c"] - b0["c"])
+        d_atr = delta / atr if atr else 0
+        lado_vwap = sgn * (b3["c"] - vwaps[k]) > 0
+        vols = [x["v"] for x in seq]
+        typs = [typ(k - 2), typ(k - 1), typ(k)]
+        creciente = vols[1] >= 0.9 * vols[0] and vols[2] >= 0.9 * vols[1] and vols[2] > vols[0]
+        vol_x = sum(vols) / sum(typs)
+        grande = max(range(3), key=lambda j: vols[j] / typs[j])
+        big_x = vols[grande] / typs[grande]
+        big_usd = vols[grande] * seq[grande]["c"]
+        ext = sgn * (b3["c"] - prev_close) / atr if atr else 0
+        conds = {
+            "escalones": esc,
+            "delta": d_atr >= MOV_DELTA_ATR and lado_vwap,
+            "volumen_creciendo": creciente and vol_x >= MOV_VOL_X,
+            "operacion_grande": big_x >= MOV_BIG_X and big_usd >= 1_000_000,
+            "no_se_ha_ido": ext <= MOV_MAX_ATR,
+        }
+        det = {"vela": b3["hm"], "precio": round(b3["c"], 2), "delta_pct": round(delta / b0["c"] * 100, 2),
+               "delta_atr": round(d_atr, 2), "vwap": round(vwaps[k], 2), "vol_x": round(vol_x, 1),
+               "vela_grande": f"la vela de las {seq[grande]['hm']} operó {big_x:.1f}x su volumen normal (${big_usd / 1e6:.1f}M)",
+               "desde_cierre_atr": round(ext, 2), "cumple": sum(conds.values()), "condiciones": conds,
+               "velas": [{"hora": x["hm"], "cierre": round(x["c"], 2), "vol": x["v"], "normal": int(t)} for x, t in zip(seq, typs)],
+               "inicio": round(b0["c"], 2), "stop": round(b1["l"] if sgn > 0 else b1["h"], 2), "atr": round(atr, 2)}
+        if all(conds.values()):
+            return {"ok": True, "dia": day, **det}
+        if best is None or det["cumple"] > best["cumple"]:
+            best = det
+    return {"ok": False, "dia": day, "mas_cerca": best}
+
+
+def _fmt_mov(x: Dict, m: Dict) -> str:
+    sgn = 1 if x["dir"] == "CALL" else -1
+    risk = abs(m["precio"] - m["stop"])
+    t1, t2 = round(m["precio"] + sgn * risk, 2), round(m["precio"] + sgn * 2 * risk, 2)
+    v = m["velas"]
+    L = [f"🚀 <b>MOVIMIENTO  {x['ticker']} {x['dir']}</b>",
+         f"Precio <b>${m['precio']}</b> · {m['delta_pct']:+}% en 15 min ({m['delta_atr']} ATR) · vela de las {m['vela']}",
+         "",
+         "✓ 3 escalones: " + " → ".join(f"{b['hora']} ${b['cierre']}" for b in v),
+         "✓ Volumen creciendo: " + " → ".join(f"{b['vol']:,}" for b in v) + f" ({m['vol_x']}x lo normal a esta hora)",
+         f"✓ Operación grande: {m['vela_grande']}",
+         f"✓ {'Sobre' if sgn > 0 else 'Bajo'} VWAP ${m['vwap']} · lleva {m['desde_cierre_atr']} ATR desde el cierre anterior (no se ha ido)",
+         "",
+         f"Stop ${m['stop']} (vela donde arrancó) · T1 ${t1} · T2 ${t2}",
+         f"Alerta del grupo del {x['day'][8:]}/{x['day'][5:7]} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}",
+         "Confirma en SensaMarket antes de entrar."]
+    return "\n".join(L)
+
+
+def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]]:
+    """Revisa en paralelo todas las alertas vivas (no muertas) y regresa las que disparan AHORA."""
+    seen, pares = set(), []
+    for x in sorted(items, key=lambda x: x["day"], reverse=True):
+        if x["life"] == "❌ MUERTA" or (x["ticker"], x["dir"]) in seen:
+            continue
+        seen.add((x["ticker"], x["dir"])); pares.append(x)
+    pares = pares[:70]
+    out = []
+    if not pares or budget <= 2:
+        return out
+    ex = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+    futs = {ex.submit(_m5_days, x["ticker"]): x for x in pares}
+    done, _ = wait(futs, timeout=budget)
+    now_t = time.time()
+    for f in done:
+        x = futs[f]
+        try:
+            m = detect_movimiento(f.result(), x["dir"])
+        except Exception as e:
+            print(f"movimiento {x['ticker']}: {e}")
+            continue
+        if m.get("ok"):
+            # solo si disparó en las últimas 2 velas (≤10 min): si ya pasó más, se perdió y no se avisa tarde
+            hm = datetime.now(NY_TZ).strftime("%H:%M")
+            t_fire = datetime.strptime(m["vela"], "%H:%M"); t_now = datetime.strptime(hm, "%H:%M")
+            if (t_now - t_fire).total_seconds() <= 15 * 60:
+                out.append((x, m))
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+@app.route("/api/movimiento")
+def api_movimiento():
+    """Revisa un ticker con la regla de 🚀 MOVIMIENTO. Ej.: /api/movimiento?ticker=AAPL&dir=CALL&dia=2026-11-04
+    Repite el día vela por vela y dice a qué hora habría disparado (o qué condición faltó)."""
+    tk = (request.args.get("ticker") or "").upper().strip()
+    side = (request.args.get("dir") or "CALL").upper()
+    if not tk:
+        return jsonify({"error": "falta ticker"}), 400
+    try:
+        data = _m5_days(tk)
+        return jsonify({"ticker": tk, "dir": side, **detect_movimiento(data, side, request.args.get("dia"), live=not request.args.get("dia")),
+                        "reglas": {"delta_atr": MOV_DELTA_ATR, "vol_x": MOV_VOL_X, "vela_grande_x": MOV_BIG_X, "max_atr_desde_cierre": MOV_MAX_ATR}})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════════════════════
 # VIGILANTE
 # Un servicio externo gratuito (cron-job.org) llama /api/monitor/tick cada
 # 5 minutos en horario de mercado: eso mantiene despierto a Render y en cada
@@ -3884,19 +4068,24 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                 continue
             if len(sent) >= cap:
                 continue
-            if now_life == "🧨 MADURANDO":
-                # un aviso por ticker+lado al día, aunque el grupo lo haya alertado varios días
-                if send(f"sent|{day}|{x['ticker']}|{x['dir']}|mad", _fmt_alert(x, "🧨 MADURANDO")):
-                    try:
-                        record_signal("telegram", x["ticker"], x["dir"], x.get("spot"), x.get("entry_plan") or {},
-                                      x.get("dinamita"), x.get("life_why", ""), x["day"])
-                    except Exception as e:
-                        print(f"record_signal error: {e}")
-            elif before == "🧨 MADURANDO" and now_life == "❌ MUERTA":
-                send(f"sent|{day}|{x['ticker']}|{x['dir']}|dead", _fmt_alert(x, "❌ SE INVALIDÓ — si entraste, respeta tu stop:"))
-            elif before == "🧨 MADURANDO" and now_life == "🚂 YA CORRIÓ":
-                send(f"sent|{day}|{x['ticker']}|{x['dir']}|ran", _fmt_alert(x, "🚂 YA CORRIÓ — si entraste, toma parcial o sube el stop:"))
-
+            # Telegram ya no avisa MADURANDO/CARGADA: solo el 🚀 MOVIMIENTO (abajo), vela por vela.
+        movs = []
+        if live:
+            try:
+                movs = scan_movimientos(d["items"], max(6.0, SCAN_BUDGET_S * 0.6))
+            except Exception as e:
+                errors.append(f"movimiento: {e}")
+        for x, m in movs:
+            if len(sent) >= cap:
+                break
+            if send(f"sent|{day}|{x['ticker']}|{x['dir']}|mov", _fmt_mov(x, m)):
+                sgn = 1 if x["dir"] == "CALL" else -1; risk = abs(m["precio"] - m["stop"])
+                try:
+                    record_signal("telegram", x["ticker"], x["dir"], m["precio"],
+                                  {"entry_state": "MOVIMIENTO", "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
+                                   "entry_t2": round(m["precio"] + sgn * 2 * risk, 2)}, None, "🚀 MOVIMIENTO " + m["vela"], x["day"])
+                except Exception as e:
+                    print(f"record_signal error: {e}")
         c = d.get("counts", {})
         resumen = " · ".join(f"{k} {v}" for k, v in c.items())
         mad = [x for x in d["items"] if x["life"] == "🧨 MADURANDO"][:8]
@@ -3907,14 +4096,13 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
         car = car[:8]
         if mins >= 9 * 60 + 45:
             send(f"sent|{day}|open", "🌅 <b>Apertura</b> — alertas de 10 sesiones\n" + resumen +
-                 ("\n\n🧨 Madurando: " + ", ".join(f"{x['ticker']} {x['dir']}" for x in mad) if mad else "") +
-                 ("\n🔁 Cargadas repetidas: " + ", ".join(f"{x['ticker']} {x['dir']} ×{x['repeats']}" for x in car) if car else "") +
+                 "\n\nVigilando vela por vela. Solo te llega aviso cuando hay 🚀 MOVIMIENTO: 3 escalones, volumen creciendo, operación grande y sin haberse ido." +
                  f"\n\n{APP_URL}/alertas")
         if mins >= 16 * 60 + 5:
             n_sig = len(st.kv_many(f"sig|{day}|"))
             send(f"sent|{day}|close", "🌙 <b>Cierre</b>\n" + resumen +
                  f"\n📒 Señales registradas hoy: {n_sig} · seguimiento: {APP_URL}/senales" +
-                 (f"\n\nAvisos de hoy: {sum(1 for k in st.kv_many(f'sent|{day}|') if k.endswith('|mad'))} madurando"
+                 (f"\n\nAvisos de hoy: {sum(1 for k in st.kv_many(f'sent|{day}|') if k.endswith('|mov'))} movimientos"
                   ) + f"\n{APP_URL}/alertas")
         res = {"ok": True, "et": now.strftime("%H:%M"), "alertas": len(d["items"]), "conteo": c,
                "evaluadas": f"{d.get('evaluadas_ligero', 0)} ligero · {d.get('evaluadas_completo', 0)} completo",
@@ -3933,7 +4121,7 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                 if len(top5) >= 5:
                     break
             st.kv_set("monitor_last", json.dumps({**res, "cuando": now.isoformat(timespec="minutes"),
-                                                  "madurando": [f"{x['ticker']} {x['dir']} 🧨{x.get('dinamita')}" for x in mad],
+                                                  "movimientos": [f"{x['ticker']} {x['dir']} {m['vela']} ${m['precio']}" for x, m in movs],
                                                   "top_dinamita": top5}))
             if sent:
                 st.kv_set("monitor_last_sent", now.isoformat(timespec="minutes"))
