@@ -3902,6 +3902,110 @@ def detect_movimiento(data: Dict[str, Any], side: str, day: Optional[str] = None
     return {"ok": False, "dia": day, "mas_cerca": best}
 
 
+def detect_gap(data: Dict[str, Any], side: str, day: Optional[str] = None, live: bool = True) -> Dict[str, Any]:
+    """🚀 GAP CON GASOLINA: abrió con gap a favor y todavía le quedan compradores.
+    Dispara en el PRIMER RETROCESO, no en la ruptura:
+      1) gap entre 1 y 3 ATR a favor        2) no ha rellenado más de 1/3 del gap
+      3) se mantiene del lado bueno del VWAP 4) hubo retroceso al VWAP o al rango de apertura con MENOS volumen que el impulso
+      5) 3 escalones al reanudar             6) volumen creciendo en esas 3 velas
+      7) una vela con ≥2x su volumen normal  8) antes de las 11:00"""
+    days = data["days"]
+    if not days:
+        return {"ok": False, "why": "sin velas de 5 min"}
+    day = day or list(days.keys())[-1]
+    bars = list(days.get(day) or [])
+    if live and bars and bars[-1]["t"] + 300 > time.time():
+        bars = bars[:-1]
+    prev_days = [v for k, v in days.items() if k < day and len(v) >= 70][-9:]
+    daily = [b for b in data["daily"] if b["d"] < day]
+    if len(daily) < 15 or len(bars) < 5:
+        return {"ok": False, "dia": day, "why": "pocas velas todavía", "velas": len(bars)}
+    trs = [max(daily[i]["h"] - daily[i]["l"], abs(daily[i]["h"] - daily[i - 1]["c"]), abs(daily[i]["l"] - daily[i - 1]["c"]))
+           for i in range(len(daily) - 14, len(daily))]
+    atr = sum(trs) / len(trs)
+    prev_close = daily[-1]["c"]
+    sgn = 1 if side == "CALL" else -1
+    op = bars[0]["o"]
+    gap = sgn * (op - prev_close)
+    gap_atr = gap / atr if atr else 0
+    base = {"dia": day, "cierre_anterior": round(prev_close, 2), "apertura": round(op, 2), "gap_pct": round(gap / prev_close * 100, 2),
+            "gap_atr": round(gap_atr, 2), "atr": round(atr, 2)}
+    if gap_atr < 1:
+        return {"ok": False, **base, "why": f"no hubo gap a favor de 1 ATR o más (fue {gap_atr:.2f} ATR)"}
+
+    def typ(i: int) -> float:
+        xs = sorted(d[i]["v"] for d in prev_days if i < len(d))
+        return max(1.0, xs[len(xs) // 2]) if xs else max(1.0, sum(b["v"] for b in bars[:i + 1]) / (i + 1))
+
+    pv = vv = 0.0; vwaps = []
+    for b in bars:
+        pv += (b["h"] + b["l"] + b["c"]) / 3 * b["v"]; vv += b["v"]; vwaps.append(pv / vv if vv else b["c"])
+    orh = max(b["h"] for b in bars[:3]) if sgn > 0 else min(b["l"] for b in bars[:3])
+    fav = (lambda b: b["h"]) if sgn > 0 else (lambda b: -b["l"])
+    adv = (lambda b: b["l"]) if sgn > 0 else (lambda b: -b["h"])
+    best = None
+    for k in range(4, len(bars)):
+        b0, b1, b2, b3 = bars[k - 3], bars[k - 2], bars[k - 1], bars[k]
+        seq = (b1, b2, b3)
+        prior = bars[:k - 2]
+        ih = max(range(len(prior)), key=lambda i: fav(prior[i]))
+        imp, pull = bars[:ih + 1], bars[ih + 1:k - 2]
+        worst = min(adv(b) for b in bars[:k + 1]) * sgn          # precio más en contra desde la apertura
+        relleno = sgn * (op - worst) / gap if gap else 1
+        zona = max(vwaps[ih + 1:k - 2] or [vwaps[ih]]) if sgn > 0 else min(vwaps[ih + 1:k - 2] or [vwaps[ih]])
+        ref = max(zona, orh) if sgn > 0 else min(zona, orh)
+        if pull:
+            toco = min(sgn * adv(b) * sgn for b in pull) if sgn > 0 else max(b["h"] for b in pull)
+            llego = (toco <= ref + 0.2 * atr) if sgn > 0 else (toco >= ref - 0.2 * atr)
+            sostuvo = all(sgn * (b["c"] - vwaps[ih + 1 + i]) >= -0.15 * atr for i, b in enumerate(pull))
+            vol_pull = sum(b["v"] for b in pull) / len(pull); vol_imp = sum(b["v"] for b in imp) / len(imp)
+            retroceso = llego and sostuvo and vol_pull < vol_imp
+        else:
+            retroceso, vol_pull, vol_imp = False, 0, 0
+        esc = all(sgn * (y["c"] - x["c"]) > 0 for x, y in ((b0, b1), (b1, b2), (b2, b3)))
+        vols = [b["v"] for b in seq]; typs = [typ(k - 2), typ(k - 1), typ(k)]
+        creciente = vols[1] >= 0.9 * vols[0] and vols[2] >= 0.9 * vols[1] and vols[2] > vols[0]
+        g = max(range(3), key=lambda j: vols[j] / typs[j]); big_x = vols[g] / typs[g]; big_usd = vols[g] * seq[g]["c"]
+        conds = {"gap_1_a_3_atr": 1 <= gap_atr <= 3, "no_rellena": relleno <= 1 / 3,
+                 "sobre_vwap": sgn * (b3["c"] - vwaps[k]) > 0, "retroceso_con_poco_volumen": retroceso,
+                 "escalones": esc, "volumen_creciendo": creciente, "operacion_grande": big_x >= 2.0 and big_usd >= 1_000_000,
+                 "antes_11": b3["hm"] <= "11:00"}
+        det = {"vela": b3["hm"], "precio": round(b3["c"], 2), "vwap": round(vwaps[k], 2), "rango_apertura": round(orh, 2),
+               "relleno_del_gap_pct": round(relleno * 100), "impulso_hasta": bars[ih]["hm"],
+               "vol_impulso": int(vol_imp), "vol_retroceso": int(vol_pull),
+               "vela_grande": f"la vela de las {seq[g]['hm']} operó {big_x:.1f}x su volumen normal (${big_usd / 1e6:.1f}M)",
+               "velas": [{"hora": b["hm"], "cierre": round(b["c"], 2), "vol": b["v"], "normal": int(t)} for b, t in zip(seq, typs)],
+               "stop": round(min(b["l"] for b in pull + [b0]) if sgn > 0 else max(b["h"] for b in pull + [b0]), 2),
+               "cumple": sum(conds.values()), "condiciones": conds}
+        if all(conds.values()):
+            return {"ok": True, **base, **det}
+        if best is None or det["cumple"] > best["cumple"]:
+            best = det
+        if b3["hm"] > "11:00":
+            break
+    return {"ok": False, **base, "mas_cerca": best}
+
+
+def _fmt_gap(x: Dict, m: Dict) -> str:
+    sgn = 1 if x["dir"] == "CALL" else -1
+    risk = abs(m["precio"] - m["stop"])
+    t1, t2 = round(m["precio"] + sgn * risk, 2), round(m["precio"] + sgn * 2 * risk, 2)
+    v = m["velas"]
+    return "\n".join([
+        f"🚀 <b>GAP CON GASOLINA  {x['ticker']} {x['dir']}</b>",
+        f"Precio <b>${m['precio']}</b> · abrió con gap de {m['gap_pct']:+}% ({m['gap_atr']} ATR) · vela de las {m['vela']}",
+        "",
+        f"✓ No rellenó el gap (devolvió {m['relleno_del_gap_pct']}%) y sigue {'sobre' if sgn > 0 else 'bajo'} VWAP ${m['vwap']}",
+        f"✓ Retrocedió con menos volumen ({m['vol_retroceso']:,} vs {m['vol_impulso']:,} del impulso) y aguantó",
+        "✓ Reanuda en 3 escalones: " + " → ".join(f"{b['hora']} ${b['cierre']}" for b in v),
+        "✓ Volumen creciendo: " + " → ".join(f"{b['vol']:,}" for b in v),
+        f"✓ Operación grande: {m['vela_grande']}",
+        "",
+        f"Stop ${m['stop']} (mínimo del retroceso) · T1 ${t1} · T2 ${t2}",
+        f"Alerta del grupo del {x['day'][8:]}/{x['day'][5:7]} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}",
+        "Confirma en SensaMarket antes de entrar."])
+
+
 def _fmt_mov(x: Dict, m: Dict) -> str:
     sgn = 1 if x["dir"] == "CALL" else -1
     risk = abs(m["precio"] - m["stop"])
@@ -3943,6 +4047,12 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
         except Exception as e:
             print(f"movimiento {x['ticker']}: {e}")
             continue
+        try:
+            g = detect_gap(f.result(), x["dir"])
+        except Exception as e:
+            g = {}; print(f"gap {x['ticker']}: {e}")
+        if g.get("ok"):
+            m = {**g, "_tipo": "gap"}
         if m.get("ok"):
             # solo si disparó en las últimas 2 velas (≤10 min): si ya pasó más, se perdió y no se avisa tarde
             hm = datetime.now(NY_TZ).strftime("%H:%M")
@@ -3951,6 +4061,19 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
                 out.append((x, m))
     ex.shutdown(wait=False, cancel_futures=True)
     return out
+
+
+@app.route("/api/gap")
+def api_gap():
+    """Revisa un ticker con la regla 🚀 GAP CON GASOLINA. Ej.: /api/gap?ticker=AAPL&dir=CALL&dia=2026-11-04"""
+    tk = (request.args.get("ticker") or "").upper().strip()
+    side = (request.args.get("dir") or "CALL").upper()
+    if not tk:
+        return jsonify({"error": "falta ticker"}), 400
+    try:
+        return jsonify({"ticker": tk, "dir": side, **detect_gap(_m5_days(tk), side, request.args.get("dia"), live=not request.args.get("dia"))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/movimiento")
@@ -4078,12 +4201,14 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
         for x, m in movs:
             if len(sent) >= cap:
                 break
-            if send(f"sent|{day}|{x['ticker']}|{x['dir']}|mov", _fmt_mov(x, m)):
+            es_gap = m.get("_tipo") == "gap"
+            if send(f"sent|{day}|{x['ticker']}|{x['dir']}|{'gap' if es_gap else 'mov'}", _fmt_gap(x, m) if es_gap else _fmt_mov(x, m)):
                 sgn = 1 if x["dir"] == "CALL" else -1; risk = abs(m["precio"] - m["stop"])
                 try:
                     record_signal("telegram", x["ticker"], x["dir"], m["precio"],
-                                  {"entry_state": "MOVIMIENTO", "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
-                                   "entry_t2": round(m["precio"] + sgn * 2 * risk, 2)}, None, "🚀 MOVIMIENTO " + m["vela"], x["day"])
+                                  {"entry_state": "GAP" if es_gap else "MOVIMIENTO", "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
+                                   "entry_t2": round(m["precio"] + sgn * 2 * risk, 2)}, None,
+                                  ("🚀 GAP CON GASOLINA " if es_gap else "🚀 MOVIMIENTO ") + m["vela"], x["day"])
                 except Exception as e:
                     print(f"record_signal error: {e}")
         c = d.get("counts", {})
