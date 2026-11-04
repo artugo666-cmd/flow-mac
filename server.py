@@ -1622,7 +1622,10 @@ def compute_score(
     pts_B = 0.0
 
     # Earnings próximos — máxima volatilidad garantizada
-    if earn_days is not None:
+    # Días negativos = YA reportó: el catalizador se consumió (antes contaba como "próximo" y daba 2.2)
+    if earn_days is not None and -3 <= earn_days < 0:
+        pts_B = 0.6 if abs_chg >= 8 else 1.0
+    elif earn_days is not None:
         if 0 <= earn_days <= 1:
             pts_B = 2.5   # earnings HOY o MAÑANA
         elif earn_days <= 3:
@@ -1692,6 +1695,9 @@ def compute_score(
         pts_B = pts_B + vol_bonus_B
 
     pts_B = min(pts_B, 2.5)
+    # Si ya reportó y ya se movió fuerte, la noticia/volumen son el MISMO catalizador consumido: no vuelve a sumar completo
+    if earn_days is not None and -3 <= earn_days < 0 and abs_chg >= 8:
+        pts_B = min(pts_B, 1.0)
 
     # ════════════════════════════════════════════════════════
     # C. MOMENTUM TÉCNICO (max 2.5)
@@ -1835,8 +1841,13 @@ def compute_score(
     raw   = pts_A + pts_B + pts_C + pts_D
     score = round(min(max(raw, 0), 10.0), 1)
 
-    if score >= 7.0:
+    # Candado de timing: un score alto no puede ser VERDE si el momento es malo
+    # (extendido, estructura rota, mercado cerrado o timing <0.8): se suma bien pero no se entra.
+    timing_malo = pts_D < 0.8 or plan.get("entry_state") in ("EXTENDIDO", "INVALIDADO", "MERCADO_CERRADO")
+    if score >= 7.0 and not timing_malo:
         semaforo = "VERDE"
+    elif score >= 7.0:
+        semaforo = "AMARILLO"
     elif score >= 4.5:
         semaforo = "AMARILLO"
     else:
@@ -1893,8 +1904,10 @@ def compute_score(
         why.append(f"📰 Noticia {age_str}: {news.get('title','')[:80]}")
     if fund.get("analyst_action"):
         why.append(f"📊 Analista: {fund['analyst_action']}")
-    if earn_days is not None and earn_days <= 7:
+    if earn_days is not None and 0 <= earn_days <= 7:
         why.append(f"⏰ Earnings en {earn_days:.0f} día(s) — volatilidad esperada")
+    elif earn_days is not None and -3 <= earn_days < 0:
+        why.append(f"📋 Ya reportó earnings hace {abs(earn_days):.0f} día(s) — el movimiento del reporte ya ocurrió ({chg_pct:+.1f}% hoy)")
     if rel_vol >= 2 and not has_opts:
         why.append(f"📈 Volumen {rel_vol:.1f}x sobre promedio — actividad inusual sin opciones")
     if above_sma20 and above_sma50 and is_bull:

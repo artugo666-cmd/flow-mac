@@ -1036,7 +1036,8 @@ function buildSummary(rs,title){
   var g=rs.filter(function(r){return r.semaforo==='VERDE';}).length;
   var y=rs.filter(function(r){return r.semaforo==='AMARILLO';}).length;
   var rd=rs.length-g-y;
-  var earnUrgent=rs.filter(function(r){return r.earnings_days!==null&&r.earnings_days!==undefined&&r.earnings_days<=3;}).length;
+  var earnUrgent=rs.filter(function(r){return r.earnings_days!==null&&r.earnings_days!==undefined&&r.earnings_days>=0&&r.earnings_days<=3;}).length;
+  var earnPast=rs.filter(function(r){return r.earnings_days!==null&&r.earnings_days!==undefined&&r.earnings_days<0&&r.earnings_days>=-3;}).length;
   var s=rs.slice().sort(function(a,b){return(b.score||0)-(a.score||0);});
   var bias=g>rd?'ALCISTA':rd>g?'BAJISTA':'MIXTO';
   var bc=bias==='ALCISTA'?'var(--grn)':bias==='BAJISTA'?'var(--red)':'var(--yel)';
@@ -1046,6 +1047,7 @@ function buildSummary(rs,title){
     (y?(g?', ':'')+y+' esperar':'')+(rd?' y '+rd+' evitar':'')+'. '+
     (s[0]?'Mejor: <b style="color:'+(s[0].direction==='CALL'?'var(--grn)':'var(--red)')+'">'+s[0].ticker+'</b> '+s[0].score+'/10.':'');
   if(earnUrgent) verdict += ' <span style="color:var(--ora)">🚨 '+earnUrgent+' con earnings próximos.</span>';
+  if(earnPast) verdict += ' <span style="color:var(--ora)">📋 '+earnPast+' ya reportaron: su movimiento ya ocurrió.</span>';
 
   var now=new Date();
   var ds=now.toLocaleDateString('es-MX',{weekday:'long',day:'numeric',month:'long'})+' · '+now.toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});
@@ -1098,9 +1100,11 @@ function buildCard(d, idx, alert){
 
   // Earnings urgente
   var earnDays=d.earnings_days;
-  var earnUrgent=earnDays!==null&&earnDays!==undefined&&earnDays<=3;
-  var earnSoon=earnDays!==null&&earnDays!==undefined&&earnDays<=7;
+  var earnPastOne=earnDays!==null&&earnDays!==undefined&&earnDays<0&&earnDays>=-3;
+  var earnUrgent=earnDays!==null&&earnDays!==undefined&&earnDays>=0&&earnDays<=3;
+  var earnSoon=earnDays!==null&&earnDays!==undefined&&earnDays>=0&&earnDays<=7;
   if(earnUrgent){decCls='dec-o';decTxt='🚨 EARNINGS EN '+Math.round(earnDays)+'d — ALTA VOLATILIDAD ESPERADA';}
+  else if(earnPastOne){decCls='dec-o';decTxt='📋 YA REPORTÓ EARNINGS ('+d.earnings_date+') — EL MOVIMIENTO YA OCURRIÓ, NO PERSEGUIR';}
 
   // Opciones
   var hasOpts=d.has_options;
@@ -1149,6 +1153,9 @@ function buildCard(d, idx, alert){
 
   // EARNINGS BOX
   var earnHtml='';
+  if(earnPastOne){
+    earnHtml='<div style="background:rgba(255,140,0,.08);border:1px solid rgba(255,140,0,.25);border-radius:6px;margin:10px 14px;padding:8px 12px;font-family:\'IBM Plex Mono\',monospace;font-size:.62rem;color:var(--ora)">📋 EARNINGS YA REPORTADOS: '+d.earnings_date+' (hace '+Math.abs(Math.round(earnDays))+(Math.abs(Math.round(earnDays))===1?' día':' días')+'). El movimiento del reporte ya ocurrió: no perseguir.</div>';
+  }
   if(earnSoon){
     var earnCl=earnUrgent?'earn-box':'';
     earnHtml='<div class="'+earnCl+'" style="background:rgba(255,140,0,'+(earnUrgent?.15:.08)+');border:1px solid rgba(255,140,0,'+(earnUrgent?.5:.25)+');border-radius:6px;margin:10px 14px;padding:8px 12px;font-family:\'IBM Plex Mono\',monospace;font-size:.62rem;color:var(--ora)">'+
