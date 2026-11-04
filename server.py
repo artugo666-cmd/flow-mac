@@ -4185,7 +4185,7 @@ def detect_entrada_carga(data: Dict[str, Any], side: str, dia: Optional[str] = N
     pv = vv = 0.0; vw = []
     for b in bars:
         pv += (b["h"] + b["l"] + b["c"]) / 3 * b["v"]; vv += b["v"]; vw.append(pv / vv if vv else b["c"])
-    best = None
+    best = None; detalle = []
     for k in range(1, len(bars)):
         b = bars[k]; a = bars[k - 1]; ref = bars[k - 2]["c"] if k >= 2 else op
         cum = sum(x["v"] for x in bars[:k + 1])
@@ -4205,13 +4205,17 @@ def detect_entrada_carga(data: Dict[str, Any], side: str, dia: Optional[str] = N
                "desde_cierre_atr": round(ext, 2), "stop": round(stop, 2), "atr": round(atr, 2),
                "velas": [{"hora": x["hm"], "cierre": round(x["c"], 2), "vol": x["v"]} for x in (a, b)],
                "cumple": sum(conds.values()), "condiciones": conds}
+        # Vela por vela: qué faltó en cada una (para afinar umbrales con casos reales)
+        detalle.append({"vela": b["hm"], "precio": round(b["c"], 2), "vol": b["v"], "rvol_hoy": round(rvol_hoy, 2),
+                        "vwap": round(vw[k], 2), "desde_apertura_atr": round(ext_op, 2),
+                        "falta": [n for n, v in conds.items() if not v] or ["— dispara —"]})
         if all(conds.values()):
-            return {"ok": True, **base, **det}
+            return {"ok": True, **base, **det, "detalle": detalle}
         if best is None or det["cumple"] > best["cumple"]:
             best = det
         if b["hm"] >= "12:00":
             break
-    return {"ok": False, **base, "mas_cerca": best}
+    return {"ok": False, **base, "mas_cerca": best, "detalle": detalle}
 
 
 def _fmt_entrada(x: Dict, m: Dict) -> str:
