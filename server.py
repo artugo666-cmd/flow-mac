@@ -3862,9 +3862,39 @@ def _m5_days(ticker: str) -> Dict[str, Any]:
         daily = dc[1]
     else:
         daily = _daily_bars(ticker, "3mo"); _M5_DAILY[ticker] = (time.time(), daily)
-    out = {"days": days, "daily": daily}
+    dudosas = _limpiar_volumen(days, daily)
+    out = {"days": days, "daily": daily, "dudosas": dudosas}
     _M5_CACHE[ticker] = (time.time(), out)
     return out
+
+
+def _limpiar_volumen(days: "OrderedDict[str, List[Dict]]", daily: List[Dict]) -> List[Dict]:
+    """Yahoo a veces infla el volumen de algunas velas de 5 min. Si la suma de las velas de un día
+    pasa de 1.25x el volumen diario oficial, se neutralizan (volumen = lo normal a esa hora) las velas
+    más anormales (≥10x) hasta que la suma cuadre. Si el volumen fue real, el diario lo refleja y no se toca."""
+    dvol = {b["d"]: b["v"] for b in daily}
+    marcadas = []
+    for dia, bars in days.items():
+        dv = dvol.get(dia)
+        s5 = sum(b["v"] for b in bars)
+        if not dv or s5 <= 1.25 * dv:
+            continue
+        otros = [v for k, v in days.items() if k != dia and len(v) >= 70]
+        def normal(i: int) -> float:
+            xs = sorted(d[i]["v"] for d in otros if i < len(d))
+            return max(1.0, xs[len(xs) // 2]) if xs else 1.0
+        orden = sorted(range(len(bars)), key=lambda i: bars[i]["v"] / normal(i), reverse=True)
+        for i in orden:
+            if s5 <= 1.1 * dv:
+                break
+            n = normal(i)
+            if bars[i]["v"] / n < 10:
+                break
+            b = bars[i]
+            marcadas.append({"dia": dia, "vela": b.get("hm"), "vol_yahoo": b["v"], "vol_normal": int(n)})
+            s5 -= b["v"] - int(n)
+            b["v_yahoo"] = b["v"]; b["v"] = int(n); b["dudosa"] = True
+    return marcadas
 
 
 def detect_movimiento(data: Dict[str, Any], side: str, day: Optional[str] = None, live: bool = True) -> Dict[str, Any]:
@@ -4422,7 +4452,9 @@ def api_agotamiento():
     if not tk:
         return jsonify({"error": "falta ticker"}), 400
     try:
-        return jsonify({"ticker": tk, "dir": side, **detect_agotamiento(_m5_days(tk), side, request.args.get("dia"), live=not request.args.get("dia"))})
+        data = _m5_days(tk)
+        return jsonify({"ticker": tk, "dir": side, **detect_agotamiento(data, side, request.args.get("dia"), live=not request.args.get("dia")),
+                        "velas_dudosas": [v for v in data.get("dudosas", []) if not request.args.get("dia") or v["dia"] == request.args.get("dia")]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
