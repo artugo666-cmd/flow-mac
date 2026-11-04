@@ -4063,6 +4063,125 @@ def _fmt_mov(x: Dict, m: Dict) -> str:
     return "\n".join(L)
 
 
+# ══════════════════════════════════════════════════════════════
+# 🔔 APERTURA — para las que CARGARON ayer y abren con gap a favor.
+#   Entra al cierre de la primera vela (9:35) si: cargó ayer · gap a favor de 0.25 a 2 ATR ·
+#   la primera vela cierra a favor y arriba del cierre de ayer · su rango no pasa de 1 ATR.
+#   Si la primera vela sale en contra, se da una oportunidad a la de 9:35 si supera su máximo.
+#   Stop: mínimo de las velas de la apertura. Sin confirmación: es la regla más arriesgada.
+# ⚠️ AGOTAMIENTO — después de un movimiento a favor (≥1 ATR desde la apertura o ≥2 desde ayer),
+#   una vela con ≥4x su volumen normal que NO avanza (cierra igual o en contra de la anterior).
+#   Señal de absorción: si estás dentro, toma parcial o sube el stop; si no, no persigas.
+# ══════════════════════════════════════════════════════════════
+AGOT_VOL_X = float(os.environ.get("AGOT_VOL_X", "4.0"))
+
+
+def _atr_prev(data: Dict[str, Any], dia: str) -> Tuple[float, float]:
+    daily = [b for b in data["daily"] if b["d"] < dia]
+    trs = [max(daily[i]["h"] - daily[i]["l"], abs(daily[i]["h"] - daily[i - 1]["c"]), abs(daily[i]["l"] - daily[i - 1]["c"]))
+           for i in range(len(daily) - 14, len(daily))]
+    return (sum(trs) / len(trs) if trs else 0.0), (daily[-1]["c"] if daily else 0.0)
+
+
+def detect_apertura(data: Dict[str, Any], side: str, dia: Optional[str] = None, live: bool = True) -> Dict[str, Any]:
+    days = data["days"]
+    if not days:
+        return {"ok": False, "why": "sin velas de 5 min"}
+    dia = dia or list(days.keys())[-1]
+    fd = _sesion_previa(data, dia)
+    carga = analizar_carga(data, side, fd) if fd else {"ok": False}
+    bars = list(days.get(dia) or [])
+    if live and bars and bars[-1]["t"] + 300 > time.time():
+        bars = bars[:-1]
+    base = {"dia": dia, "carga": carga}
+    if not bars:
+        return {"ok": False, **base, "why": "todavía no cierra la primera vela (9:35)"}
+    atr, prev_close = _atr_prev(data, dia)
+    sgn = 1 if side == "CALL" else -1
+    op = bars[0]["o"]; gap_atr = sgn * (op - prev_close) / atr if atr else 0
+    revisadas = []
+    for k in (0, 1):
+        if k >= len(bars):
+            break
+        b = bars[k]; b0 = bars[0]
+        rango = (max(x["h"] for x in bars[:k + 1]) - min(x["l"] for x in bars[:k + 1])) / atr if atr else 9
+        a_favor = sgn * (b["c"] - b["o"]) > 0 if k == 0 else (b["c"] > b0["h"] if sgn > 0 else b["c"] < b0["l"])
+        conds = {"cargo_ayer": bool(carga.get("cargo")), "gap_a_favor": 0.25 <= gap_atr <= 2.0,
+                 "vela_a_favor": a_favor, "sobre_cierre_ayer": sgn * (b["c"] - prev_close) > 0, "rango_menor_1_atr": rango <= 1.0}
+        stop = min(x["l"] for x in bars[:k + 1]) if sgn > 0 else max(x["h"] for x in bars[:k + 1])
+        det = {"vela": b["hm"], "precio": round(b["c"], 2), "apertura": round(op, 2), "cierre_ayer": round(prev_close, 2),
+               "gap_atr": round(gap_atr, 2), "gap_pct": round(sgn * (op - prev_close) / prev_close * 100, 2) if prev_close else 0,
+               "stop": round(stop, 2), "atr": round(atr, 2), "vol": b["v"], "condiciones": conds,
+               "falta": [n for n, v in conds.items() if not v]}
+        revisadas.append(det)
+        if all(conds.values()):
+            return {"ok": True, **base, **det}
+        if k == 0 and conds["vela_a_favor"]:
+            break          # la primera vela salió a favor pero falló otra cosa: no hay segunda oportunidad
+    return {"ok": False, **base, "revisadas": revisadas}
+
+
+def detect_agotamiento(data: Dict[str, Any], side: str, dia: Optional[str] = None, live: bool = True) -> Dict[str, Any]:
+    days = data["days"]
+    if not days:
+        return {"ok": False, "why": "sin velas de 5 min"}
+    dia = dia or list(days.keys())[-1]
+    bars = list(days.get(dia) or [])
+    if live and bars and bars[-1]["t"] + 300 > time.time():
+        bars = bars[:-1]
+    if len(bars) < 2:
+        return {"ok": False, "dia": dia, "why": "pocas velas"}
+    atr, prev_close = _atr_prev(data, dia)
+    sgn = 1 if side == "CALL" else -1; op = bars[0]["o"]
+    prev = [v for k, v in days.items() if k < dia and len(v) >= 70][-9:]
+    lista = []
+    for k in range(1, len(bars)):
+        b, a = bars[k], bars[k - 1]
+        xs = sorted(d[k]["v"] for d in prev if k < len(d))
+        normal = max(1.0, xs[len(xs) // 2]) if xs else max(1.0, sum(x["v"] for x in bars[:k]) / k)
+        vx = b["v"] / normal
+        ext_op = sgn * (a["c"] - op) / atr if atr else 0
+        ext = sgn * (a["c"] - prev_close) / atr if atr else 0
+        if vx >= AGOT_VOL_X and (ext_op >= 1.0 or ext >= 2.0) and sgn * (b["c"] - a["c"]) <= 0:
+            lista.append({"vela": b["hm"], "precio": round(b["c"], 2), "vela_anterior": round(a["c"], 2), "vol": b["v"],
+                          "vol_x": round(vx, 1), "usd_m": round(b["v"] * b["c"] / 1e6, 1),
+                          "desde_apertura_atr": round(ext_op, 2), "desde_cierre_atr": round(ext, 2),
+                          "maximo": round(max(x["h"] for x in bars[:k + 1]) if sgn > 0 else min(x["l"] for x in bars[:k + 1]), 2)})
+    if lista:
+        return {"ok": True, "dia": dia, **lista[0], "todas": lista}
+    return {"ok": False, "dia": dia, "why": f"sin vela de ≥{AGOT_VOL_X:g}x volumen que frene el movimiento"}
+
+
+def _fmt_apertura(x: Dict, m: Dict) -> str:
+    sgn = 1 if x["dir"] == "CALL" else -1
+    risk = abs(m["precio"] - m["stop"]) or m["atr"] * 0.25
+    t1, t2 = round(m["precio"] + sgn * risk, 2), round(m["precio"] + sgn * 2 * risk, 2)
+    c = m["carga"]
+    return "\n".join([
+        f"🔔 <b>APERTURA  {x['ticker']} {x['dir']}</b>  (cargó ayer y abre a favor)",
+        f"Precio <b>${m['precio']}</b> · vela de las {m['vela']} · gap {m['gap_pct']:+}% ({m['gap_atr']} ATR)",
+        "",
+        f"<b>Ayer ({c['dia_flujo'][8:]}/{c['dia_flujo'][5:7]}) cargó:</b> {c['cambio_dia_pct']:+}%",
+        *[_h(w) for w in c["por_que"]],
+        "",
+        f"Stop ${m['stop']} (mínimo de la apertura) · T1 ${t1} · T2 ${t2}",
+        "⚠️ Entrada SIN confirmación de volumen: es la más arriesgada. Tamaño chico.",
+        f"Flujo del grupo · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}"])
+
+
+def _fmt_agot(x: Dict, m: Dict, dentro: bool) -> str:
+    sgn = 1 if x["dir"] == "CALL" else -1
+    return "\n".join([
+        f"⚠️ <b>AGOTAMIENTO  {x['ticker']} {x['dir']}</b>",
+        f"La vela de las {m['vela']} operó <b>{m['vol_x']}x</b> su volumen normal (${m['usd_m']}M) y NO avanzó: "
+        f"${m['vela_anterior']} → ${m['precio']}",
+        f"Venía de {m['desde_apertura_atr']} ATR desde la apertura · {'máximo' if sgn > 0 else 'mínimo'} ${m['maximo']}",
+        "",
+        ("<b>Si entraste:</b> toma parcial o sube el stop al precio de entrada." if dentro else
+         "<b>No persigas:</b> alguien grande está absorbiendo el movimiento."),
+        "Si la siguiente vela rompe el " + ("máximo" if sgn > 0 else "mínimo") + " con volumen, el agotamiento se cancela."])
+
+
 def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]]:
     """Revisa en paralelo todas las alertas vivas (no muertas) y regresa las que disparan AHORA."""
     seen, pares = set(), []
@@ -4071,7 +4190,9 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
             continue
         seen.add((x["ticker"], x["dir"])); pares.append(x)
     pares = pares[:70]
-    out = []
+    out: List[Tuple[Dict, Dict]] = []
+    agot: List[Tuple[Dict, Dict]] = []
+    scan_movimientos.agotamientos = agot
     if not pares or budget <= 2:
         return out
     ex = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
@@ -4097,7 +4218,15 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
             if fd and x["day"] == fd:
                 e_ = detect_entrada_carga(data, x["dir"])
                 if e_.get("ok"):
-                    m = {**e_, "_tipo": "carga"}     # la entrada por carga tiene prioridad: es la más temprana
+                    m = {**e_, "_tipo": "carga"}     # la entrada por carga va antes que movimiento y gap
+                ap = detect_apertura(data, x["dir"])
+                if ap.get("ok"):
+                    m = {**ap, "_tipo": "apertura"}  # y la de apertura antes que todas: es la más temprana
+            ag = detect_agotamiento(data, x["dir"])
+            if ag.get("ok"):
+                hm_ = datetime.now(NY_TZ).strftime("%H:%M")
+                if (datetime.strptime(hm_, "%H:%M") - datetime.strptime(ag["vela"], "%H:%M")).total_seconds() <= 15 * 60:
+                    agot.append((x, ag))
         except Exception as e:
             print(f"carga {x['ticker']}: {e}")
         if m.get("ok"):
@@ -4277,6 +4406,30 @@ def api_carga():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/apertura")
+def api_apertura():
+    """🔔 APERTURA: /api/apertura?ticker=AAPL&dir=CALL&dia=2026-11-04"""
+    tk = (request.args.get("ticker") or "").upper().strip(); side = (request.args.get("dir") or "CALL").upper()
+    if not tk:
+        return jsonify({"error": "falta ticker"}), 400
+    try:
+        return jsonify({"ticker": tk, "dir": side, **detect_apertura(_m5_days(tk), side, request.args.get("dia"), live=not request.args.get("dia"))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/agotamiento")
+def api_agotamiento():
+    """⚠️ AGOTAMIENTO: /api/agotamiento?ticker=AAPL&dir=CALL&dia=2026-11-04"""
+    tk = (request.args.get("ticker") or "").upper().strip(); side = (request.args.get("dir") or "CALL").upper()
+    if not tk:
+        return jsonify({"error": "falta ticker"}), 400
+    try:
+        return jsonify({"ticker": tk, "dir": side, **detect_agotamiento(_m5_days(tk), side, request.args.get("dia"), live=not request.args.get("dia"))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/gap")
 def api_gap():
     """Revisa un ticker con la regla 🚀 GAP CON GASOLINA. Ej.: /api/gap?ticker=AAPL&dir=CALL&dia=2026-11-04"""
@@ -4406,19 +4559,20 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
             if len(sent) >= cap:
                 continue
             # Telegram ya no avisa MADURANDO/CARGADA: solo el 🚀 MOVIMIENTO (abajo), vela por vela.
-        movs = []
-        if live:
+        movs, agots = [], []
+        if mins >= 9 * 60 + 35:          # la regla de APERTURA puede disparar al cierre de la vela de 9:30
             try:
                 movs = scan_movimientos(d["items"], max(6.0, SCAN_BUDGET_S * 0.6))
+                agots = list(getattr(scan_movimientos, "agotamientos", []))
             except Exception as e:
                 errors.append(f"movimiento: {e}")
         for x, m in movs:
             if len(sent) >= cap:
                 break
             tipo = m.get("_tipo") or "mov"; es_gap = tipo == "gap"
-            fmt = {"gap": _fmt_gap, "carga": _fmt_entrada}.get(tipo, _fmt_mov)
+            fmt = {"gap": _fmt_gap, "carga": _fmt_entrada, "apertura": _fmt_apertura}.get(tipo, _fmt_mov)
             # un solo aviso de entrada por ticker y lado al día, sea cual sea la regla
-            if any(st.kv_get(f"sent|{day}|{x['ticker']}|{x['dir']}|{t}") for t in ("mov", "gap", "carga")):
+            if any(st.kv_get(f"sent|{day}|{x['ticker']}|{x['dir']}|{t}") for t in ("mov", "gap", "carga", "apertura")):
                 continue
             if send(f"sent|{day}|{x['ticker']}|{x['dir']}|{tipo}", fmt(x, m)):
                 sgn = 1 if x["dir"] == "CALL" else -1; risk = abs(m["precio"] - m["stop"])
@@ -4426,9 +4580,16 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
                     record_signal("telegram", x["ticker"], x["dir"], m["precio"],
                                   {"entry_state": tipo.upper(), "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
                                    "entry_t2": round(m["precio"] + sgn * 2 * risk, 2)}, None,
-                                  {"gap": "🚀 GAP CON GASOLINA ", "carga": "✅ ENTRADA POR CARGA "}.get(tipo, "🚀 MOVIMIENTO ") + m["vela"], x["day"])
+                                  {"gap": "🚀 GAP CON GASOLINA ", "carga": "✅ ENTRADA POR CARGA ", "apertura": "🔔 APERTURA "}.get(tipo, "🚀 MOVIMIENTO ") + m["vela"], x["day"])
                 except Exception as e:
                     print(f"record_signal error: {e}")
+        for x, m in agots:
+            if len(sent) >= cap:
+                break
+            dentro = any(st.kv_get(f"sent|{day}|{x['ticker']}|{x['dir']}|{t}") for t in ("mov", "gap", "carga", "apertura"))
+            # solo se avisa de lo que se está vigilando: si hubo entrada hoy o si el flujo fue la sesión anterior
+            if dentro or x.get("day") == (_sesion_previa(_M5_CACHE[x["ticker"]][1], day) if x["ticker"] in _M5_CACHE else None):
+                send(f"sent|{day}|{x['ticker']}|{x['dir']}|agot", _fmt_agot(x, m, dentro))
         c = d.get("counts", {})
         resumen = " · ".join(f"{k} {v}" for k, v in c.items())
         mad = [x for x in d["items"] if x["life"] == "🧨 MADURANDO"][:8]
