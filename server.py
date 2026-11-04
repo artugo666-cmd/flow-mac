@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 
 import os
 import re
@@ -3047,9 +3048,15 @@ def api_alerts():
 
     # Guardar en el almacén (seguimiento de 10 sesiones)
     saved = 0
+    msg_day = _today_et()
     try:
-        msg_day = message_date(payload.get("raw") or "") or _today_et()
-        saved = get_store().add(min(msg_day, _today_et()), parsed["alerts"], source="app")
+        msg_day = min(message_date(payload.get("raw") or "") or _today_et(), _today_et())
+        # El flujo del grupo es de la sesión ANTERIOR al mensaje: se guarda con esa fecha
+        dm = datetime.strptime(msg_day, "%Y-%m-%d").date() - timedelta(days=1)
+        while dm.weekday() >= 5:
+            dm -= timedelta(days=1)
+        flow_day = dm.isoformat()
+        saved = get_store().add(flow_day, parsed["alerts"], source="app")
         _ACTIVE_CACHE["data"] = None
     except Exception as e:
         print(f"store add error: {e}")
@@ -3081,6 +3088,32 @@ def api_alerts():
                 print(f"record_signal error: {e}")
         items.append(it)
 
+    # ¿Cargó en el día del flujo? (se avisa por Telegram una vez por mensaje)
+    cargas = []
+    try:
+        cargas = resumen_cargas(parsed["alerts"], msg_day, max(4.0, SCAN_BUDGET_S - (time.time() - t0)))
+        cmap = {(c["ticker"], c["dir"]): c["carga"] for c in cargas}
+        for it in items:
+            it["carga"] = cmap.get((it["ticker"], it["alert"]["dir"]))
+        si = [c for c in cargas if c["carga"].get("cargo")]
+        no = [c for c in cargas if c["carga"].get("ok") and not c["carga"].get("cargo")]
+        if cargas and TG_TOKEN:
+            fmt_p = lambda p: (f"${p / 1e6:.1f}M" if p >= 1e6 else f"${p / 1e3:.0f}K") if isinstance(p, (int, float)) and p else ""
+            txt = ["📥 <b>ALERTAS RECIBIDAS</b> — ¿cargaron el día del flujo?", ""]
+            txt += ["<b>Cargaron</b> (vigilo la entrada desde las 9:40):"] + [
+                f"✓ {c['ticker']} {c['dir']} {fmt_p(c.get('premium'))} · vol {c['carga']['rvol_dia']}x · {c['carga']['cambio_dia_pct']:+}% · {c['carga']['cumple']}/4"
+                for c in si] if si else ["Ninguna cargó con fuerza."]
+            if no:
+                txt += ["", "<b>No cargaron:</b> " + ", ".join(f"{c['ticker']} {c['dir']}" for c in no[:15])]
+            key = f"sent|{_today_et()}|recibidas|{hashlib.md5((payload.get('raw') or '').encode()).hexdigest()[:10]}"
+            st_ = get_store()
+            if not st_.kv_get(key):
+                ok, _m = tg_send("\n".join(txt))
+                if ok:
+                    st_.kv_set(key, datetime.now(NY_TZ).isoformat(timespec="minutes"))
+    except Exception as e:
+        print(f"cargas error: {e}")
+
     items.sort(key=_alert_rank_key)
     counts: Dict[str, int] = {}
     for it in items:
@@ -3100,6 +3133,7 @@ def api_alerts():
         "failed": failed, "segundos": round(time.time() - t0, 1),
         "parser": parsed.get("parser"), "lineas_sin_leer": parsed.get("lineas_sin_leer", 0),
         "guardadas": saved, "almacen": get_store().mode,
+        "cargas": [{"ticker": c["ticker"], "dir": c["dir"], "premium": c.get("premium"), **c["carga"]} for c in cargas],
         "items": items,
     })
 
@@ -4057,6 +4091,15 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
             g = {}; print(f"gap {x['ticker']}: {e}")
         if g.get("ok"):
             m = {**g, "_tipo": "gap"}
+        try:
+            data = f.result()
+            fd = _sesion_previa(data, list(data["days"].keys())[-1]) if data["days"] else None
+            if fd and x["day"] == fd:
+                e_ = detect_entrada_carga(data, x["dir"])
+                if e_.get("ok"):
+                    m = {**e_, "_tipo": "carga"}     # la entrada por carga tiene prioridad: es la más temprana
+        except Exception as e:
+            print(f"carga {x['ticker']}: {e}")
         if m.get("ok"):
             # solo si disparó en las últimas 2 velas (≤10 min): si ya pasó más, se perdió y no se avisa tarde
             hm = datetime.now(NY_TZ).strftime("%H:%M")
@@ -4065,6 +4108,169 @@ def scan_movimientos(items: List[Dict], budget: float) -> List[Tuple[Dict, Dict]
                 out.append((x, m))
     ex.shutdown(wait=False, cancel_futures=True)
     return out
+
+
+# ══════════════════════════════════════════════════════════════
+# ✅ ENTRADA POR CARGA — las alertas del grupo llegan un día tarde
+# El flujo es de la sesión ANTERIOR. Al recibir la alerta se revisa si ese día
+# la acción CARGÓ, y hoy desde la apertura se da la entrada si el volumen sigue.
+#   Cargó ayer (3 de 4): volumen del día ≥1.3x su promedio de 20 días · cerró en el tercio
+#     alto del rango (bajo, en puts) · cerró del lado bueno del VWAP · la última hora operó
+#     ≥1.3x lo normal (dinero entrando al cierre)
+#   Entrada hoy: cargó ayer + volumen de hoy ≥1.5x lo normal a esa hora + precio sobre el
+#     cierre de ayer, la apertura y el VWAP + 2 velas seguidas a favor con volumen sostenido +
+#     no se ha ido (≤1.5 ATR desde la apertura, ≤3 ATR desde ayer) + antes de las 12:00.
+#     Puede disparar desde las 9:40: la carga de ayer ya es la confirmación.
+# ══════════════════════════════════════════════════════════════
+def _sesion_previa(data: Dict[str, Any], dia: str) -> Optional[str]:
+    ks = [k for k in data["days"].keys() if k < dia]
+    return ks[-1] if ks else None
+
+
+def analizar_carga(data: Dict[str, Any], side: str, flow_day: str) -> Dict[str, Any]:
+    days = data["days"]; bars = days.get(flow_day) or []
+    daily = data["daily"]
+    di = next((i for i, b in enumerate(daily) if b["d"] == flow_day), None)
+    if not bars or di is None or di < 21:
+        return {"ok": False, "dia_flujo": flow_day, "why": "sin datos del día del flujo"}
+    D, prevD = daily[di], daily[di - 1]
+    sgn = 1 if side == "CALL" else -1
+    avg20 = sum(b["v"] for b in daily[di - 20:di]) / 20
+    rvol = D["v"] / avg20 if avg20 else 0
+    clv = (D["c"] - D["l"]) / (D["h"] - D["l"]) if D["h"] > D["l"] else 0.5
+    clv_side = clv if sgn > 0 else 1 - clv
+    pv = sum((b["h"] + b["l"] + b["c"]) / 3 * b["v"] for b in bars); vv = sum(b["v"] for b in bars)
+    vwap = pv / vv if vv else D["c"]
+    prev = [v for k, v in days.items() if k < flow_day and len(v) >= 70][-9:]
+    last_n = 12
+    lh = sum(b["v"] for b in bars[-last_n:])
+    lh_norm = sorted(sum(b["v"] for b in d[-last_n:]) for d in prev)
+    lh_x = lh / lh_norm[len(lh_norm) // 2] if lh_norm else 1.0
+    chg = (D["c"] - prevD["c"]) / prevD["c"] * 100
+    crit = {"volumen_del_dia": rvol >= 1.3, "cierre_fuerte": clv_side >= 0.6,
+            "lado_bueno_vwap": sgn * (D["c"] - vwap) > 0, "dinero_al_cierre": lh_x >= 1.3}
+    n = sum(crit.values())
+    why = [f"{'✓' if crit['volumen_del_dia'] else '✗'} volumen {rvol:.1f}x su promedio de 20 días",
+           f"{'✓' if crit['cierre_fuerte'] else '✗'} cerró en el {clv_side * 100:.0f}% {'alto' if sgn > 0 else 'bajo'} del rango",
+           f"{'✓' if crit['lado_bueno_vwap'] else '✗'} cierre ${D['c']:.2f} {'sobre' if D['c'] > vwap else 'bajo'} VWAP ${vwap:.2f}",
+           f"{'✓' if crit['dinero_al_cierre'] else '✗'} última hora {lh_x:.1f}x lo normal"]
+    return {"ok": True, "dia_flujo": flow_day, "cargo": n >= 3 and rvol >= 1.2, "cumple": n, "criterios": crit,
+            "por_que": why, "rvol_dia": round(rvol, 2), "cambio_dia_pct": round(chg, 2), "cierre": round(D["c"], 2),
+            "vwap_dia": round(vwap, 2), "ultima_hora_x": round(lh_x, 2)}
+
+
+def detect_entrada_carga(data: Dict[str, Any], side: str, dia: Optional[str] = None, live: bool = True) -> Dict[str, Any]:
+    days = data["days"]
+    if not days:
+        return {"ok": False, "why": "sin velas de 5 min"}
+    dia = dia or list(days.keys())[-1]
+    fd = _sesion_previa(data, dia)
+    if not fd:
+        return {"ok": False, "dia": dia, "why": "sin sesión previa"}
+    carga = analizar_carga(data, side, fd)
+    base = {"dia": dia, "carga": carga}
+    if not carga.get("ok"):
+        return {"ok": False, **base, "why": carga.get("why")}
+    bars = list(days.get(dia) or [])
+    if live and bars and bars[-1]["t"] + 300 > time.time():
+        bars = bars[:-1]
+    daily = [b for b in data["daily"] if b["d"] < dia]
+    if len(daily) < 15 or len(bars) < 2:
+        return {"ok": False, **base, "why": "todavía no hay 2 velas cerradas (dispara desde las 9:40)"}
+    trs = [max(daily[i]["h"] - daily[i]["l"], abs(daily[i]["h"] - daily[i - 1]["c"]), abs(daily[i]["l"] - daily[i - 1]["c"]))
+           for i in range(len(daily) - 14, len(daily))]
+    atr = sum(trs) / len(trs); prev_close = daily[-1]["c"]; op = bars[0]["o"]
+    sgn = 1 if side == "CALL" else -1
+    prev = [v for k, v in days.items() if k < dia and len(v) >= 70][-9:]
+    pv = vv = 0.0; vw = []
+    for b in bars:
+        pv += (b["h"] + b["l"] + b["c"]) / 3 * b["v"]; vv += b["v"]; vw.append(pv / vv if vv else b["c"])
+    best = None
+    for k in range(1, len(bars)):
+        b = bars[k]; a = bars[k - 1]; ref = bars[k - 2]["c"] if k >= 2 else op
+        cum = sum(x["v"] for x in bars[:k + 1])
+        norms = sorted(sum(x["v"] for x in d[:k + 1]) for d in prev)
+        rvol_hoy = cum / norms[len(norms) // 2] if norms and norms[len(norms) // 2] else 0
+        ext_op = sgn * (b["c"] - op) / atr if atr else 0
+        ext = sgn * (b["c"] - prev_close) / atr if atr else 0
+        conds = {"cargo_ayer": bool(carga["cargo"]),
+                 "volumen_sigue": rvol_hoy >= 1.5,
+                 "precio_a_favor": sgn * (b["c"] - prev_close) > 0 and sgn * (b["c"] - op) > 0 and sgn * (b["c"] - vw[k]) > 0,
+                 "dos_velas_a_favor": sgn * (b["c"] - a["c"]) > 0 and sgn * (a["c"] - ref) > 0 and b["v"] >= 0.8 * a["v"],
+                 "no_se_ha_ido": ext_op <= MOV_MAX_ATR and ext <= MOV_MAX_TOTAL,
+                 "antes_12": b["hm"] < "12:00"}
+        stop = min(a["l"], vw[k]) if sgn > 0 else max(a["h"], vw[k])
+        det = {"vela": b["hm"], "precio": round(b["c"], 2), "vwap": round(vw[k], 2), "apertura": round(op, 2),
+               "cierre_ayer": round(prev_close, 2), "rvol_hoy": round(rvol_hoy, 2), "desde_apertura_atr": round(ext_op, 2),
+               "desde_cierre_atr": round(ext, 2), "stop": round(stop, 2), "atr": round(atr, 2),
+               "velas": [{"hora": x["hm"], "cierre": round(x["c"], 2), "vol": x["v"]} for x in (a, b)],
+               "cumple": sum(conds.values()), "condiciones": conds}
+        if all(conds.values()):
+            return {"ok": True, **base, **det}
+        if best is None or det["cumple"] > best["cumple"]:
+            best = det
+        if b["hm"] >= "12:00":
+            break
+    return {"ok": False, **base, "mas_cerca": best}
+
+
+def _fmt_entrada(x: Dict, m: Dict) -> str:
+    sgn = 1 if x["dir"] == "CALL" else -1
+    risk = abs(m["precio"] - m["stop"]) or m["atr"] * 0.25
+    t1, t2 = round(m["precio"] + sgn * risk, 2), round(m["precio"] + sgn * 2 * risk, 2)
+    c = m["carga"]; prem = x.get("premium")
+    prem_s = f" · ${prem / 1e6:.1f}M" if isinstance(prem, (int, float)) and prem >= 1e6 else (f" · ${prem / 1e3:.0f}K" if isinstance(prem, (int, float)) and prem else "")
+    return "\n".join([
+        f"✅ <b>ENTRADA  {x['ticker']} {x['dir']}</b>  (cargó ayer y el volumen sigue)",
+        f"Precio <b>${m['precio']}</b> · vela de las {m['vela']} · volumen de hoy {m['rvol_hoy']}x lo normal a esta hora",
+        "",
+        f"<b>Ayer ({c['dia_flujo'][8:]}/{c['dia_flujo'][5:7]}) cargó:</b> {c['cambio_dia_pct']:+}%",
+        *[_h(w) for w in c["por_que"]],
+        "",
+        f"<b>Hoy:</b> sobre el cierre de ayer ${m['cierre_ayer']}, la apertura ${m['apertura']} y el VWAP ${m['vwap']}",
+        "2 velas a favor: " + " → ".join(f"{v['hora']} ${v['cierre']} ({v['vol']:,})" for v in m["velas"]),
+        f"Lleva {m['desde_apertura_atr']} ATR desde la apertura (no se ha ido)",
+        "",
+        f"Stop ${m['stop']} · T1 ${t1} · T2 ${t2}",
+        f"Flujo del grupo{prem_s} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}",
+        "Confirma en SensaMarket antes de entrar."])
+
+
+def resumen_cargas(alerts: List[Dict], dia_msg: str, budget: float = 15) -> List[Dict]:
+    """Al recibir las alertas: revisa de inmediato si cada una cargó en el día del flujo."""
+    pares = list({(a["ticker"], a["dir"]): a for a in alerts}.values())[:25]
+    out = []
+    ex = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+    futs = {ex.submit(_m5_days, a["ticker"]): a for a in pares}
+    done, _ = wait(futs, timeout=budget)
+    for f in done:
+        a = futs[f]
+        try:
+            data = f.result()
+            keys = list(data["days"].keys())
+            # antes de abrir hoy no hay velas de hoy: el flujo es la última sesión; con el mercado abierto, la anterior
+            fd = keys[-1] if dia_msg > keys[-1] else _sesion_previa(data, dia_msg)
+            c = analizar_carga(data, a["dir"], fd)
+            out.append({**a, "carga": c})
+        except Exception as e:
+            print(f"carga {a['ticker']}: {e}")
+    ex.shutdown(wait=False, cancel_futures=True)
+    out.sort(key=lambda a: (not (a["carga"].get("cargo")), -(a.get("premium") or 0)))
+    return out
+
+
+@app.route("/api/carga")
+def api_carga():
+    """¿Cargó en el día del flujo y hubo entrada hoy? Ej.: /api/carga?ticker=AAPL&dir=CALL&dia=2026-11-04
+    (dia = día en que se recibe la alerta; el flujo es de la sesión anterior)."""
+    tk = (request.args.get("ticker") or "").upper().strip()
+    side = (request.args.get("dir") or "CALL").upper()
+    if not tk:
+        return jsonify({"error": "falta ticker"}), 400
+    try:
+        return jsonify({"ticker": tk, "dir": side, **detect_entrada_carga(_m5_days(tk), side, request.args.get("dia"), live=not request.args.get("dia"))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/gap")
@@ -4205,14 +4411,18 @@ def monitor_tick(force: bool = False) -> Dict[str, Any]:
         for x, m in movs:
             if len(sent) >= cap:
                 break
-            es_gap = m.get("_tipo") == "gap"
-            if send(f"sent|{day}|{x['ticker']}|{x['dir']}|{'gap' if es_gap else 'mov'}", _fmt_gap(x, m) if es_gap else _fmt_mov(x, m)):
+            tipo = m.get("_tipo") or "mov"; es_gap = tipo == "gap"
+            fmt = {"gap": _fmt_gap, "carga": _fmt_entrada}.get(tipo, _fmt_mov)
+            # un solo aviso de entrada por ticker y lado al día, sea cual sea la regla
+            if any(st.kv_get(f"sent|{day}|{x['ticker']}|{x['dir']}|{t}") for t in ("mov", "gap", "carga")):
+                continue
+            if send(f"sent|{day}|{x['ticker']}|{x['dir']}|{tipo}", fmt(x, m)):
                 sgn = 1 if x["dir"] == "CALL" else -1; risk = abs(m["precio"] - m["stop"])
                 try:
                     record_signal("telegram", x["ticker"], x["dir"], m["precio"],
-                                  {"entry_state": "GAP" if es_gap else "MOVIMIENTO", "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
+                                  {"entry_state": tipo.upper(), "entry_stop": m["stop"], "entry_t1": round(m["precio"] + sgn * risk, 2),
                                    "entry_t2": round(m["precio"] + sgn * 2 * risk, 2)}, None,
-                                  ("🚀 GAP CON GASOLINA " if es_gap else "🚀 MOVIMIENTO ") + m["vela"], x["day"])
+                                  {"gap": "🚀 GAP CON GASOLINA ", "carga": "✅ ENTRADA POR CARGA "}.get(tipo, "🚀 MOVIMIENTO ") + m["vela"], x["day"])
                 except Exception as e:
                     print(f"record_signal error: {e}")
         c = d.get("counts", {})
