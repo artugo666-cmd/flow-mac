@@ -3795,12 +3795,13 @@ def api_telegram_test():
 #      y las 3 juntas ≥ MOV_VOL_X veces lo que el ticker suele operar a esa misma hora
 #   4) Operación grande: al menos una de las 3 velas con ≥ MOV_BIG_X veces su volumen normal a esa hora
 #      y ≥ $1M operado (proxy de bloque: los datos gratuitos no traen el tamaño de cada transacción)
-#   5) No se ha ido: lleva ≤ MOV_MAX_ATR ATR desde el cierre anterior (incluye el gap)
+#   5) No se ha ido: ≤ MOV_MAX_ATR ATR desde la apertura y ≤ MOV_MAX_TOTAL ATR desde el cierre de ayer
 # ══════════════════════════════════════════════════════════════
 MOV_DELTA_ATR = float(os.environ.get("MOV_DELTA_ATR", "0.30"))
 MOV_VOL_X     = float(os.environ.get("MOV_VOL_X", "1.5"))
 MOV_BIG_X     = float(os.environ.get("MOV_BIG_X", "2.5"))
-MOV_MAX_ATR   = float(os.environ.get("MOV_MAX_ATR", "1.5"))
+MOV_MAX_ATR   = float(os.environ.get("MOV_MAX_ATR", "1.5"))     # máximo recorrido desde la apertura
+MOV_MAX_TOTAL = float(os.environ.get("MOV_MAX_TOTAL", "3.0"))   # máximo recorrido desde el cierre de ayer (gap incluido)
 _M5_CACHE: Dict[str, Tuple[float, Dict]] = {}
 _M5_DAILY: Dict[str, Tuple[float, List[Dict]]] = {}
 
@@ -3881,18 +3882,21 @@ def detect_movimiento(data: Dict[str, Any], side: str, day: Optional[str] = None
         grande = max(range(3), key=lambda j: vols[j] / typs[j])
         big_x = vols[grande] / typs[grande]
         big_usd = vols[grande] * seq[grande]["c"]
-        ext = sgn * (b3["c"] - prev_close) / atr if atr else 0
+        ext = sgn * (b3["c"] - prev_close) / atr if atr else 0          # desde el cierre de ayer (incluye el gap)
+        ext_op = sgn * (b3["c"] - bars[0]["o"]) / atr if atr else 0     # desde la apertura de hoy
         conds = {
             "escalones": esc,
             "delta": d_atr >= MOV_DELTA_ATR and lado_vwap,
             "volumen_creciendo": creciente and vol_x >= MOV_VOL_X,
             "operacion_grande": big_x >= MOV_BIG_X and big_usd >= 1_000_000,
-            "no_se_ha_ido": ext <= MOV_MAX_ATR,
+            # En días con gap el gap no cuenta como "ya se fue": se mide desde la apertura,
+            # y solo se veta si el total desde ayer ya es exagerado (> MOV_MAX_TOTAL ATR).
+            "no_se_ha_ido": ext_op <= MOV_MAX_ATR and ext <= MOV_MAX_TOTAL,
         }
         det = {"vela": b3["hm"], "precio": round(b3["c"], 2), "delta_pct": round(delta / b0["c"] * 100, 2),
                "delta_atr": round(d_atr, 2), "vwap": round(vwaps[k], 2), "vol_x": round(vol_x, 1),
                "vela_grande": f"la vela de las {seq[grande]['hm']} operó {big_x:.1f}x su volumen normal (${big_usd / 1e6:.1f}M)",
-               "desde_cierre_atr": round(ext, 2), "cumple": sum(conds.values()), "condiciones": conds,
+               "desde_cierre_atr": round(ext, 2), "desde_apertura_atr": round(ext_op, 2), "cumple": sum(conds.values()), "condiciones": conds,
                "velas": [{"hora": x["hm"], "cierre": round(x["c"], 2), "vol": x["v"], "normal": int(t)} for x, t in zip(seq, typs)],
                "inicio": round(b0["c"], 2), "stop": round(b1["l"] if sgn > 0 else b1["h"], 2), "atr": round(atr, 2)}
         if all(conds.values()):
@@ -4017,7 +4021,7 @@ def _fmt_mov(x: Dict, m: Dict) -> str:
          "✓ 3 escalones: " + " → ".join(f"{b['hora']} ${b['cierre']}" for b in v),
          "✓ Volumen creciendo: " + " → ".join(f"{b['vol']:,}" for b in v) + f" ({m['vol_x']}x lo normal a esta hora)",
          f"✓ Operación grande: {m['vela_grande']}",
-         f"✓ {'Sobre' if sgn > 0 else 'Bajo'} VWAP ${m['vwap']} · lleva {m['desde_cierre_atr']} ATR desde el cierre anterior (no se ha ido)",
+         f"✓ {'Sobre' if sgn > 0 else 'Bajo'} VWAP ${m['vwap']} · lleva {m['desde_apertura_atr']} ATR desde la apertura y {m['desde_cierre_atr']} desde ayer (no se ha ido)",
          "",
          f"Stop ${m['stop']} (vela donde arrancó) · T1 ${t1} · T2 ${t2}",
          f"Alerta del grupo del {x['day'][8:]}/{x['day'][5:7]} · strike {x.get('strike') or '—'} · vence {x.get('expiry') or '—'}",
@@ -4087,7 +4091,7 @@ def api_movimiento():
     try:
         data = _m5_days(tk)
         return jsonify({"ticker": tk, "dir": side, **detect_movimiento(data, side, request.args.get("dia"), live=not request.args.get("dia")),
-                        "reglas": {"delta_atr": MOV_DELTA_ATR, "vol_x": MOV_VOL_X, "vela_grande_x": MOV_BIG_X, "max_atr_desde_cierre": MOV_MAX_ATR}})
+                        "reglas": {"delta_atr": MOV_DELTA_ATR, "vol_x": MOV_VOL_X, "vela_grande_x": MOV_BIG_X, "max_atr_desde_apertura": MOV_MAX_ATR, "max_atr_desde_cierre": MOV_MAX_TOTAL}})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
